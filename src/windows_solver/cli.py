@@ -19,6 +19,7 @@ from .builtin import default_registry
 from .contracts import canonical_json_bytes, load_study
 from .campaign_recovery import (
     RecoverySelection,
+    checkpoint_bound_promoted_recovery_selection,
     recover_campaign,
     validate_recovery_checkpoint,
     validate_recovery_receipt,
@@ -32,6 +33,7 @@ from .campaign_policy import (
     validate_schema11_checkpoint,
 )
 from .campaign_failures import (
+    resolve_layer1_system_failure_for_resume,
     resolve_system_failure_for_resume,
     system_failure_resolution_index,
 )
@@ -397,24 +399,22 @@ def build_parser() -> argparse.ArgumentParser:
         "campaign-resolve-system-failure",
         help=(
             "append an authenticated resolution of one retained software "
-            "failure before resuming unretained Layer-2 work"
+            "failure before resuming preserved Layer-1 or unretained Layer-2 work"
         ),
     )
     campaign_resolve_system_failure.add_argument("selection", type=Path)
     campaign_resolve_system_failure.add_argument(
         "--checkpoint", type=Path, required=True
     )
-    campaign_resolve_system_failure.add_argument(
-        "--binary64-lock", type=Path, required=True
-    )
+    campaign_resolve_system_failure.add_argument("--binary64-lock", type=Path)
     campaign_resolve_system_failure.add_argument(
         "--failure-receipt-sha256", required=True
     )
     campaign_resolve_system_failure.add_argument(
-        "--calibration-receipt-path", type=Path, required=True
+        "--calibration-receipt-path", type=Path
     )
     campaign_resolve_system_failure.add_argument(
-        "--calibration-receipt-sha256", required=True
+        "--calibration-receipt-sha256"
     )
     campaign_resolve_system_failure.add_argument(
         "--repair-commit",
@@ -1217,7 +1217,9 @@ def _load_schema11_campaign(
         checkpoint["campaign_id"] != recovery_selection.campaign_id
         or checkpoint["selection_id"] != recovery_selection.selection_id
     ):
-        raise ValueError("schema-11 checkpoint does not match the selected campaign")
+        recovery_selection = checkpoint_bound_promoted_recovery_selection(
+            plan, selection, checkpoint
+        )
     preflight_campaign_supports(plan, recovery_selection.ordered_leaf_ids)
     return plan, selection, descriptor, recovery_selection, resolved, checkpoint
 
@@ -1376,6 +1378,8 @@ def _campaign_schema11_validate(
             in {
                 PromotionQueueDisposition.PENDING.value,
                 PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value,
+                PromotionQueueDisposition.CONTROL_RETURN_RETAINED.value,
+                PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value,
                 PromotionQueueDisposition.NUMERICAL_CONTINUATION.value,
             }
         ]
@@ -1647,19 +1651,19 @@ def _campaign_resolve_system_failure(
     selection_path: Path,
     checkpoint_path: Path,
     *,
-    binary64_lock_path: Path,
+    binary64_lock_path: Path | None,
     system_failure_receipt_sha256: str,
-    calibration_receipt_path: Path,
-    calibration_receipt_sha256: str,
+    calibration_receipt_path: Path | None,
+    calibration_receipt_sha256: str | None,
     repair_commit_sha: str,
     reason: str,
 ) -> tuple[int, object]:
     """Close one retained software incident without altering numerical state.
 
-    This is deliberately separate from the promoted scheduler.  It verifies
-    the immutable Layer-1 lock and the exact calibration authority, appends a
-    canonical receipt, and refreshes reports.  It never changes a queue entry,
-    raw calculation, retained promoted stage, terminal record, or evidence.
+    Before the Layer-1 lock exists, the receipt binds the exact preserved
+    Binary64 checkpoint and repaired runtime.  After the lock exists, the
+    existing calibration/lock authority remains mandatory.  Neither route
+    changes numerical state.
     """
 
     (
@@ -1670,35 +1674,56 @@ def _campaign_resolve_system_failure(
         resolved,
         checkpoint,
     ) = _load_schema11_campaign(selection_path, checkpoint_path)
-    calibration_receipt = load_calibration_receipt(
-        _resolve_recovery_path(calibration_receipt_path),
-        calibration_receipt_sha256,
-    )
-    from .binary64_layer_lock import (
-        load_binary64_layer_lock,
-        validate_binary64_layer_lock,
-    )
+    if binary64_lock_path is None:
+        if (
+            calibration_receipt_path is not None
+            or calibration_receipt_sha256 is not None
+        ):
+            raise ValueError(
+                "pre-lock Layer-1 resolution does not accept calibration authority"
+            )
+        updated, resolution = resolve_layer1_system_failure_for_resume(
+            checkpoint,
+            system_failure_receipt_sha256=system_failure_receipt_sha256,
+            repair_commit_sha=repair_commit_sha,
+            reason=reason,
+        )
+    else:
+        if calibration_receipt_path is None or calibration_receipt_sha256 is None:
+            raise ValueError(
+                "post-lock system failure resolution requires calibration authority"
+            )
+        calibration_receipt = load_calibration_receipt(
+            _resolve_recovery_path(calibration_receipt_path),
+            calibration_receipt_sha256,
+        )
+        from .binary64_layer_lock import (
+            load_binary64_layer_lock,
+            validate_binary64_layer_lock,
+        )
 
-    lock = validate_binary64_layer_lock(
-        load_binary64_layer_lock(_resolve_recovery_path(binary64_lock_path)),
-        checkpoint,
-        selection=recovery_selection,
-        leaf_mechanism_ids=_schema11_leaf_mechanism_ids(plan, recovery_selection),
-        auxiliary_evidence_manifest=_schema11_binary64_lock_manifest(
-            plan, checkpoint, resolved
-        ),
-    )
-    updated, resolution = resolve_system_failure_for_resume(
-        checkpoint,
-        system_failure_receipt_sha256=system_failure_receipt_sha256,
-        expected_authority_sha256=(
-            calibration_receipt.independent_review_authority_sha256
-        ),
-        calibration_receipt_sha256=calibration_receipt.sha256,
-        binary64_lock_receipt_sha256=lock["receipt_sha256"],
-        repair_commit_sha=repair_commit_sha,
-        reason=reason,
-    )
+        lock = validate_binary64_layer_lock(
+            load_binary64_layer_lock(_resolve_recovery_path(binary64_lock_path)),
+            checkpoint,
+            selection=recovery_selection,
+            leaf_mechanism_ids=_schema11_leaf_mechanism_ids(
+                plan, recovery_selection
+            ),
+            auxiliary_evidence_manifest=_schema11_binary64_lock_manifest(
+                plan, checkpoint, resolved
+            ),
+        )
+        updated, resolution = resolve_system_failure_for_resume(
+            checkpoint,
+            system_failure_receipt_sha256=system_failure_receipt_sha256,
+            expected_authority_sha256=(
+                calibration_receipt.independent_review_authority_sha256
+            ),
+            calibration_receipt_sha256=calibration_receipt.sha256,
+            binary64_lock_receipt_sha256=lock["receipt_sha256"],
+            repair_commit_sha=repair_commit_sha,
+            reason=reason,
+        )
     # Persist the receipt before deriving a disposable report view.  A report
     # problem can never erase the operator's incident decision.
     _atomic_export(resolved, updated)
@@ -1712,6 +1737,7 @@ def _campaign_resolve_system_failure(
         "checkpoint_path": str(resolved),
         "system_failure_receipt_sha256": system_failure_receipt_sha256,
         "resolution_receipt_sha256": resolution["receipt_sha256"],
+        "resolution_scope": resolution["resolution_scope"],
         "repair_commit_sha": resolution["repair_commit_sha"],
         "repair_runtime_sha256": resolution["repair_runtime_sha256"],
         "active_system_failure_count": len(refreshed["system_failures"])

@@ -11,7 +11,9 @@ permissions:
 jobs:
   julia-factored-gsn:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # The authenticated PR75 lifecycle now includes the real Julia worker
+    # process seam after the complete vendored suite and regression harnesses.
+    timeout-minutes: 60
     env:
       M02_PROJECT: .ci/m02-project
       M02_PROJECT_SEED: src/windows_solver/data/julia/m02_project
@@ -103,6 +105,25 @@ jobs:
             "$fixture"
           julia --startup-file=no --history-file=no --project="$M02_PROJECT" \
             tools/leaf13_horizon_harness_spec.jl
+      - name: Run PR75 fixed-root lifecycle through real Julia without solver kernels
+        shell: bash
+        run: |
+          cases="$RUNNER_TEMP/pr75-fixed-root-cases.json"
+          results="$RUNNER_TEMP/pr75-fixed-root-results.json"
+          PYTHONPATH=src python tests/pr75_fixed_root_contract_fixture.py \
+            write "$cases"
+          julia --startup-file=no --history-file=no --project="$M02_PROJECT" \
+            tests/julia/test_pr75_fixed_root_lifecycle.jl \
+            "$cases" "$results"
+          PYTHONPATH=src python tests/pr75_fixed_root_contract_fixture.py \
+            verify "$cases" "$results"
+          PR75_FIXED_ROOT_CASES="$cases" \
+          PR75_FIXED_ROOT_RESULTS="$results" \
+          PYTHONPATH=src python -m unittest \
+            tests.test_pr75_fixed_root_lifecycle -v
+          PR75_REAL_WORKER_PROCESS=1 \
+          PYTHONPATH=src python -m unittest \
+            tests.test_pr75_fixed_root_process_seam -v
 
   test:
     strategy:
@@ -136,10 +157,13 @@ jobs:
               raise AssertionError(f"expected one wheel, found {wheels}")
           with zipfile.ZipFile(wheels[0]) as wheel:
               names = set(wheel.namelist())
+              packaged_worker = wheel.read("windows_solver/data/julia/m02_worker.jl")
           required = {
               "windows_solver/linear_response_admission.py",
               "windows_solver/data/kerr_qnm_roots_2736.csv",
               "windows_solver/data/kerr_qnm_lattice_receipt.json",
+              "windows_solver/data/fixed_root_reliability_projection_authority_v1.json",
+              "windows_solver/data/julia/m02_worker.jl",
               "windows_solver/data/LICENSE-CANONICAL-BACKEND-MIT.txt",
               "windows_solver/data/LICENSE-CC-BY-4.0.txt",
               "windows_solver/data/LICENSE-QNM-MIT.txt",
@@ -154,6 +178,9 @@ jobs:
           }
           if missing or forbidden:
               raise AssertionError(f"wheel data mismatch: missing={missing}, forbidden={forbidden}")
+          source_worker = Path("src/windows_solver/data/julia/m02_worker.jl").read_bytes()
+          if packaged_worker != source_worker:
+              raise AssertionError("packaged m02_worker.jl differs from canonical source")
       - name: Compile Python
         run: python -m compileall -q src tests tools
       - name: Verify critical production capability wiring

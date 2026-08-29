@@ -63,6 +63,9 @@ from windows_solver.structural_diagnostics import StructuralDiagnosticSession
 
 from tests.test_pr66_terminal_cache_wiring import _terminal_survey_record
 from tests.test_pr69_commit10_recovery import Commit10RecoveryTests
+from tests.test_promoted_horizon_control_authority import (
+    _horizon_control_outcome,
+)
 from tests.test_promoted_survey_scheduler import _strict_run
 
 
@@ -520,29 +523,7 @@ class SchedulerForensicTests(unittest.TestCase):
                 ),
                 promoted_horizon_runner=lambda _leaf, entry, _source, _receipts: (
                     calls.append("horizon")
-                    or PromotedPassOutcome(
-                        disposition=SurveyDisposition.UNRESOLVED,
-                        reason_code="HORIZON_LADDER_EXHAUSTED",
-                        precision_tiers=("BF80",),
-                        operation_identity="promoted-horizon-control-return/v1",
-                        calculation_artifact=(
-                            lambda content: {
-                                **content,
-                                "calculation_sha256": _sha256(content),
-                            }
-                        )({
-                            "schema": "windows-solver.promoted-horizon-control-return/1",
-                            "precision_tier": "BF80",
-                            "failure_code": "HORIZON_LADDER_EXHAUSTED",
-                            "policy_disposition": "UNRESOLVED",
-                            "failure_fingerprint_sha256": "a" * 64,
-                            "predecessor_stage_sha256": entry["source_stage_sha256"],
-                            "source_fingerprint_sha256": entry[
-                                "source_fingerprint_sha256"
-                            ],
-                            "layer1_lock_receipt_sha256": "f" * 64,
-                        }),
-                    )
+                    or _horizon_control_outcome(_leaf, entry)
                 ),
                 root_seal_publish=lambda *_args: self.fail("unexpected publish"),
                 solved_leaf_store=store,

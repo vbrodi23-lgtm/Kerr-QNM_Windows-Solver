@@ -34,6 +34,7 @@ windows_solver = [
     "data/kerr_qnm_lattice_receipt.json",
     "data/kerr_qnm_m02_overlay_44.csv",
     "data/kerr_qnm_m02_overlay_receipt.json",
+    "data/fixed_root_reliability_projection_authority_v1.json",
     "data/promoted_control_empirical_calibration_v1.json",
     "data/promoted_control_derivative_lower_bound_source_audit_v1.json",
     "data/release_domain_manifest.json",

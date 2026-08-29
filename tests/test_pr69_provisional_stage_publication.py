@@ -13,7 +13,10 @@ import unittest
 from unittest.mock import patch
 
 import windows_solver.campaign_runtime as campaign_runtime
-from windows_solver.campaign_failures import CampaignSystemFailure
+from windows_solver.campaign_failures import (
+    CampaignSystemFailure,
+    resolve_layer1_system_failure_for_resume,
+)
 from windows_solver.campaign_policy import empty_schema11_checkpoint
 from windows_solver.campaign_recovery import RecoverySelection
 from windows_solver.campaign_survey import (
@@ -575,13 +578,21 @@ class ProvisionalStagePublicationTests(unittest.TestCase):
             first_ledger_bytes = canonical_json_bytes(
                 failed["survey_pass_ledger"]["binary64"][first.leaf_id]
             )
+            resolved, _resolution = resolve_layer1_system_failure_for_resume(
+                failed,
+                system_failure_receipt_sha256=(
+                    raised.exception.receipt["receipt_sha256"]
+                ),
+                repair_commit_sha="d" * 40,
+                reason="repair provisional-stage publication before resuming",
+            )
 
             calls.clear()
             published: list[str] = []
             resumed = run_binary64_survey(
                 self.plan,
                 recovery,
-                failed,
+                resolved,
                 checkpoint_path=checkpoint_path,
                 root_seal_lookup=lambda leaf: seals[leaf.leaf_id],
                 native_backend_factory=lambda: self.fail(

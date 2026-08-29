@@ -19,6 +19,9 @@ export build_asymptotic_series, build_asymptotic_series_bundle
 export build_infinity_recurrence_from_zero
 export SeriesEvaluation, AsymptoticConditioningAssessment
 export ASYMPTOTIC_CONDITIONING_ESTIMATE_KIND
+export ENDPOINT_ADEQUATE, ENDPOINT_SERIES_ORDER_LIMITED
+export ENDPOINT_ARITHMETIC_LIMITED, ENDPOINT_GEOMETRY_LIMITED
+export asymptotic_endpoint_limitation
 export evaluate_asymptotic_series
 export evaluate_infinity_asymptotic_series, evaluate_horizon_asymptotic_series
 export assess_asymptotic_preflight
@@ -27,6 +30,11 @@ const I = 1im # Mathematica being Mathematica
 _DEFAULTDATATYPE = ComplexF64 # Double precision by default
 const ASYMPTOTIC_CONDITIONING_ESTIMATE_KIND =
     "empirical-three-way-series-conditioning/not-a-bound/v1"
+const ENDPOINT_ADEQUATE = "adequate/v1"
+const ENDPOINT_SERIES_ORDER_LIMITED = "insufficient-series-order/v1"
+const ENDPOINT_ARITHMETIC_LIMITED =
+    "insufficient-arithmetic-precision/v1"
+const ENDPOINT_GEOMETRY_LIMITED = "insufficient-geometric-depth/v1"
 
 @enum AsymptoticFamily begin
     INFINITY_INGOING_SERIES = 1
@@ -186,6 +194,29 @@ struct AsymptoticConditioningAssessment{T<:AbstractFloat}
     effective_digits_lost::T
     predicted_reliable_digits::T
     estimate_kind::String
+end
+
+"""
+    asymptotic_endpoint_limitation(assessment; geometry_adequate=true)
+
+Classify the resource that binds one asymptotic endpoint.  This is the single
+package-owned causal rule used by both horizon and infinity endpoint recovery;
+campaign code must retain and independently validate its numerical evidence.
+"""
+function asymptotic_endpoint_limitation(
+    assessment::AsymptoticConditioningAssessment{T};
+    geometry_adequate::Bool=true,
+) where {T<:AbstractFloat}
+    geometry_adequate || return ENDPOINT_GEOMETRY_LIMITED
+    assessment.adequate && return ENDPOINT_ADEQUATE
+    # At or beyond the least term, adding coefficients grows the remainder.
+    # Only changing endpoint geometry can restore an asymptotic regime.
+    assessment.maximum_last_term_ratio >= one(T) &&
+        return ENDPOINT_GEOMETRY_LIMITED
+    arithmetic_loss = assessment.maximum_recurrence_digits_lost +
+        assessment.maximum_series_evaluation_digits_lost
+    return arithmetic_loss >= assessment.maximum_truncation_digits_lost ?
+        ENDPOINT_ARITHMETIC_LIMITED : ENDPOINT_SERIES_ORDER_LIMITED
 end
 
 typed_integer(::Type{T}, value::Integer) where {T<:AbstractFloat} = T(value)

@@ -30,7 +30,7 @@ PROMOTED_BACKGROUND_REUSE_KEY_SCHEMA = (
 )
 PROMOTED_BACKGROUND_BINDING_SCHEMA = "windows-solver.promoted-background-binding/3"
 PROMOTED_EXTERIOR_CALCULATION_SCHEMA = (
-    "windows-solver.promoted-exterior-calculation/3"
+    "windows-solver.promoted-exterior-calculation/4"
 )
 PROMOTED_FIXED_ROOT_COMPOSITE_SCHEMA = (
     "windows-solver.promoted-fixed-root-composite/2"

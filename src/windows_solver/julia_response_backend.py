@@ -27,6 +27,26 @@ from types import SimpleNamespace
 from typing import Callable, Mapping
 
 from .contracts import canonical_json_bytes
+from .fixed_root_reliability import (
+    load_fixed_root_reliability_projection_authority,
+)
+from .operation_control import (
+    FIXED_ROOT_SURVEY_BATCH_OPERATION,
+    JULIA_WORKER_ORIGIN,
+    NUMERICAL_CONTROL_FAILURE_CODES,
+    OPERATION_CONTROL_FACT_RECEIPT_SCHEMA,
+    OPERATION_CONTROL_RECEIPT_SCHEMA,
+    OperationExecutionIdentity,
+    PYTHON_SUPERVISOR_ORIGIN,
+    REQUEST_SCOPE,
+    SAMPLE_SCOPE,
+    SUPERVISOR_RETRYABILITY_BASIS,
+    ValidatedControlReceipt,
+    build_operation_control_receipt,
+    execution_identity_from_request,
+    operation_execution_identity,
+    validate_operation_control_receipt,
+)
 from .adaptive_controls import (
     MissingODECalibrationError,
     ODE_CALIBRATION_BLOCKER,
@@ -43,7 +63,6 @@ from .response_engine import (
     FixedRootDeterminantSample,
     DiagnosticRootReadout,
     HISTORICAL_WORKER_RESPONSE_RECEIPT_SCHEMA,
-    LEGACY_PROMOTED_WORKER_RESPONSE_WIRE_SCHEMA,
     NumericalConditioningEvidence,
     NUMERICAL_CONDITIONING_SCHEMA,
     ResponseComponentJob,
@@ -123,11 +142,38 @@ _DEFAULT_COORDINATE_STALL_MINIMUM_SPAN_FRACTION = "1e-6"
 _DEFAULT_COORDINATE_STALL_MINIMUM_STEP_FRACTION = "1e-12"
 _PROMOTED_REQUEST_PREFLIGHT_TIMEOUT_SECONDS = 600
 _PROMOTED_REQUEST_PREFLIGHT_OPERATION = "promoted-request-preflight"
-FIXED_ROOT_SURVEY_BATCH_OPERATION = "fixed-root-survey-batch"
-FIXED_ROOT_SURVEY_BATCH_SCHEMA = "windows-solver.fixed-root-survey-batch/1"
-FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA = (
-    "windows-solver.fixed-root-survey-conditioning/1"
+FIXED_ROOT_SURVEY_BATCH_SCHEMA = "windows-solver.fixed-root-survey-batch/3"
+FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA = (
+    "windows-solver.fixed-root-survey-batch-response/3"
 )
+FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA = (
+    "windows-solver.fixed-root-survey-conditioning/3"
+)
+FIXED_ROOT_RELIABILITY_PROJECTION_SCHEMA = (
+    "windows-solver.fixed-root-reliability-projection/2"
+)
+FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_SCHEMA = (
+    "windows-solver.fixed-root-endpoint-recovery-policy/1"
+)
+FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_IDENTITY = (
+    "cause-aware-fixed-root-exterior-endpoint-recovery/v1"
+)
+FIXED_ROOT_CONTROL_PROFILE = "fixed-root-deep-v1"
+FIXED_ROOT_ENDPOINT_ORDER_RULE = "bounded-doubling-prefix/v1"
+FIXED_ROOT_HORIZON_GEOMETRY_RULE = "bounded-negative-rho-depth/v1"
+FIXED_ROOT_INFINITY_GEOMETRY_RULE = "bounded-positive-rho-depth/v1"
+EXTERIOR_ENDPOINT_RECOVERY_RECEIPT_SCHEMA = (
+    "windows-solver.exterior-endpoint-recovery-receipt/1"
+)
+ENDPOINT_ADEQUATE = "adequate/v1"
+ENDPOINT_SERIES_ORDER_LIMITED = "insufficient-series-order/v1"
+ENDPOINT_ARITHMETIC_LIMITED = "insufficient-arithmetic-precision/v1"
+ENDPOINT_GEOMETRY_LIMITED = "insufficient-geometric-depth/v1"
+EXTERIOR_ENDPOINT_CONTROL_CODES = frozenset({
+    "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE",
+    "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED",
+    "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
+})
 _FIXED_ROOT_SURVEY_MAXIMUM_SAMPLE_COUNT = 9
 _FIXED_ROOT_SURVEY_BACKGROUND_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[:5]
 _FIXED_ROOT_SURVEY_COORDINATE_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:]
@@ -209,33 +255,60 @@ def fixed_root_survey_plan_for_pair(
     raise ValueError("fixed-root survey identity and roles are not one request plan")
 
 
-def _resolve_fixed_root_survey_request_contract(
+def _endpoint_order_schedule(base_order: int, maximum_order: int) -> list[int]:
+    if type(base_order) is not int or base_order <= 0 or maximum_order < base_order:
+        raise ValueError("fixed-root endpoint order bounds are invalid")
+    result: list[int] = []
+    current = base_order
+    while current < maximum_order:
+        result.append(current)
+        current *= 2
+    result.append(maximum_order)
+    return result
+
+
+def _fixed_root_endpoint_recovery_policy(
+    policy: Mapping[str, object],
+    reliability_projection: Mapping[str, object],
     *,
-    plan: FixedRootSurveyPlan | str | None,
-    sample_roles: tuple[str, ...] | None,
-    scientific_operation_identity: str | None,
-) -> FixedRootSurveyRequestContract:
-    """Resolve one plan, accepting only exact legacy pairs while callers move.
+    precision_digits: int,
+) -> dict[str, object]:
+    """Authenticate the complete bounded same-tier endpoint ladder."""
 
-    Production scheduler code must pass ``plan``.  The narrow compatibility
-    path keeps historical readers and controlled fixtures usable, but still
-    rejects every identity/roles cross-pair before a worker is invoked.
-    """
-
-    if plan is not None:
-        if sample_roles is not None or scientific_operation_identity is not None:
-            raise ValueError(
-                "fixed-root survey plan cannot be combined with identity or roles"
-            )
-        return fixed_root_survey_request_contract(plan)
-    if sample_roles is None:
-        raise ValueError("fixed-root survey request requires a named plan")
-    if scientific_operation_identity is None:
-        scientific_operation_identity = BINARY64_FIXED_ROOT_SURVEY_IDENTITY
-    resolved_plan = fixed_root_survey_plan_for_pair(
-        scientific_operation_identity, sample_roles
-    )
-    return fixed_root_survey_request_contract(resolved_plan)
+    base_order = policy.get("endpoint_series_order")
+    if type(base_order) is not int or base_order <= 0:
+        raise ValueError("fixed-root endpoint base order is invalid")
+    maximum_order = 4 * base_order
+    binding: dict[str, object] = {
+        "schema": FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_SCHEMA,
+        "identity": FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_IDENTITY,
+        "endpoint_order_rule": FIXED_ROOT_ENDPOINT_ORDER_RULE,
+        "base_endpoint_order": base_order,
+        "generated_maximum_order": maximum_order,
+        "endpoint_order_schedule": _endpoint_order_schedule(
+            base_order, maximum_order
+        ),
+        "horizon_geometry_rule": FIXED_ROOT_HORIZON_GEOMETRY_RULE,
+        "horizon_geometry_schedule": ["-5000", "-10000", "-20000"],
+        "infinity_geometry_rule": FIXED_ROOT_INFINITY_GEOMETRY_RULE,
+        "infinity_geometry_schedule": [
+            "100", "250", "500", "1000", "2000", "5000",
+            "10000", "20000",
+        ],
+        "fixed_root_reliability_target_abs": reliability_projection[
+            "fixed_root_reliability_target_abs"
+        ],
+        "fixed_root_reliability_rule": reliability_projection[
+            "fixed_root_reliability_rule"
+        ],
+        "required_digit_guard": reliability_projection["required_digit_guard"],
+        "precision_digits": precision_digits,
+        "semantic_precision_tier": f"bigfloat-{precision_digits}",
+    }
+    return {
+        **binding,
+        "policy_sha256": hashlib.sha256(canonical_json_bytes(binding)).hexdigest(),
+    }
 
 
 def consume_authenticated_binary64_provisional_predecessor(
@@ -306,41 +379,11 @@ _FIXED_ROOT_SURVEY_ROOT_ONLY_POLICY_FIELDS = frozenset({
     "max_newton_iterations",
     "root_correction_tolerance",
 })
-NUMERICAL_CONTROL_FAILURE_CODES = frozenset({
-    "SCATTERING_BASIS_ILL_CONDITIONED",
-    "SCATTERING_CHART_ILL_CONDITIONED",
-    "ASYMPTOTIC_SERIES_INVALID",
-    "INSUFFICIENT_ASYMPTOTIC_PRECISION",
-    "PHYSICAL_SINGULAR_LIMIT",
-    "ALGEBRAIC_REPRESENTATION_SINGULAR",
-    "CARRIER_CHANGE_INCONSISTENT",
-    "INVALID_FACTORED_PROPAGATION_INPUT",
-    "FACTORED_PROPAGATION_PRECISION_MISMATCH",
-    "NONFINITE_FACTORED_PROPAGATION_DATA",
-    "FACTORED_ODE_FAILURE",
-    # Fewer than two horizon endpoints passed the radial-approach and
-    # dual-series gate. Raised before any homogeneous ODE starts.
-    "NO_VERIFIED_HORIZON_ENDPOINT",
-    # The coordinate map made no meaningful progress. Distinguishes an
-    # impossible local-error target from an exhausted resource budget.
-    "COORDINATE_INVERSION_STALLED",
-    # The central determinant is small but its absolute error is too large to
-    # call the root located. Never reported as a solved root.
-    "DETERMINANT_UNCERTAINTY_TOO_LARGE",
-    # An exterior promoted determinant lacked one of its mandatory empirical
-    # same-point, preceding-tier, or endpoint/series comparisons.
-    "EXTERIOR_DETERMINANT_CERTIFICATE_UNAVAILABLE",
-    # The finite-difference ladder was exhausted without a step at which the
-    # derivative estimates agree and determinant noise does not dominate.
-    "FINITE_DIFFERENCE_NOISE_LIMIT",
-    "HORIZON_GEOMETRY_EXHAUSTED",
-    "HORIZON_MAXIMUM_ORDER_INADEQUATE",
-    "HORIZON_ARITHMETIC_INADEQUATE",
-    "HORIZON_COORDINATE_INVERSION_FAILED",
-    "HORIZON_ONLY_ONE_ENDPOINT",
+_FIXED_ROOT_SURVEY_RELIABILITY_POLICY_FIELDS = frozenset({
+    "required_digit_guard",
+    "promoted_control_calibration_receipt_sha256",
+    "empirical_control_profile_sha256",
 })
-
-
 def _mode_specific_branch_enclosure_radius(
     job: ResponseComponentJob,
 ) -> float:
@@ -370,11 +413,20 @@ class JuliaRootReadoutResourceLimitError(JuliaResponseBackendError):
 class JuliaNumericalControlError(JuliaResponseBackendError):
     """The worker stopped at one recognized, bounded numerical-control gate."""
 
-    def __init__(self, message: str, failure_code: str) -> None:
-        if failure_code not in NUMERICAL_CONTROL_FAILURE_CODES:
+    def __init__(
+        self,
+        message: str,
+        failure_code: str,
+        *,
+        control_receipt: ValidatedControlReceipt | None = None,
+    ) -> None:
+        if failure_code not in (
+            NUMERICAL_CONTROL_FAILURE_CODES | EXTERIOR_ENDPOINT_CONTROL_CODES
+        ):
             raise ValueError("numerical-control failure code is not recognized")
         super().__init__(message)
         self.failure_code = failure_code
+        self.control_receipt = control_receipt
 
 
 def _positive_environment_integer(name: str, default: int) -> int:
@@ -871,6 +923,7 @@ def _run_streamed_julia(
 ) -> object:
     """Drain worker pipes concurrently and forward progress before completion."""
 
+    started = time.monotonic()
     popen_options: dict[str, object] = {
         "cwd": cwd,
         "env": dict(env),
@@ -1028,6 +1081,7 @@ def _run_streamed_julia(
             None if not last_progress_event else last_progress_event[0]
         ),
         last_progress_event_validated=bool(last_progress_event),
+        elapsed_seconds=max(0.0, time.monotonic() - started),
     )
 
 
@@ -1287,10 +1341,15 @@ def _require_worker_resource_identity(
         "failure_class"
     ) != "CONTROL":
         return
-    if _worker_resource_identity_matches(
-        structured.get("execution_resource_policy"),
-        execution_resource,
-    ):
+    candidate = structured.get("execution_resource_policy")
+    if structured.get("schema") in {
+        OPERATION_CONTROL_RECEIPT_SCHEMA,
+        OPERATION_CONTROL_FACT_RECEIPT_SCHEMA,
+    }:
+        identity = structured.get("execution_identity")
+        if isinstance(identity, Mapping):
+            candidate = identity.get("execution_resource_policy_identity")
+    if _worker_resource_identity_matches(candidate, execution_resource):
         return
     message = "M02 Julia worker execution-resource policy identity mismatch"
     fatal_details = {
@@ -1303,65 +1362,259 @@ def _require_worker_resource_identity(
     raise failure
 
 
-def _bind_failed_preflight_failure_to_request(
+def _control_receipt_diagnostics_validator(
+    receipt: Mapping[str, object],
+    *,
+    request_binding: Mapping[str, object],
+) -> bool:
+    code = receipt.get("failure_code")
+    retryable_evidence = receipt.get("retryable_evidence")
+    legacy = {
+        "failure_code": code,
+        "stage": receipt.get("stage"),
+        "diagnostics": receipt.get("diagnostics"),
+        "retryable": (
+            retryable_evidence.get("retryable")
+            if isinstance(retryable_evidence, Mapping)
+            else None
+        ),
+        "request_binding": dict(request_binding),
+    }
+    if code in EXTERIOR_ENDPOINT_CONTROL_CODES:
+        return _valid_exterior_endpoint_control_diagnostics(
+            receipt, request_binding=request_binding
+        )
+    if code in NUMERICAL_CONTROL_FAILURE_CODES:
+        return _valid_numerical_control_diagnostics(
+            legacy,
+            request_binding=request_binding,
+        )
+    diagnostics = receipt.get("diagnostics")
+    if code == "ODE_RESOURCE_LIMIT":
+        if not isinstance(diagnostics, Mapping):
+            return False
+        resource_pairs = {
+            "request_wall_clock": "cooperative_request_deadline",
+            "homogeneous_leg_wall_clock": "homogeneous_leg_wall_clock",
+            "accepted_steps": "accepted_steps",
+            "rhs_evaluations": "rhs_evaluations",
+            "ode_solver_iterations": "homogeneous_ode_maxiters",
+        }
+        limit_kind = diagnostics.get("limit_kind")
+        snapshot = diagnostics.get("ode_snapshot")
+        try:
+            elapsed = _finite_text(
+                diagnostics.get("elapsed_leg_seconds"),
+                "ODE resource elapsed_leg_seconds",
+            )
+            snapshot_elapsed = _finite_text(
+                snapshot.get("elapsed_seconds")
+                if isinstance(snapshot, Mapping)
+                else None,
+                "ODE resource snapshot elapsed_seconds",
+            )
+        except JuliaResponseBackendError:
+            return False
+        return (
+            receipt.get("stage") == "homogeneous-propagation"
+            and limit_kind in resource_pairs
+            and diagnostics.get("limiting_resource")
+            == resource_pairs[limit_kind]
+            and isinstance(diagnostics.get("ode_leg"), str)
+            and bool(diagnostics["ode_leg"])
+            and isinstance(snapshot, Mapping)
+            and snapshot.get("ode_leg") == diagnostics["ode_leg"]
+            and snapshot.get("ode_endpoint_reached") is False
+            and (
+                snapshot.get("ode_retcode") == "MaxIters"
+                if limit_kind == "ode_solver_iterations"
+                else snapshot.get("ode_retcode") == "ResourceLimit"
+            )
+            and elapsed >= 0
+            and snapshot_elapsed == elapsed
+        )
+    if code == "ROOT_READOUT_RESOURCE_INFEASIBLE":
+        if not isinstance(diagnostics, Mapping):
+            return False
+        minimum_count = diagnostics.get("minimum_remaining_determinant_count")
+        try:
+            measured = _finite_text(
+                diagnostics.get("measured_determinant_seconds"),
+                "root feasibility measured_determinant_seconds",
+            )
+            remaining = _finite_text(
+                diagnostics.get("remaining_wall_time_seconds"),
+                "root feasibility remaining_wall_time_seconds",
+            )
+            estimated = _finite_text(
+                diagnostics.get("estimated_mandatory_seconds"),
+                "root feasibility estimated_mandatory_seconds",
+            )
+        except JuliaResponseBackendError:
+            return False
+        return (
+            receipt.get("stage") == "request-policy"
+            and diagnostics.get("limiting_resource")
+            == "cooperative_request_deadline"
+            and type(minimum_count) is int
+            and minimum_count >= 0
+            and measured >= 0
+            and remaining >= 0
+            and estimated >= remaining
+            and math.isclose(
+                estimated,
+                measured * minimum_count,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+            and diagnostics.get("estimator")
+            == "first-determinant-linear-lower-bound/v1"
+        )
+    if code == "WORKER_TIMEOUT":
+        if not isinstance(diagnostics, Mapping):
+            return False
+        expected_fields = {
+            "elapsed_request_seconds",
+            "limiting_resource",
+            "precision_digits",
+            "execution_resource_policy",
+        }
+        if "last_validated_progress" in diagnostics:
+            expected_fields.add("last_validated_progress")
+        resource = request_binding.get("execution_resource")
+        last_progress = diagnostics.get("last_validated_progress")
+        valid_last_progress = "last_validated_progress" not in diagnostics
+        if not valid_last_progress:
+            try:
+                timeout_identity = operation_execution_identity(
+                    receipt.get("execution_identity")
+                )
+            except (TypeError, ValueError):
+                return False
+            valid_last_progress = (
+                _timeout_progress_failure_fields(last_progress, timeout_identity)
+                == last_progress
+            )
+        try:
+            elapsed = _finite_text(
+                diagnostics.get("elapsed_request_seconds"),
+                "timeout elapsed_request_seconds",
+            )
+        except JuliaResponseBackendError:
+            return False
+        return (
+            receipt.get("origin") == PYTHON_SUPERVISOR_ORIGIN
+            and receipt.get("stage") == "worker-supervision"
+            and set(diagnostics) == expected_fields
+            and diagnostics.get("limiting_resource")
+            == "worker_request_wall_clock"
+            and isinstance(resource, Mapping)
+            and isinstance(resource.get("worker_request_wall_clock_seconds"), int)
+            and elapsed >= resource["worker_request_wall_clock_seconds"]
+            and diagnostics.get("precision_digits")
+            == request_binding.get("precision_digits")
+            and _worker_resource_identity_matches(
+                diagnostics.get("execution_resource_policy"), resource
+            )
+            and valid_last_progress
+        )
+    return False
+
+
+def validate_persisted_operation_control_receipt(
+    receipt: Mapping[str, object],
+    canonical_request: Mapping[str, object],
+) -> ValidatedControlReceipt:
+    """Revalidate a checkpointed worker/supervisor CONTROL proof."""
+
+    try:
+        _validated_execution_resource_policy(
+            canonical_request.get("execution_resource")
+        )
+    except JuliaResponseBackendError as error:
+        raise ValueError(
+            "persisted operation-control resource policy is invalid"
+        ) from error
+    request_sha256 = hashlib.sha256(
+        canonical_json_bytes(dict(canonical_request))
+    ).hexdigest()
+    return validate_operation_control_receipt(
+        receipt,
+        request=canonical_request,
+        request_sha256=request_sha256,
+        diagnostics_validator=lambda value: _control_receipt_diagnostics_validator(
+            value,
+            request_binding=canonical_request,
+        ),
+    )
+
+
+def _bind_control_failure_to_request(
     details: Mapping[str, object],
     request_document: Mapping[str, object],
     request_sha256: str,
-) -> dict[str, object]:
-    """Attach the canonical request only after its worker identity is verified."""
+) -> tuple[dict[str, object], ValidatedControlReceipt | None]:
+    """Validate every CONTROL receipt against the exact canonical request."""
 
     bound = dict(details)
     structured = bound.get("failure")
-    if (
-        not isinstance(structured, Mapping)
-        or structured.get("failure_class") != "CONTROL"
-        or structured.get("failure_code") not in (
-            {"INSUFFICIENT_ASYMPTOTIC_PRECISION"}
-            | set(_HORIZON_RECOVERY_FAILURES)
-        )
-    ):
-        return bound
+    if not isinstance(structured, Mapping) or structured.get("failure_class") != "CONTROL":
+        return bound, None
+    if structured.get("schema") not in {
+        OPERATION_CONTROL_RECEIPT_SCHEMA,
+        OPERATION_CONTROL_FACT_RECEIPT_SCHEMA,
+    }:
+        if request_document.get("operation") not in {
+            "root-readout",
+            "fixed-root-determinant-sample",
+            FIXED_ROOT_SURVEY_BATCH_OPERATION,
+        }:
+            return bound, None
     expected_sha256 = hashlib.sha256(
         canonical_json_bytes(request_document)
     ).hexdigest()
-    expected_identity = {
-        "request_sha256": expected_sha256,
-        "job_id": request_document.get("job_id"),
-        "leaf_id": request_document.get("leaf_id"),
-        "role": request_document.get("role"),
-        "job_policy_sha256": request_document.get("job_policy_sha256"),
-        "backend_identity_sha256": request_document.get(
-            "backend_identity_sha256"
-        ),
-        "refinement_level": request_document.get("refinement_level"),
-        "precision_digits": request_document.get("precision_digits"),
-    }
-    mismatch = request_sha256 != expected_sha256 or any(
-        structured.get(name) != expected
-        for name, expected in expected_identity.items()
-    )
-    if mismatch:
-        message = "M02 Julia failed-preflight request identity mismatch"
+    try:
+        if request_sha256 != expected_sha256:
+            raise ValueError("request digest mismatch")
+        validated = validate_operation_control_receipt(
+            structured,
+            request=request_document,
+            request_sha256=request_sha256,
+            diagnostics_validator=lambda receipt: _control_receipt_diagnostics_validator(
+                receipt,
+                request_binding=request_document,
+            ),
+        )
+    except ValueError as error:
+        message = "M02 Julia operation-control request identity mismatch"
         fatal_details = {
             name: details.get(name) for name in _WORKER_FAILURE_BASE_FIELDS
         }
-        fatal_details["worker_error_type"] = "FailedPreflightRequestIdentityError"
-        fatal_details["worker_error_message"] = message
+        fatal_details["worker_error_type"] = "OperationControlReceiptError"
+        fatal_details["worker_error_message"] = f"{message}: {error}"
         failure = JuliaResponseBackendError(message)
         failure.worker_failure = fatal_details
-        raise failure
-    enriched = dict(structured)
-    enriched["request_binding"] = dict(request_document)
-    bound["failure"] = enriched
-    return bound
+        raise failure from error
+    bound["failure"] = validated.to_mapping()
+    return bound, validated
 
 
-def _raise_worker_failure(details: Mapping[str, object]) -> None:
+def _raise_worker_failure(
+    details: Mapping[str, object],
+    *,
+    control_receipt: ValidatedControlReceipt | None = None,
+) -> None:
     """Raise an operational error while retaining bounded worker diagnostics."""
 
     details = dict(details)
     structured = details.get("failure")
-    if isinstance(structured, Mapping):
+    if (
+        isinstance(structured, Mapping)
+        and structured.get("schema") not in {
+            OPERATION_CONTROL_RECEIPT_SCHEMA,
+            OPERATION_CONTROL_FACT_RECEIPT_SCHEMA,
+        }
+    ):
         enriched = dict(structured)
         context = current_progress_context()
         for receipt_name, context_name in (
@@ -1420,19 +1673,25 @@ def _raise_worker_failure(details: Mapping[str, object]) -> None:
         error_class = JuliaRootReadoutResourceLimitError
     elif (
         isinstance(structured, Mapping)
-        and structured.get("failure_code") in NUMERICAL_CONTROL_FAILURE_CODES
+        and structured.get("failure_code") in (
+            NUMERICAL_CONTROL_FAILURE_CODES | EXTERIOR_ENDPOINT_CONTROL_CODES
+        )
         and structured.get("failure_class") == "CONTROL"
-        and _valid_numerical_control_diagnostics(structured)
+        and control_receipt is not None
     ):
         error_class = JuliaNumericalControlError
     else:
         error_class = JuliaResponseBackendError
     if error_class is JuliaNumericalControlError:
         failure = JuliaNumericalControlError(
-            message, str(structured["failure_code"])
+            message,
+            str(structured["failure_code"]),
+            control_receipt=control_receipt,
         )
     else:
         failure = error_class(message)
+        if control_receipt is not None:
+            failure.control_receipt = control_receipt
     failure.worker_failure = dict(details)
     raise failure
 
@@ -1660,6 +1919,69 @@ def _valid_insufficient_precision_diagnostics(
         and diagnostics.get("asymptotic_preflight_avoided_ode") is True
         and diagnostics.get("asymptotic_preflight_reason")
         == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+    )
+
+
+def _valid_exterior_endpoint_control_diagnostics(
+    receipt: Mapping[str, object],
+    *,
+    request_binding: Mapping[str, object],
+) -> bool:
+    code = receipt.get("failure_code")
+    diagnostics = receipt.get("diagnostics")
+    fields = {
+        "reason", "aggregate_limitation",
+        "endpoint_recovery_policy_identity",
+        "endpoint_recovery_policy_sha256", "endpoint_receipts",
+        "selected_intervention", "result",
+        "factored_homogeneous_rhs_evaluations",
+    }
+    expected = {
+        "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE": (
+            ENDPOINT_SERIES_ORDER_LIMITED,
+            "ENDPOINT_ORDER_RECOVERY_EXHAUSTED",
+            "UNRESOLVED",
+        ),
+        "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED": (
+            ENDPOINT_GEOMETRY_LIMITED,
+            "ENDPOINT_GEOMETRY_RECOVERY_EXHAUSTED",
+            "UNRESOLVED",
+        ),
+        "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE": (
+            ENDPOINT_ARITHMETIC_LIMITED,
+            "ARITHMETIC_PRECISION_PROMOTION",
+            "ARITHMETIC_INADEQUATE",
+        ),
+    }.get(str(code))
+    if (
+        receipt.get("stage") != "asymptotic-preflight"
+        or expected is None
+        or not isinstance(diagnostics, Mapping)
+        or set(diagnostics) != fields
+        or diagnostics.get("reason") != code
+        or diagnostics.get("aggregate_limitation") != expected[0]
+        or diagnostics.get("selected_intervention") != expected[1]
+        or diagnostics.get("result") != expected[2]
+        or diagnostics.get("factored_homogeneous_rhs_evaluations") != 0
+        or request_binding.get("schema") != FIXED_ROOT_SURVEY_BATCH_SCHEMA
+    ):
+        return False
+    try:
+        policy = _validated_fixed_root_endpoint_recovery_policy(
+            request_binding.get("fixed_root_endpoint_recovery_policy")
+        )
+        _validated_exterior_endpoint_recovery_evidence(
+            diagnostics.get("endpoint_receipts"),
+            policy,
+            expected_aggregate=expected[0],
+        )
+    except (TypeError, ValueError, JuliaResponseBackendError):
+        return False
+    return (
+        diagnostics.get("endpoint_recovery_policy_identity")
+        == policy["identity"]
+        and diagnostics.get("endpoint_recovery_policy_sha256")
+        == policy["policy_sha256"]
     )
 
 
@@ -2104,11 +2426,17 @@ def _valid_numerical_control_diagnostics(
     code = failure.get("failure_code")
     if not isinstance(code, str):
         return False
+    # These two codes share the factored-propagation exception family but
+    # carry richer, code-specific evidence.  Dispatch them before the generic
+    # four-field factored validator or their additional proof fields make an
+    # otherwise valid receipt fail exact-field validation.
+    if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
+        return _valid_insufficient_precision_diagnostics(stage, diagnostics)
+    if code == "ALGEBRAIC_REPRESENTATION_SINGULAR":
+        return _valid_algebraic_singularity_diagnostics(stage, diagnostics)
     if code in _FACTORED_FAILURE_STAGES:
         return _valid_factored_diagnostics(code, stage, diagnostics)
     if code in _HORIZON_RECOVERY_FAILURES:
-        if failure.get("retryable") is not _HORIZON_RECOVERY_FAILURES[code][2]:
-            return False
         if request_binding is None:
             raw_request = failure.get("request_binding")
             request_binding = raw_request if isinstance(raw_request, Mapping) else None
@@ -2121,14 +2449,29 @@ def _valid_numerical_control_diagnostics(
                 allow_historical_schema7_policy
             ),
         )
-    if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
-        return _valid_insufficient_precision_diagnostics(stage, diagnostics)
     if code in {
         "SCATTERING_BASIS_ILL_CONDITIONED",
         "SCATTERING_CHART_ILL_CONDITIONED",
     }:
         return _valid_scattering_diagnostics(code, stage, diagnostics)
     if code == "COORDINATE_INVERSION_STALLED":
+        # The coordinate watchdog emits the rich ODE snapshot below, while
+        # the shared factored-propagation translator can emit the same typed
+        # outcome with the bounded four-field factored proof.  Both are real
+        # production producers and therefore both must survive the common
+        # CONTROL binder.
+        if _has_exact_fields(diagnostics, _FACTORED_DIAGNOSTIC_FIELDS):
+            return (
+                stage == "coordinate-inversion"
+                and diagnostics.get("reason")
+                == "COORDINATE_INVERSION_STALLED"
+                and _is_positive_int(diagnostics.get("precision_bits"))
+                and _is_nonnegative_int(
+                    diagnostics.get("factored_homogeneous_rhs_evaluations")
+                )
+                and diagnostics.get("avoided_ode_scope")
+                == "factored-homogeneous-gsn/v1"
+            )
         return _valid_coordinate_stall_diagnostics(stage, diagnostics)
     if code == "FINITE_DIFFERENCE_NOISE_LIMIT":
         return _valid_finite_difference_noise_diagnostics(stage, diagnostics)
@@ -2138,8 +2481,27 @@ def _valid_numerical_control_diagnostics(
         return _valid_exterior_certificate_unavailable_diagnostics(
             stage, diagnostics
         )
-    if code == "ALGEBRAIC_REPRESENTATION_SINGULAR":
-        return _valid_algebraic_singularity_diagnostics(stage, diagnostics)
+    if code == "COORDINATE_IDENTITY_MISMATCH":
+        required_fields = {
+            "contour_label",
+            "maximum_absolute_residual",
+            "maximum_relative_residual",
+            "absolute_tolerance",
+            "relative_tolerance",
+            "sample_count",
+            "failure_reason",
+        }
+        return (
+            stage == "coordinate-inversion"
+            and required_fields.issubset(diagnostics)
+            and _is_positive_int(diagnostics.get("sample_count"))
+        )
+    if code == "ODE_SOLVER_FAILURE":
+        return (
+            stage == "homogeneous-propagation"
+            and isinstance(diagnostics.get("ode_leg"), str)
+            and isinstance(diagnostics.get("ode_snapshot"), Mapping)
+        )
     return False
 
 
@@ -2147,29 +2509,67 @@ def _timeout_worker_failure_details(
     details: Mapping[str, object],
     request: Mapping[str, object],
     execution_resource: Mapping[str, object],
+    elapsed_request_seconds: object,
     last_progress_event: object = None,
 ) -> dict[str, object]:
     """Attach a bounded control receipt to a forced outer worker timeout."""
 
     output = dict(details)
-    failure: dict[str, object] = {
-        "failure_code": "WORKER_TIMEOUT",
-        "failure_class": "CONTROL",
-        "retryable": True,
-        "precision_digits": request.get("precision_digits"),
-        "elapsed_request_seconds": execution_resource[
-            "worker_request_wall_clock_seconds"
-        ],
+    raw_identity = request.get("execution_identity")
+    if not isinstance(raw_identity, Mapping):
+        # The low-level adapter remains usable for probes and non-promoted
+        # callers that do not participate in the operation-control contract.
+        # Such a timeout is still typed operationally, but it cannot authorize
+        # a promoted transition or claim an authenticated request identity.
+        return output
+    identity = operation_execution_identity(raw_identity)
+    try:
+        elapsed = _finite_text(
+            elapsed_request_seconds, "timeout elapsed_request_seconds"
+        )
+    except JuliaResponseBackendError:
+        return output
+    configured_limit = execution_resource.get(
+        "worker_request_wall_clock_seconds"
+    )
+    if (
+        isinstance(configured_limit, bool)
+        or not isinstance(configured_limit, int)
+        or configured_limit <= 0
+        or elapsed < configured_limit
+    ):
+        # A runner flag is not evidence that the authenticated request exhausted
+        # its configured wall-clock budget.  Keep the operational failure, but
+        # do not manufacture a CONTROL receipt that could authorize recovery.
+        return output
+    diagnostics: dict[str, object] = {
+        "elapsed_request_seconds": elapsed,
         "limiting_resource": "worker_request_wall_clock",
+        "precision_digits": request.get("precision_digits"),
         "execution_resource_policy": dict(execution_resource),
     }
-    failure.update(_timeout_progress_failure_fields(last_progress_event))
-    output["failure"] = failure
+    progress_fields = _timeout_progress_failure_fields(
+        last_progress_event, identity
+    )
+    if progress_fields:
+        diagnostics["last_validated_progress"] = progress_fields
+    output["failure"] = build_operation_control_receipt(
+        origin=PYTHON_SUPERVISOR_ORIGIN,
+        failure_code="WORKER_TIMEOUT",
+        stage="worker-supervision",
+        identity=identity,
+        retryable=True,
+        retryable_basis=SUPERVISOR_RETRYABILITY_BASIS,
+        diagnostics=diagnostics,
+    )
     return output
 
 
-def _timeout_progress_failure_fields(value: object) -> dict[str, object]:
-    """Project the last already-validated worker event into timeout evidence."""
+def _timeout_progress_failure_fields(
+    value: object,
+    identity: OperationExecutionIdentity,
+) -> dict[str, object]:
+    """Retain only progress bound to this exact authenticated request."""
 
     if not isinstance(value, Mapping) or set(value) != {
         "schema",
@@ -2191,38 +2591,29 @@ def _timeout_progress_failure_fields(value: object) -> dict[str, object]:
     payload = copied.get("payload")
     if not isinstance(context, Mapping) or not isinstance(payload, Mapping):
         return {}
-    fields: dict[str, object] = {"last_progress_kind": copied["kind"]}
-    for receipt_name, context_names in (
-        ("readout_index", ("readout_index",)),
-        ("readout_role", ("readout_role",)),
-        ("root_phase", ("phase",)),
-        ("newton_index", ("newton_index",)),
-        ("determinant_index", ("determinant_index_leaf", "determinant_index")),
-        ("phase_determinant_index", ("determinant_index_phase",)),
-        ("determinant_purpose", ("determinant_purpose",)),
+    expected_identity = identity
+    if context.get("scope") == SAMPLE_SCOPE:
+        try:
+            expected_identity = identity.select_sample(
+                context.get("sample_index"),
+                context.get("sample_role"),
+            )
+        except (TypeError, ValueError):
+            return {}
+    expected_plan = expected_identity.mapping.get("plan")
+    if (
+        context.get("operation") != expected_identity.operation
+        or context.get("scope") != expected_identity.scope
+        or context.get("request_sha256") != expected_identity.request_sha256
+        or context.get("execution_identity_sha256")
+        != expected_identity.sha256
+        or (
+            expected_plan is not None
+            and context.get("plan") != expected_plan
+        )
     ):
-        for context_name in context_names:
-            item = context.get(context_name)
-            if item is not None:
-                fields[receipt_name] = item
-                break
-    request_elapsed = payload.get("request_elapsed_seconds")
-    if request_elapsed is not None:
-        fields["elapsed_request_seconds"] = request_elapsed
-    ode_kinds = {
-        ProgressEventKind.ODE_SOLVE_STARTED.value,
-        ProgressEventKind.ODE_SOLVE_PROGRESS.value,
-        ProgressEventKind.ODE_SOLVE_COMPLETED.value,
-        ProgressEventKind.ODE_SOLVE_FAILED.value,
-        ProgressEventKind.ODE_RESOURCE_LIMIT.value,
-    }
-    if copied["kind"] in ode_kinds:
-        fields["ode_snapshot"] = dict(payload)
-        if payload.get("ode_leg") is not None:
-            fields["ode_leg"] = payload["ode_leg"]
-        if payload.get("elapsed_seconds") is not None:
-            fields["elapsed_leg_seconds"] = payload["elapsed_seconds"]
-    return fields
+        return {}
+    return dict(copied)
 
 
 def _finite_text(value: object, label: str) -> float:
@@ -2299,7 +2690,15 @@ def _worker_request_document(
 ) -> tuple[dict[str, object], dict[str, object], str]:
     """Return the request binding, wire document, and canonical wire digest."""
 
-    request_binding = dict(request)
+    # A caller may need to derive a variant from an already-bound wire
+    # document.  Both fields below are products of binding, never inputs to
+    # it.  Excluding them here keeps rebinding canonical and matches Julia's
+    # request-digest projection.
+    request_binding = {
+        key: value
+        for key, value in request.items()
+        if key not in {"request_sha256", "execution_identity"}
+    }
     execution_resource = _validated_execution_resource_policy(
         request_binding["execution_resource"]
         if "execution_resource" in request_binding
@@ -2311,6 +2710,15 @@ def _worker_request_document(
     ).hexdigest()
     document = dict(request_binding)
     document["request_sha256"] = request_sha256
+    if request_binding.get("operation") in {
+        "root-readout",
+        "fixed-root-determinant-sample",
+        FIXED_ROOT_SURVEY_BATCH_OPERATION,
+    }:
+        document["execution_identity"] = execution_identity_from_request(
+            request_binding,
+            request_sha256=request_sha256,
+        ).to_mapping()
     return request_binding, document, request_sha256
 
 
@@ -2383,6 +2791,51 @@ class JuliaResponseEvaluation:
     cached_worker_response_receipt: Mapping[str, object] | None
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedFixedRootSurveyRequest:
+    """Immutable scheduler-to-adapter authority for one exact `/3` wire request."""
+
+    request: Mapping[str, object]
+    request_binding: Mapping[str, object]
+    document: Mapping[str, object]
+    request_sha256: str
+    execution_identity_sha256: str
+
+    @classmethod
+    def from_request(
+        cls, request: Mapping[str, object]
+    ) -> "PreparedFixedRootSurveyRequest":
+        request_copy = json.loads(canonical_json_bytes(dict(request)))
+        request_binding, document, request_sha256 = _worker_request_document(
+            request_copy
+        )
+        if document.get("operation") != FIXED_ROOT_SURVEY_BATCH_OPERATION:
+            raise ValueError("prepared request is not a fixed-root survey")
+        if (
+            request_copy.get("schema") != FIXED_ROOT_SURVEY_BATCH_SCHEMA
+            or request_copy.get("schema_version") != 3
+            or request_copy.get("control_profile") != FIXED_ROOT_CONTROL_PROFILE
+        ):
+            raise ValueError("prepared fixed-root request is not registered `/3`")
+        _validated_fixed_root_endpoint_recovery_policy(
+            request_copy.get("fixed_root_endpoint_recovery_policy")
+        )
+        identity = operation_execution_identity(document.get("execution_identity"))
+        if (
+            identity.scope != REQUEST_SCOPE
+            or identity.operation != FIXED_ROOT_SURVEY_BATCH_OPERATION
+            or identity.request_sha256 != request_sha256
+        ):
+            raise ValueError("prepared fixed-root execution identity is invalid")
+        return cls(
+            request=request_copy,
+            request_binding=json.loads(canonical_json_bytes(request_binding)),
+            document=json.loads(canonical_json_bytes(document)),
+            request_sha256=request_sha256,
+            execution_identity_sha256=identity.sha256,
+        )
+
+
 def _survey_complex_mapping(value: complex) -> dict[str, str]:
     converted = complex(value)
     if not math.isfinite(converted.real) or not math.isfinite(converted.imag):
@@ -2413,6 +2866,280 @@ def _survey_decimal_complex_from_mapping(
     )
 
 
+def _validated_fixed_root_endpoint_recovery_policy(
+    value: object,
+) -> dict[str, object]:
+    fields = {
+        "schema", "identity", "endpoint_order_rule", "base_endpoint_order",
+        "generated_maximum_order", "endpoint_order_schedule",
+        "horizon_geometry_rule", "horizon_geometry_schedule",
+        "infinity_geometry_rule", "infinity_geometry_schedule",
+        "fixed_root_reliability_target_abs", "fixed_root_reliability_rule",
+        "required_digit_guard", "precision_digits", "semantic_precision_tier",
+        "policy_sha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ValueError("fixed-root endpoint recovery policy fields are invalid")
+    if (
+        value["schema"] != FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_SCHEMA
+        or value["identity"] != FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_IDENTITY
+        or value["endpoint_order_rule"] != FIXED_ROOT_ENDPOINT_ORDER_RULE
+        or value["horizon_geometry_rule"] != FIXED_ROOT_HORIZON_GEOMETRY_RULE
+        or value["infinity_geometry_rule"] != FIXED_ROOT_INFINITY_GEOMETRY_RULE
+    ):
+        raise ValueError("fixed-root endpoint recovery policy identity is invalid")
+    base = value["base_endpoint_order"]
+    maximum = value["generated_maximum_order"]
+    orders = value["endpoint_order_schedule"]
+    if (
+        type(base) is not int or type(maximum) is not int
+        or not isinstance(orders, list)
+        or maximum != 4 * base
+        or any(type(order) is not int for order in orders)
+        or orders != _endpoint_order_schedule(base, maximum)
+    ):
+        raise ValueError("fixed-root endpoint recovery order schedule is invalid")
+    horizon = value["horizon_geometry_schedule"]
+    infinity = value["infinity_geometry_schedule"]
+    try:
+        horizon_values = [
+            _finite_decimal_text(item, "horizon endpoint geometry")
+            for item in horizon
+        ]
+        infinity_values = [
+            _finite_decimal_text(item, "infinity endpoint geometry")
+            for item in infinity
+        ]
+    except TypeError as error:
+        raise ValueError("fixed-root endpoint geometry schedule is invalid") from error
+    if (
+        not isinstance(horizon, list) or not horizon_values
+        or any(item >= 0 for item in horizon_values)
+        or [abs(item) for item in horizon_values]
+        != sorted(abs(item) for item in horizon_values)
+        or len(set(horizon_values)) != len(horizon_values)
+        or not isinstance(infinity, list) or not infinity_values
+        or any(item <= 0 for item in infinity_values)
+        or infinity_values != sorted(infinity_values)
+        or len(set(infinity_values)) != len(infinity_values)
+    ):
+        raise ValueError("fixed-root endpoint geometry schedule is invalid")
+    digits = value["precision_digits"]
+    if (
+        digits not in (40, 80)
+        or value["semantic_precision_tier"] != f"bigfloat-{digits}"
+        or type(value["required_digit_guard"]) is not int
+    ):
+        raise ValueError("fixed-root endpoint recovery precision binding is invalid")
+    content = {name: value[name] for name in fields if name != "policy_sha256"}
+    expected_sha256 = hashlib.sha256(canonical_json_bytes(content)).hexdigest()
+    if value["policy_sha256"] != expected_sha256:
+        raise ValueError("fixed-root endpoint recovery policy digest is invalid")
+    return json.loads(canonical_json_bytes(dict(value)))
+
+
+_ENDPOINT_ATTEMPT_FIELDS = {
+    "endpoint_branch", "attempted_endpoint_order", "attempted_geometry",
+    "maximum_last_term_ratio", "maximum_truncation_digits_lost",
+    "maximum_recurrence_digits_lost",
+    "maximum_series_evaluation_digits_lost", "predicted_reliable_digits",
+    "required_reliable_digits", "candidate_limitation",
+    "selected_intervention", "result",
+}
+_ENDPOINT_RECEIPT_FIELDS = {
+    "schema", "endpoint_branch", "recovery_policy_identity",
+    "recovery_policy_sha256", "base_endpoint_order",
+    "generated_maximum_order", "attempted_endpoint_orders",
+    "terminal_endpoint_order", "candidate_geometry_schedule",
+    "terminal_geometry", "maximum_last_term_ratio",
+    "maximum_truncation_digits_lost", "maximum_recurrence_digits_lost",
+    "maximum_series_evaluation_digits_lost", "predicted_reliable_digits",
+    "required_reliable_digits", "candidate_limitation",
+    "aggregate_limitation", "factored_homogeneous_rhs_evaluations",
+    "attempts",
+}
+
+
+def _recomputed_endpoint_limitation(attempt: Mapping[str, object]) -> str:
+    predicted = _finite_decimal_text(
+        attempt["predicted_reliable_digits"], "endpoint predicted digits"
+    )
+    required = _finite_decimal_text(
+        attempt["required_reliable_digits"], "endpoint required digits",
+        nonnegative=True,
+    )
+    last_ratio = _finite_decimal_text(
+        attempt["maximum_last_term_ratio"], "endpoint last-term ratio",
+        nonnegative=True,
+    )
+    truncation = _finite_decimal_text(
+        attempt["maximum_truncation_digits_lost"],
+        "endpoint truncation loss", nonnegative=True,
+    )
+    recurrence = _finite_decimal_text(
+        attempt["maximum_recurrence_digits_lost"],
+        "endpoint recurrence loss", nonnegative=True,
+    )
+    evaluation = _finite_decimal_text(
+        attempt["maximum_series_evaluation_digits_lost"],
+        "endpoint series-evaluation loss", nonnegative=True,
+    )
+    if predicted >= required:
+        return ENDPOINT_ADEQUATE
+    if last_ratio >= 1:
+        return ENDPOINT_GEOMETRY_LIMITED
+    if recurrence + evaluation >= truncation:
+        return ENDPOINT_ARITHMETIC_LIMITED
+    return ENDPOINT_SERIES_ORDER_LIMITED
+
+
+def _aggregate_endpoint_limitations(limitations: list[str]) -> str:
+    if limitations and all(item == ENDPOINT_ADEQUATE for item in limitations):
+        return ENDPOINT_ADEQUATE
+    if ENDPOINT_SERIES_ORDER_LIMITED in limitations:
+        return ENDPOINT_SERIES_ORDER_LIMITED
+    if ENDPOINT_GEOMETRY_LIMITED in limitations:
+        return ENDPOINT_GEOMETRY_LIMITED
+    if ENDPOINT_ARITHMETIC_LIMITED in limitations and all(
+        item in {ENDPOINT_ADEQUATE, ENDPOINT_ARITHMETIC_LIMITED}
+        for item in limitations
+    ):
+        return ENDPOINT_ARITHMETIC_LIMITED
+    raise ValueError("exterior endpoint limitations cannot be aggregated")
+
+
+def _validated_endpoint_recovery_receipt(
+    value: object,
+    policy: Mapping[str, object],
+    *,
+    endpoint_branch: str,
+) -> tuple[dict[str, object], str]:
+    if not isinstance(value, Mapping) or set(value) != _ENDPOINT_RECEIPT_FIELDS:
+        raise ValueError("exterior endpoint recovery receipt fields are invalid")
+    if (
+        value["schema"] != EXTERIOR_ENDPOINT_RECOVERY_RECEIPT_SCHEMA
+        or value["endpoint_branch"] != endpoint_branch
+        or value["recovery_policy_identity"] != policy["identity"]
+        or value["recovery_policy_sha256"] != policy["policy_sha256"]
+        or value["base_endpoint_order"] != policy["base_endpoint_order"]
+        or value["generated_maximum_order"] != policy["generated_maximum_order"]
+        or value["candidate_geometry_schedule"]
+        != policy[f"{endpoint_branch.split('-')[0]}_geometry_schedule"]
+        or value["factored_homogeneous_rhs_evaluations"] != 0
+    ):
+        raise ValueError("exterior endpoint recovery receipt binding is invalid")
+    attempts = value["attempts"]
+    if not isinstance(attempts, list) or not attempts:
+        raise ValueError("exterior endpoint recovery attempts are absent")
+    orders = policy["endpoint_order_schedule"]
+    geometries = value["candidate_geometry_schedule"]
+    order_index = 0
+    geometry_index = 0
+    recomputed: list[str] = []
+    metric_names = (
+        "maximum_last_term_ratio", "maximum_truncation_digits_lost",
+        "maximum_recurrence_digits_lost",
+        "maximum_series_evaluation_digits_lost",
+    )
+    maxima = {name: Decimal("-Infinity") for name in metric_names}
+    for index, attempt in enumerate(attempts):
+        if not isinstance(attempt, Mapping) or set(attempt) != _ENDPOINT_ATTEMPT_FIELDS:
+            raise ValueError("exterior endpoint recovery attempt fields are invalid")
+        if (
+            order_index >= len(orders)
+            or geometry_index >= len(geometries)
+            or attempt["endpoint_branch"] != endpoint_branch
+            or attempt["attempted_endpoint_order"] != orders[order_index]
+            or attempt["attempted_geometry"] != geometries[geometry_index]
+        ):
+            raise ValueError("exterior endpoint recovery trajectory is invalid")
+        limitation = _recomputed_endpoint_limitation(attempt)
+        if attempt["candidate_limitation"] != limitation:
+            raise ValueError("Julia endpoint limitation disagrees with its evidence")
+        recomputed.append(limitation)
+        for name in metric_names:
+            maxima[name] = max(
+                maxima[name],
+                _finite_decimal_text(attempt[name], f"endpoint {name}", nonnegative=True),
+            )
+        terminal = index == len(attempts) - 1
+        if limitation == ENDPOINT_ADEQUATE:
+            expected = ("ENTER_HOMOGENEOUS_ODE", "ADEQUATE", True)
+        elif limitation == ENDPOINT_ARITHMETIC_LIMITED:
+            expected = (
+                "PROMOTE_ARITHMETIC_TIER_IF_AGGREGATE_ALLOWS",
+                "ARITHMETIC_INADEQUATE", True,
+            )
+        elif limitation == ENDPOINT_SERIES_ORDER_LIMITED:
+            exhausted = order_index == len(orders) - 1
+            expected = (
+                "NONE" if exhausted else "INCREASE_ENDPOINT_ORDER",
+                "ORDER_EXHAUSTED" if exhausted else "RETRY",
+                exhausted,
+            )
+        else:
+            exhausted = geometry_index == len(geometries) - 1
+            expected = (
+                "NONE" if exhausted else "DEEPEN_ENDPOINT_GEOMETRY",
+                "GEOMETRY_EXHAUSTED" if exhausted else "RETRY",
+                exhausted,
+            )
+        if (
+            attempt["selected_intervention"] != expected[0]
+            or attempt["result"] != expected[1]
+            or terminal is not expected[2]
+        ):
+            raise ValueError("exterior endpoint recovery intervention is invalid")
+        if not terminal:
+            if limitation == ENDPOINT_SERIES_ORDER_LIMITED:
+                order_index += 1
+            else:
+                geometry_index += 1
+                order_index = 0
+    terminal_attempt = attempts[-1]
+    if (
+        value["attempted_endpoint_orders"]
+        != [attempt["attempted_endpoint_order"] for attempt in attempts]
+        or value["terminal_endpoint_order"]
+        != terminal_attempt["attempted_endpoint_order"]
+        or value["terminal_geometry"] != terminal_attempt["attempted_geometry"]
+        or value["predicted_reliable_digits"]
+        != terminal_attempt["predicted_reliable_digits"]
+        or value["required_reliable_digits"]
+        != terminal_attempt["required_reliable_digits"]
+        or value["candidate_limitation"] != recomputed[-1]
+    ):
+        raise ValueError("exterior endpoint terminal evidence is inconsistent")
+    for name in metric_names:
+        if _finite_decimal_text(value[name], f"terminal {name}", nonnegative=True) != maxima[name]:
+            raise ValueError("exterior endpoint summary maximum is invalid")
+    return json.loads(canonical_json_bytes(dict(value))), recomputed[-1]
+
+
+def _validated_exterior_endpoint_recovery_evidence(
+    value: object,
+    policy: Mapping[str, object],
+    *,
+    expected_aggregate: str | None = None,
+) -> tuple[list[dict[str, object]], str]:
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError("exterior determinant requires two endpoint receipts")
+    validated: list[dict[str, object]] = []
+    limitations: list[str] = []
+    for raw, branch in zip(value, ("horizon-ingoing", "infinity-outgoing")):
+        receipt, limitation = _validated_endpoint_recovery_receipt(
+            raw, policy, endpoint_branch=branch
+        )
+        validated.append(receipt)
+        limitations.append(limitation)
+    aggregate = _aggregate_endpoint_limitations(limitations)
+    if expected_aggregate is not None and aggregate != expected_aggregate:
+        raise ValueError("exterior endpoint aggregate limitation is invalid")
+    if any(receipt["aggregate_limitation"] != aggregate for receipt in validated):
+        raise ValueError("exterior endpoint receipts disagree on aggregate cause")
+    return validated, aggregate
+
+
 @dataclass(frozen=True, slots=True)
 class FixedRootSurveyConditioning:
     """Bounded, survey-only conditioning telemetry for one raw sample."""
@@ -2422,6 +3149,10 @@ class FixedRootSurveyConditioning:
     def __post_init__(self) -> None:
         fields = {
             "schema",
+            "fixed_root_reliability_target_abs",
+            "fixed_root_reliability_rule",
+            "required_digit_guard",
+            "fixed_root_reliability_projection_sha256",
             "determinant_family",
             "homogeneous_representation",
             "branch_convention",
@@ -2429,6 +3160,9 @@ class FixedRootSurveyConditioning:
             "determinant_normalisation",
             "maximum_series_digits_lost",
             "maximum_recurrence_digits_lost",
+            "maximum_series_evaluation_digits_lost",
+            "maximum_last_term_ratio",
+            "maximum_truncation_digits_lost",
             "minimum_asymptotic_predicted_reliable_digits",
             "endpoint_remainders_regular",
             "maximum_endpoint_reconstruction_error",
@@ -2436,12 +3170,53 @@ class FixedRootSurveyConditioning:
             "predicted_reliable_digits",
             "required_reliable_digits",
             "precision_limited",
+            "endpoint_recovery_policy_identity",
+            "endpoint_recovery_policy_sha256",
+            "endpoint_receipts",
+            "aggregate_limitation",
+            "factored_homogeneous_rhs_evaluations_before_recovery_decision",
             "determinant_count",
         }
         if not isinstance(self.mapping, Mapping) or set(self.mapping) != fields:
             raise ValueError("fixed-root survey conditioning fields are invalid")
         if self.mapping["schema"] != FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA:
             raise ValueError("fixed-root survey conditioning schema is invalid")
+        target = _finite_decimal_text(
+            self.mapping["fixed_root_reliability_target_abs"],
+            "fixed-root survey conditioning reliability target",
+            nonnegative=True,
+        )
+        if target <= 0 or target >= 1:
+            raise ValueError(
+                "fixed-root survey conditioning reliability target is invalid"
+            )
+        authority = load_fixed_root_reliability_projection_authority()
+        if (
+            self.mapping["fixed_root_reliability_rule"]
+            != authority.fixed_root_reliability_rule
+        ):
+            raise ValueError(
+                "fixed-root survey conditioning reliability rule is invalid"
+            )
+        guard = self.mapping["required_digit_guard"]
+        if type(guard) is not int or guard != authority.required_digit_guard:
+            raise ValueError(
+                "fixed-root survey conditioning required digit guard is invalid"
+            )
+        projection_sha256 = self.mapping[
+            "fixed_root_reliability_projection_sha256"
+        ]
+        if (
+            not isinstance(projection_sha256, str)
+            or len(projection_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in projection_sha256
+            )
+        ):
+            raise ValueError(
+                "fixed-root survey conditioning reliability projection is invalid"
+            )
         for name in (
             "determinant_family",
             "homogeneous_representation",
@@ -2454,6 +3229,9 @@ class FixedRootSurveyConditioning:
         for name in (
             "maximum_series_digits_lost",
             "maximum_recurrence_digits_lost",
+            "maximum_series_evaluation_digits_lost",
+            "maximum_last_term_ratio",
+            "maximum_truncation_digits_lost",
             "minimum_asymptotic_predicted_reliable_digits",
             "maximum_endpoint_reconstruction_error",
             "maximum_contour_angle_deformation",
@@ -2465,10 +3243,47 @@ class FixedRootSurveyConditioning:
                 f"fixed-root survey conditioning {name}",
                 nonnegative=True,
             )
+        predicted = _finite_decimal_text(
+            self.mapping["predicted_reliable_digits"],
+            "fixed-root survey conditioning predicted_reliable_digits",
+            nonnegative=True,
+        )
+        required = _finite_decimal_text(
+            self.mapping["required_reliable_digits"],
+            "fixed-root survey conditioning required_reliable_digits",
+            nonnegative=True,
+        )
+        with localcontext() as context:
+            context.prec = 128
+            expected_required = -target.log10() + Decimal(guard)
+        required_exponent = required.as_tuple().exponent
+        if (
+            not isinstance(required_exponent, int)
+            or required_exponent > -12
+            or abs(required - expected_required)
+            > Decimal(8).scaleb(required_exponent)
+        ):
+            raise ValueError(
+                "fixed-root survey conditioning required digits are invalid"
+            )
         if (
             type(self.mapping["endpoint_remainders_regular"]) is not bool
             or type(self.mapping["precision_limited"]) is not bool
             or self.mapping["determinant_count"] != 1
+            or self.mapping["precision_limited"] is not (predicted < required)
+            or self.mapping["precision_limited"] is not False
+            or self.mapping["endpoint_recovery_policy_identity"]
+            != FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_IDENTITY
+            or not isinstance(
+                self.mapping["endpoint_recovery_policy_sha256"], str
+            )
+            or len(self.mapping["endpoint_recovery_policy_sha256"]) != 64
+            or self.mapping["aggregate_limitation"] != ENDPOINT_ADEQUATE
+            or self.mapping[
+                "factored_homogeneous_rhs_evaluations_before_recovery_decision"
+            ] != 0
+            or not isinstance(self.mapping["endpoint_receipts"], list)
+            or len(self.mapping["endpoint_receipts"]) != 2
         ):
             raise ValueError("fixed-root survey conditioning bounds are invalid")
         object.__setattr__(
@@ -2542,12 +3357,20 @@ class ExteriorDeterminantErrorEvidence:
 
 @dataclass(frozen=True, slots=True)
 class JuliaFixedRootSurveySample:
-    role: str
+    sample_index: int
+    sample_role: str
     omega: complex
     amplitude: complex
     determinant: DecimalComplex
     numerical_conditioning: FixedRootSurveyConditioning
+    execution_identity: Mapping[str, object]
     determinant_error_evidence: ExteriorDeterminantErrorEvidence | None = None
+
+    @property
+    def role(self) -> str:
+        """Compatibility projection; persistence uses ``sample_role``."""
+
+        return self.sample_role
 
 
 @dataclass(frozen=True, slots=True)
@@ -2562,6 +3385,8 @@ class JuliaFixedRootSurveyBatch:
     frequency_step: Decimal
     coordinate_step: Decimal
     scientific_operation_identity: str
+    plan: FixedRootSurveyPlan
+    execution_identity: Mapping[str, object]
     request_sha256: str
     precision_tier: PrecisionTier
     working_precision_bits: int
@@ -2580,10 +3405,33 @@ class JuliaFixedRootSurveyBatch:
         cached, composed, or serialized by a later caller.
         """
 
-        fixed_root_survey_plan_for_pair(
+        resolved_plan = fixed_root_survey_plan_for_pair(
             self.scientific_operation_identity,
             self.sample_roles,
         )
+        if self.plan is not resolved_plan:
+            raise ValueError("fixed-root survey batch plan is invalid")
+        identity = operation_execution_identity(self.execution_identity)
+        if (
+            identity.scope != REQUEST_SCOPE
+            or identity.operation != FIXED_ROOT_SURVEY_BATCH_OPERATION
+            or identity.mapping["plan"] != self.plan.value
+            or tuple(identity.mapping["sample_roles"]) != self.sample_roles
+            or identity.request_sha256 != self.request_sha256
+        ):
+            raise ValueError("fixed-root survey execution identity is invalid")
+        object.__setattr__(self, "execution_identity", identity.to_mapping())
+        for index, sample in enumerate(self.samples):
+            sample_identity = operation_execution_identity(
+                sample.execution_identity
+            )
+            if (
+                sample.sample_index != index
+                or sample.sample_role != self.sample_roles[index]
+                or sample_identity.to_mapping()
+                != identity.select_sample(index, sample.sample_role).to_mapping()
+            ):
+                raise ValueError("fixed-root survey sample identity is invalid")
         if self.operation != FIXED_ROOT_SURVEY_BATCH_OPERATION:
             raise ValueError("fixed-root survey batch operation is invalid")
         if self.identity != BINARY64_FIXED_ROOT_SURVEY_IDENTITY:
@@ -2608,9 +3456,11 @@ class JuliaFixedRootSurveyBatch:
 
     def to_mapping(self) -> dict[str, object]:
         return {
-            "schema": FIXED_ROOT_SURVEY_BATCH_SCHEMA,
+            "schema": FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA,
             "operation": self.operation,
             "identity": self.identity,
+            "plan": self.plan.value,
+            "execution_identity": copy.deepcopy(dict(self.execution_identity)),
             "scientific_operation_identity": self.scientific_operation_identity,
             "leaf_id": self.leaf_id,
             "job_id": self.job_id,
@@ -2631,7 +3481,11 @@ class JuliaFixedRootSurveyBatch:
             "root_read_count": self.root_read_count,
             "samples": [
                 {
-                    "role": sample.role,
+                    "sample_index": sample.sample_index,
+                    "sample_role": sample.sample_role,
+                    "execution_identity": copy.deepcopy(
+                        dict(sample.execution_identity)
+                    ),
                     "omega": _survey_complex_mapping(sample.omega),
                     "amplitude": _survey_complex_mapping(sample.amplitude),
                     "determinant": sample.determinant.to_mapping(),
@@ -2754,7 +3608,9 @@ class JuliaResponseAdapter:
         )
 
     def _reuse_readout(
-        self, request_sha256: str
+        self,
+        request: Mapping[str, object],
+        request_sha256: str,
     ) -> tuple[dict[str, object], dict[str, object] | None] | None:
         """Return an already-computed readout for this exact request, if any."""
 
@@ -2787,19 +3643,68 @@ class JuliaResponseAdapter:
                 "trusted root-readout entry is corrupt: "
                 f"{lookup.path}: {lookup.reason}"
             )
+        if lookup.status is RootReadoutLookupStatus.INCOMPATIBLE:
+            # Compatibility changes are ordinary cache misses.  The old bytes
+            # remain forensic and are never interpreted or upgraded.
+            emit_progress(
+                ProgressEventKind.ROOT_READOUT_CACHE_STALE,
+                request_sha256=request_sha256,
+                store_path=str(lookup.path),
+                message=lookup.reason,
+            )
+            return None
         if lookup.status is not RootReadoutLookupStatus.HIT:
             return None
+        response = dict(lookup.response or {})
+        receipt = lookup.worker_response_receipt
+        if request.get("operation") == "root-readout":
+            try:
+                returned_identity = operation_execution_identity(
+                    response.get("execution_identity")
+                )
+                expected_identity = execution_identity_from_request(
+                    request,
+                    request_sha256=request_sha256,
+                )
+            except (TypeError, ValueError):
+                returned_identity = None
+                expected_identity = None
+            incompatible = (
+                response.get("schema_version") != WORKER_RESPONSE_WIRE_SCHEMA
+                or response.get("operation") != "root-readout"
+                or response.get("request_sha256") != request_sha256
+                or returned_identity is None
+                or expected_identity is None
+                or returned_identity.to_mapping()
+                != expected_identity.to_mapping()
+                or not isinstance(receipt, Mapping)
+                or receipt.get("schema") != WORKER_RESPONSE_RECEIPT_SCHEMA
+                or receipt.get("request_sha256") != request_sha256
+                or receipt.get("worker_response_schema_version")
+                != WORKER_RESPONSE_WIRE_SCHEMA
+            )
+            if incompatible:
+                emit_progress(
+                    ProgressEventKind.ROOT_READOUT_CACHE_STALE,
+                    request_sha256=request_sha256,
+                    store_path=str(lookup.path),
+                    message=(
+                        "cached root-readout response predates the current "
+                        "response/execution-identity contract"
+                    ),
+                )
+                return None
         emit_progress(
             ProgressEventKind.ROOT_READOUT_REUSED,
             request_sha256=request_sha256,
             store_path=str(lookup.path),
         )
         return (
-            dict(lookup.response or {}),
+            response,
             (
                 None
-                if lookup.worker_response_receipt is None
-                else dict(lookup.worker_response_receipt)
+                if receipt is None
+                else dict(receipt)
             ),
         )
 
@@ -2850,6 +3755,17 @@ class JuliaResponseAdapter:
         """Return a response without publishing it before scientific validation."""
 
         return self._evaluate(request, retain_fresh=False)
+
+    def evaluate_prepared_for_validation(
+        self, prepared: PreparedFixedRootSurveyRequest
+    ) -> JuliaResponseEvaluation:
+        """Dispatch the exact immutable request already named by the scheduler."""
+
+        return self._evaluate(
+            prepared.request,
+            retain_fresh=False,
+            prepared_request=prepared,
+        )
 
     def retain_validated_readout(
         self,
@@ -3012,14 +3928,28 @@ class JuliaResponseAdapter:
         return PromotedRequestPreflightResult(validated, binding, False)
 
     def _evaluate(
-        self, request: Mapping[str, object], *, retain_fresh: bool
+        self,
+        request: Mapping[str, object],
+        *,
+        retain_fresh: bool,
+        prepared_request: PreparedFixedRootSurveyRequest | None = None,
     ) -> JuliaResponseEvaluation:
-        request_document, document, request_sha256 = _worker_request_document(
-            request
-        )
+        if prepared_request is None:
+            request_document, document, request_sha256 = _worker_request_document(
+                request
+            )
+        else:
+            recomputed = PreparedFixedRootSurveyRequest.from_request(request)
+            if recomputed != prepared_request:
+                raise JuliaResponseBackendError(
+                    "prepared fixed-root request changed before dispatch"
+                )
+            request_document = dict(prepared_request.request_binding)
+            document = dict(prepared_request.document)
+            request_sha256 = prepared_request.request_sha256
         execution_resource = request_document["execution_resource"]
         runtime_identity = runtime_identity_sha256(self.runtime_provenance)
-        reused = self._reuse_readout(request_sha256)
+        reused = self._reuse_readout(request_document, request_sha256)
         if reused is not None:
             response, receipt = reused
             return JuliaResponseEvaluation(
@@ -3050,6 +3980,7 @@ class JuliaResponseAdapter:
                     str(request_path),
                     str(response_path),
                 )
+            worker_started = time.monotonic()
             if self.runner is subprocess.run:
                 completed = _run_streamed_julia(
                     command, cwd=directory, env=environment, timeout=timeout
@@ -3066,10 +3997,13 @@ class JuliaResponseAdapter:
                         timeout=timeout,
                     )
                 except subprocess.TimeoutExpired as error:
+                    elapsed_request_seconds = max(
+                        0.0, time.monotonic() - worker_started
+                    )
                     stderr = _bounded_text(error.stderr, 4000)
                     if stderr is None:
                         stderr = _bounded_text(error.output, 4000) or ""
-                    _raise_worker_failure(_timeout_worker_failure_details(
+                    timeout_details = _timeout_worker_failure_details(
                         {
                             "worker_exit_code": None,
                             "worker_timed_out": True,
@@ -3079,8 +4013,19 @@ class JuliaResponseAdapter:
                         },
                         document,
                         execution_resource,
-                    ))
+                        elapsed_request_seconds,
+                    )
+                    timeout_details, timeout_receipt = _bind_control_failure_to_request(
+                        timeout_details, request_document, request_sha256
+                    )
+                    _raise_worker_failure(
+                        timeout_details,
+                        control_receipt=timeout_receipt,
+                    )
             returncode = getattr(completed, "returncode", None)
+            elapsed_request_seconds = max(
+                0.0, time.monotonic() - worker_started
+            )
             if bool(getattr(completed, "timed_out", False)) or returncode != 0:
                 details = _worker_failure_details(completed, response_path)
                 if bool(getattr(completed, "timed_out", False)):
@@ -3099,23 +4044,24 @@ class JuliaResponseAdapter:
                         details,
                         document,
                         execution_resource,
+                        elapsed_request_seconds,
                         last_progress_event,
                     )
                 _require_worker_resource_identity(details, execution_resource)
-                details = _bind_failed_preflight_failure_to_request(
+                details, control_receipt = _bind_control_failure_to_request(
                     details, request_document, request_sha256
                 )
-                _raise_worker_failure(details)
+                _raise_worker_failure(details, control_receipt=control_receipt)
             response = _strict_json_file(response_path, "M02 Julia response")
         if response.get("status") != "ok":
             details = _worker_failure_details(
                 completed, response_path, response=response
             )
             _require_worker_resource_identity(details, execution_resource)
-            details = _bind_failed_preflight_failure_to_request(
+            details, control_receipt = _bind_control_failure_to_request(
                 details, request_document, request_sha256
             )
-            _raise_worker_failure(details)
+            _raise_worker_failure(details, control_receipt=control_receipt)
         if response.get("request_sha256") != request_sha256:
             raise JuliaResponseBackendError("M02 Julia response request digest mismatch")
         if retain_fresh and self.readout_cache is not None:
@@ -3592,7 +4538,7 @@ class JuliaPrecisionRootBackend:
 
     def _fixed_root_survey_policy(
         self, job: ResponseComponentJob
-    ) -> dict[str, object]:
+    ) -> tuple[dict[str, object], dict[str, object]]:
         policy = _precision_policy(
             job,
             self.digits,
@@ -3603,9 +4549,72 @@ class JuliaPrecisionRootBackend:
             diagnostic_model_identity=EXTERIOR_PROVISIONAL_DETERMINANT_ERROR_MODEL,
             include_control_provenance=True,
         )
+        profile = self.empirical_control_profile
+        receipt = self.calibration_receipt
+        if profile is None or receipt is None:
+            raise ValueError(
+                "fixed-root reliability projection requires authenticated controls"
+            )
+        authority = load_fixed_root_reliability_projection_authority()
+        calibrated_controls = (
+            profile.base_controls
+            if self.refinement == 0
+            else profile.refinement_controls
+        )
+        for field in authority.fixed_root_policy_control_fields:
+            if (
+                field not in calibrated_controls
+                or policy.get(field) != calibrated_controls[field]
+            ):
+                raise ValueError(
+                    "fixed-root survey policy disagrees with its calibrated "
+                    f"control {field}"
+                )
+        target_control_field = (
+            authority.fixed_root_reliability_target_control_field
+        )
+        reliability_target = calibrated_controls.get(target_control_field)
+        if policy.get(target_control_field) != reliability_target:
+            raise ValueError(
+                "fixed-root reliability target disagrees with calibration"
+            )
+        if not isinstance(reliability_target, str):
+            raise ValueError(
+                "fixed-root reliability target is absent from calibration"
+            )
+        target = _finite_decimal_text(
+            reliability_target,
+            "fixed-root reliability target",
+            nonnegative=True,
+        )
+        if target <= 0 or target >= 1:
+            raise ValueError(
+                "fixed-root reliability target must be between zero and one"
+            )
+        receipt_mapping = receipt.to_mapping()
+        if (
+            receipt_mapping.get("schema") != authority.calibration_receipt_schema
+            or receipt_mapping.get("identity")
+            != authority.calibration_receipt_identity
+        ):
+            raise ValueError(
+                "fixed-root reliability authority disagrees with calibration"
+            )
+        profile_sha256 = hashlib.sha256(
+            canonical_json_bytes(profile.to_mapping())
+        ).hexdigest()
+        if (
+            policy.get("promoted_control_calibration_receipt_sha256")
+            != receipt.sha256
+            or policy.get("empirical_control_profile_sha256") != profile_sha256
+        ):
+            raise ValueError(
+                "fixed-root reliability provenance disagrees with calibration"
+            )
         for field in (
             _FIXED_ROOT_SURVEY_REVIEW_ONLY_POLICY_FIELDS
             | _FIXED_ROOT_SURVEY_ROOT_ONLY_POLICY_FIELDS
+            | _FIXED_ROOT_SURVEY_RELIABILITY_POLICY_FIELDS
         ):
             policy.pop(field, None)
         if not _FIXED_ROOT_SURVEY_CERTIFICATE_FIELDS.issubset(policy):
@@ -3613,7 +4622,28 @@ class JuliaPrecisionRootBackend:
                 "fixed-root survey policy is missing its determinant-error "
                 "certificate fields"
             )
-        return policy
+        projection_binding: dict[str, object] = {
+            "schema": FIXED_ROOT_RELIABILITY_PROJECTION_SCHEMA,
+            "source_reliability_projection_authority_schema": authority.schema,
+            "source_reliability_projection_authority_identity": (
+                authority.identity
+            ),
+            "source_reliability_projection_authority_sha256": (
+                authority.authority_sha256
+            ),
+            "source_calibration_receipt_sha256": receipt.sha256,
+            "source_empirical_control_profile_sha256": profile_sha256,
+            "source_refinement_level": self.refinement,
+            "fixed_root_reliability_target_abs": reliability_target,
+            "fixed_root_reliability_rule": authority.fixed_root_reliability_rule,
+            "required_digit_guard": authority.required_digit_guard,
+        }
+        return policy, {
+            **projection_binding,
+            "projection_sha256": hashlib.sha256(
+                canonical_json_bytes(projection_binding)
+            ).hexdigest(),
+        }
 
     def preview_fixed_root_survey_request(
         self,
@@ -3622,15 +4652,12 @@ class JuliaPrecisionRootBackend:
         fixed_root: complex,
         root_seal_sha256: str,
         branch_identity: str,
-        plan: FixedRootSurveyPlan | str | None = None,
-        sample_roles: tuple[str, ...] | None = None,
-        scientific_operation_identity: str | None = None,
+        plan: FixedRootSurveyPlan | str,
     ) -> dict[str, object]:
         """Build one strict plan-owned Julia batch without launching Julia.
 
-        ``sample_roles``/``scientific_operation_identity`` remain a narrow
-        reader/fixture compatibility path.  New scheduler code supplies only
-        the named ``plan``; both concrete values are resolved below.
+        The named plan is the sole request-shape authority.  Callers cannot
+        independently pair a scientific identity with a role vector.
         """
 
         if job.backend_identity != self.identity:
@@ -3650,11 +4677,7 @@ class JuliaPrecisionRootBackend:
             raise ValueError("fixed-root survey root seal is invalid")
         if branch_identity != job.root.branch_id:
             raise ValueError("fixed-root survey branch identity mismatch")
-        contract = _resolve_fixed_root_survey_request_contract(
-            plan=plan,
-            sample_roles=sample_roles,
-            scientific_operation_identity=scientific_operation_identity,
-        )
+        contract = fixed_root_survey_request_contract(plan)
         sample_roles = contract.sample_roles
         scientific_operation_identity = contract.scientific_operation_identity
         frequency_step = 1.0e-5 * (1.0 + abs(root))
@@ -3681,21 +4704,42 @@ class JuliaPrecisionRootBackend:
             ),
         }
         samples: list[dict[str, object]] = []
-        for role in sample_roles:
+        for sample_index, role in enumerate(sample_roles):
             omega, amplitude = points[role]
             sample: dict[str, object] = {
-                "role": role,
+                "sample_index": sample_index,
+                "sample_role": role,
                 "omega": _survey_complex_mapping(omega),
                 "amplitude": _survey_complex_mapping(amplitude),
             }
             if role in _FIXED_ROOT_SURVEY_COORDINATE_ROLES:
                 sample["support"] = dict(support)
             samples.append(sample)
+        fixed_root_policy, reliability_projection = (
+            self._fixed_root_survey_policy(job)
+        )
+        endpoint_recovery_policy = _fixed_root_endpoint_recovery_policy(
+            fixed_root_policy,
+            reliability_projection,
+            precision_digits=self.digits,
+        )
+        fixed_root_policy = dict(fixed_root_policy)
+        fixed_root_policy["rho_in"] = endpoint_recovery_policy[
+            "horizon_geometry_schedule"
+        ][-1]
+        fixed_root_policy["rho_out"] = endpoint_recovery_policy[
+            "infinity_geometry_schedule"
+        ][-1]
+        fixed_root_policy["rho_out_candidate_schedule"] = list(
+            endpoint_recovery_policy["infinity_geometry_schedule"]
+        )
         return {
-            "schema_version": 1,
+            "schema_version": 3,
             "schema": FIXED_ROOT_SURVEY_BATCH_SCHEMA,
             "operation": FIXED_ROOT_SURVEY_BATCH_OPERATION,
+            "control_profile": FIXED_ROOT_CONTROL_PROFILE,
             "identity": BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
+            "plan": contract.plan.value,
             "scientific_operation_identity": scientific_operation_identity,
             "leaf_id": job.leaf_id,
             "job_id": job.job_id,
@@ -3718,14 +4762,37 @@ class JuliaPrecisionRootBackend:
             "precision_digits": self.digits,
             "working_precision_bits": math.ceil(self.digits * math.log2(10)) + 32,
             "semantic_precision_tier": f"bigfloat-{self.digits}",
+            "fixed_root_reliability_projection": reliability_projection,
+            "fixed_root_endpoint_recovery_policy": endpoint_recovery_policy,
             "frequency_step": format(frequency_step, ".17g"),
             "coordinate_step": format(coordinate_step, ".17g"),
             "sample_roles": list(sample_roles),
             "maximum_sample_count": _FIXED_ROOT_SURVEY_MAXIMUM_SAMPLE_COUNT,
             "samples": samples,
-            "policy": self._fixed_root_survey_policy(job),
+            "policy": fixed_root_policy,
             "execution_resource": _execution_resource_policy(),
         }
+
+    def prepare_fixed_root_survey_request(
+        self,
+        job: ResponseComponentJob,
+        *,
+        fixed_root: complex,
+        root_seal_sha256: str,
+        branch_identity: str,
+        plan: FixedRootSurveyPlan | str,
+    ) -> PreparedFixedRootSurveyRequest:
+        """Freeze the exact worker bytes before REQUESTED is reported."""
+
+        return PreparedFixedRootSurveyRequest.from_request(
+            self.preview_fixed_root_survey_request(
+                job,
+                fixed_root=fixed_root,
+                root_seal_sha256=root_seal_sha256,
+                branch_identity=branch_identity,
+                plan=plan,
+            )
+        )
 
     def fixed_root_survey_batch(
         self,
@@ -3734,35 +4801,77 @@ class JuliaPrecisionRootBackend:
         fixed_root: complex,
         root_seal_sha256: str,
         branch_identity: str,
-        plan: FixedRootSurveyPlan | str | None = None,
-        sample_roles: tuple[str, ...] | None = None,
-        scientific_operation_identity: str | None = None,
+        plan: FixedRootSurveyPlan | str,
+        prepared_request: PreparedFixedRootSurveyRequest | None = None,
     ) -> JuliaFixedRootSurveyBatch:
         """Run one Julia request for one ordered fixed-root survey batch."""
 
-        request = self.preview_fixed_root_survey_request(
+        expected_prepared = self.prepare_fixed_root_survey_request(
             job,
             fixed_root=fixed_root,
             root_seal_sha256=root_seal_sha256,
             branch_identity=branch_identity,
             plan=plan,
-            sample_roles=sample_roles,
-            scientific_operation_identity=scientific_operation_identity,
         )
-        contract = _resolve_fixed_root_survey_request_contract(
-            plan=plan,
-            sample_roles=sample_roles,
-            scientific_operation_identity=scientific_operation_identity,
+        if prepared_request is None:
+            prepared_request = expected_prepared
+        elif prepared_request != expected_prepared:
+            raise JuliaResponseBackendError(
+                "prepared fixed-root request disagrees with scheduler inputs"
+            )
+        request = prepared_request.request
+        recovery_policy = _validated_fixed_root_endpoint_recovery_policy(
+            request.get("fixed_root_endpoint_recovery_policy")
         )
+        reliability_projection = request.get("fixed_root_reliability_projection")
+        if (
+            request.get("control_profile") != FIXED_ROOT_CONTROL_PROFILE
+            or recovery_policy["base_endpoint_order"]
+            != request["policy"]["endpoint_series_order"]
+            or recovery_policy["horizon_geometry_schedule"][-1]
+            != request["policy"]["rho_in"]
+            or recovery_policy["infinity_geometry_schedule"][-1]
+            != request["policy"]["rho_out"]
+            or recovery_policy["precision_digits"] != self.digits
+            or not isinstance(reliability_projection, Mapping)
+            or any(
+                recovery_policy[field] != reliability_projection.get(field)
+                for field in (
+                    "fixed_root_reliability_target_abs",
+                    "fixed_root_reliability_rule",
+                    "required_digit_guard",
+                )
+            )
+        ):
+            raise JuliaResponseBackendError(
+                "fixed-root endpoint recovery policy disagrees with request"
+            )
+        contract = fixed_root_survey_request_contract(plan)
         sample_roles = contract.sample_roles
         scientific_operation_identity = contract.scientific_operation_identity
-        evaluation = self.adapter.evaluate_for_validation(request)
+        prepared_evaluator = getattr(
+            self.adapter, "evaluate_prepared_for_validation", None
+        )
+        if callable(prepared_evaluator):
+            evaluation = prepared_evaluator(prepared_request)
+        else:
+            evaluation = self.adapter.evaluate_for_validation(request)
+        if (
+            evaluation.request_sha256 != prepared_request.request_sha256
+            or evaluation.request_binding != prepared_request.request_binding
+        ):
+            raise JuliaResponseBackendError(
+                "fixed-root adapter dispatched a different prepared request"
+            )
         response = evaluation.response
         response_fields = {
             "schema_version",
+            "schema",
             "status",
             "operation",
             "identity",
+            "plan",
+            "execution_identity",
             "scientific_operation_identity",
             "request_sha256",
             "leaf_id",
@@ -3782,8 +4891,10 @@ class JuliaPrecisionRootBackend:
                 "M02 fixed-root survey batch response fields are invalid"
             )
         expected_bindings = {
+            "schema": FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA,
             "operation": FIXED_ROOT_SURVEY_BATCH_OPERATION,
             "identity": BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
+            "plan": contract.plan.value,
             "scientific_operation_identity": scientific_operation_identity,
             "request_sha256": evaluation.request_sha256,
             "leaf_id": job.leaf_id,
@@ -3798,7 +4909,7 @@ class JuliaPrecisionRootBackend:
             "sample_count": len(sample_roles),
         }
         if (
-            response["schema_version"] != 1
+            response["schema_version"] != 3
             or response["status"] != "ok"
             or any(response[name] != value for name, value in expected_bindings.items())
             or not isinstance(response["samples"], list)
@@ -3807,6 +4918,26 @@ class JuliaPrecisionRootBackend:
             raise JuliaResponseBackendError(
                 "M02 fixed-root survey batch response authentication failed"
             )
+        expected_execution_identity = execution_identity_from_request(
+            evaluation.request_binding,
+            request_sha256=evaluation.request_sha256,
+        )
+        try:
+            returned_execution_identity = operation_execution_identity(
+                response["execution_identity"]
+            )
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                "M02 fixed-root survey execution identity is invalid"
+            ) from error
+        if (
+            returned_execution_identity.scope != REQUEST_SCOPE
+            or returned_execution_identity.to_mapping()
+            != expected_execution_identity.to_mapping()
+        ):
+            raise JuliaResponseBackendError(
+                "M02 fixed-root survey execution identity mismatch"
+            )
         parsed_samples: list[JuliaFixedRootSurveySample] = []
         request_samples = request["samples"]
         policy = request["policy"]
@@ -3814,12 +4945,32 @@ class JuliaPrecisionRootBackend:
             zip(sample_roles, response["samples"], request_samples)
         ):
             fields = {
-                "role", "omega", "amplitude", "determinant",
+                "sample_index", "sample_role", "execution_identity",
+                "omega", "amplitude", "determinant",
                 "numerical_conditioning", "determinant_error_evidence",
             }
-            if not isinstance(raw, Mapping) or set(raw) != fields or raw["role"] != role:
+            if (
+                not isinstance(raw, Mapping)
+                or set(raw) != fields
+                or raw["sample_index"] != index
+                or raw["sample_role"] != role
+            ):
                 raise JuliaResponseBackendError(
                     f"M02 fixed-root survey sample {index} is invalid"
+                )
+            try:
+                sample_identity = operation_execution_identity(
+                    raw["execution_identity"]
+                )
+            except ValueError as error:
+                raise JuliaResponseBackendError(
+                    f"M02 fixed-root survey sample {index} identity is invalid"
+                ) from error
+            if sample_identity.to_mapping() != expected_execution_identity.select_sample(
+                index, role
+            ).to_mapping():
+                raise JuliaResponseBackendError(
+                    f"M02 fixed-root survey sample {index} identity mismatch"
                 )
             omega = _survey_complex_from_mapping(raw["omega"], "survey omega")
             amplitude = _survey_complex_from_mapping(
@@ -3845,6 +4996,9 @@ class JuliaPrecisionRootBackend:
                     "M02 fixed-root survey conditioning is invalid"
                 ) from error
             telemetry = conditioning.mapping
+            reliability_projection = request[
+                "fixed_root_reliability_projection"
+            ]
             if any(
                 telemetry[name] != policy[name]
                 for name in (
@@ -3857,6 +5011,39 @@ class JuliaPrecisionRootBackend:
             ):
                 raise JuliaResponseBackendError(
                     "M02 fixed-root survey conditioning disagrees with request"
+                )
+            if (
+                telemetry["fixed_root_reliability_target_abs"]
+                != reliability_projection["fixed_root_reliability_target_abs"]
+                or telemetry["fixed_root_reliability_rule"]
+                != reliability_projection["fixed_root_reliability_rule"]
+                or telemetry["required_digit_guard"]
+                != reliability_projection["required_digit_guard"]
+                or telemetry["fixed_root_reliability_projection_sha256"]
+                != reliability_projection["projection_sha256"]
+            ):
+                raise JuliaResponseBackendError(
+                    "M02 fixed-root survey reliability telemetry disagrees "
+                    "with request"
+                )
+            try:
+                _validated_exterior_endpoint_recovery_evidence(
+                    telemetry["endpoint_receipts"],
+                    recovery_policy,
+                    expected_aggregate=ENDPOINT_ADEQUATE,
+                )
+            except ValueError as error:
+                raise JuliaResponseBackendError(
+                    "M02 fixed-root endpoint recovery evidence is invalid"
+                ) from error
+            if (
+                telemetry["endpoint_recovery_policy_identity"]
+                != recovery_policy["identity"]
+                or telemetry["endpoint_recovery_policy_sha256"]
+                != recovery_policy["policy_sha256"]
+            ):
+                raise JuliaResponseBackendError(
+                    "M02 fixed-root endpoint recovery telemetry moved"
                 )
             raw_evidence = raw["determinant_error_evidence"]
             determinant_error_evidence = None
@@ -3878,7 +5065,13 @@ class JuliaPrecisionRootBackend:
                         "with request"
                     )
             parsed_samples.append(JuliaFixedRootSurveySample(
-                role, omega, amplitude, determinant, conditioning,
+                index,
+                role,
+                omega,
+                amplitude,
+                determinant,
+                conditioning,
+                sample_identity.to_mapping(),
                 determinant_error_evidence,
             ))
         return JuliaFixedRootSurveyBatch(
@@ -3896,6 +5089,8 @@ class JuliaPrecisionRootBackend:
                 request["coordinate_step"], "survey coordinate step", nonnegative=True
             ),
             scientific_operation_identity=scientific_operation_identity,
+            plan=contract.plan,
+            execution_identity=returned_execution_identity.to_mapping(),
             request_sha256=evaluation.request_sha256,
             precision_tier=precision_tier(str(request["semantic_precision_tier"])),
             working_precision_bits=int(request["working_precision_bits"]),
@@ -3986,7 +5181,10 @@ class JuliaPrecisionRootBackend:
             "semantic_precision_tier", "working_precision_bits",
             "readout_role",
         }
-        current_fields = historical_fields | {"numerical_conditioning"}
+        current_fields = historical_fields | {
+            "numerical_conditioning",
+            "execution_identity",
+        }
         if (
             not isinstance(response, Mapping)
             or (
@@ -4020,6 +5218,22 @@ class JuliaPrecisionRootBackend:
             if set(response) != current_fields:
                 raise JuliaResponseBackendError(
                     "M02 fixed-root sample conditioning fields are invalid"
+                )
+            try:
+                returned_identity = operation_execution_identity(
+                    response["execution_identity"]
+                )
+                expected_identity = execution_identity_from_request(
+                    evaluation.request_binding,
+                    request_sha256=evaluation.request_sha256,
+                )
+            except ValueError as error:
+                raise JuliaResponseBackendError(
+                    "M02 fixed-root sample execution identity is invalid"
+                ) from error
+            if returned_identity.to_mapping() != expected_identity.to_mapping():
+                raise JuliaResponseBackendError(
+                    "M02 fixed-root sample execution identity mismatch"
                 )
             try:
                 numerical_conditioning = NumericalConditioningEvidence.from_mapping(
@@ -4214,16 +5428,7 @@ class JuliaPrecisionRootBackend:
             == PROMOTED_ROOT_READOUT_POLICY
         )
         if current_request and response_schema == WORKER_RESPONSE_WIRE_SCHEMA:
-            return self._read_root_response_v7(
-                job, request, evaluation, legacy_wire=False
-            )
-        if (
-            current_request
-            and response_schema == LEGACY_PROMOTED_WORKER_RESPONSE_WIRE_SCHEMA
-        ):
-            return self._read_root_response_v7(
-                job, request, evaluation, legacy_wire=True
-            )
+            return self._read_root_response_v7(job, request, evaluation)
         if response_schema == 6 and not current_request:
             return self._read_root_response_v6(job, request, evaluation)
         raise JuliaResponseBackendError(
@@ -4235,8 +5440,6 @@ class JuliaPrecisionRootBackend:
         job: ResponseComponentJob,
         request: Mapping[str, object],
         evaluation: JuliaResponseEvaluation,
-        *,
-        legacy_wire: bool = False,
     ) -> RootReadout:
         response = dict(evaluation.response)
         expected_fields = {
@@ -4270,13 +5473,13 @@ class JuliaPrecisionRootBackend:
             "numerical_conditioning",
             "horizon_endpoint_search_evidence",
         }
-        if not legacy_wire:
-            expected_fields.update({
-                "operation",
-                "diagnostic_model_identity",
-                "required_raw_determinant_roles",
-                "required_raw_determinant_count",
-            })
+        expected_fields.update({
+            "operation",
+            "execution_identity",
+            "diagnostic_model_identity",
+            "required_raw_determinant_roles",
+            "required_raw_determinant_count",
+        })
         if set(response) != expected_fields:
             raise JuliaResponseBackendError("M02 Julia response fields are invalid")
         if (
@@ -4290,18 +5493,10 @@ class JuliaPrecisionRootBackend:
                     "seed_path_determinant_count",
                 )
             )
-            or response["schema_version"]
-            != (
-                LEGACY_PROMOTED_WORKER_RESPONSE_WIRE_SCHEMA
-                if legacy_wire
-                else WORKER_RESPONSE_WIRE_SCHEMA
-            )
+            or response["schema_version"] != WORKER_RESPONSE_WIRE_SCHEMA
             or response["status"] != "ok"
             or response["adapter"] != "package-owned-julia-gsn-root-readout"
-            or (
-                not legacy_wire
-                and response["operation"] != "root-readout"
-            )
+            or response["operation"] != "root-readout"
             or response["request_sha256"] != evaluation.request_sha256
             or response["precision_digits"] != self.digits
             or response["working_precision_bits"]
@@ -4317,6 +5512,22 @@ class JuliaPrecisionRootBackend:
             or response["seed_path_radius_abs"] is not None
         ):
             raise JuliaResponseBackendError("M02 Julia response contract is invalid")
+        try:
+            returned_identity = operation_execution_identity(
+                response["execution_identity"]
+            )
+            expected_identity = execution_identity_from_request(
+                evaluation.request_binding,
+                request_sha256=evaluation.request_sha256,
+            )
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                "M02 root-readout execution identity is invalid"
+            ) from error
+        if returned_identity.to_mapping() != expected_identity.to_mapping():
+            raise JuliaResponseBackendError(
+                "M02 root-readout execution identity mismatch"
+            )
 
         policy = request.get("policy")
         if not isinstance(policy, Mapping):
@@ -4334,36 +5545,30 @@ class JuliaPrecisionRootBackend:
                 "M02 Julia promoted root policy identity is invalid"
             )
 
-        diagnostic_contract: RawDeterminantContract | None = None
-        if not legacy_wire:
-            try:
-                diagnostic_contract = raw_determinant_contract_from_request(
-                    request
-                )
-            except ValueError as error:
-                raise JuliaResponseBackendError(
-                    "M02 Julia request raw determinant contract is invalid"
-                ) from error
-            try:
-                _validate_current_raw_determinant_policy(
-                    request, diagnostic_contract
-                )
-            except ValueError as error:
-                raise JuliaResponseBackendError(
-                    "M02 Julia determinant certificate policy is invalid"
-                ) from error
-            if (
-                response["diagnostic_model_identity"]
-                != diagnostic_contract.diagnostic_model_identity
-                or response["required_raw_determinant_roles"]
-                != list(diagnostic_contract.required_raw_determinant_roles)
-                or type(response["required_raw_determinant_count"]) is not int
-                or response["required_raw_determinant_count"]
-                != diagnostic_contract.required_raw_determinant_count
-            ):
-                raise JuliaResponseBackendError(
-                    "M02 Julia response raw determinant contract is invalid"
-                )
+        try:
+            diagnostic_contract = raw_determinant_contract_from_request(request)
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                "M02 Julia request raw determinant contract is invalid"
+            ) from error
+        try:
+            _validate_current_raw_determinant_policy(request, diagnostic_contract)
+        except ValueError as error:
+            raise JuliaResponseBackendError(
+                "M02 Julia determinant certificate policy is invalid"
+            ) from error
+        if (
+            response["diagnostic_model_identity"]
+            != diagnostic_contract.diagnostic_model_identity
+            or response["required_raw_determinant_roles"]
+            != list(diagnostic_contract.required_raw_determinant_roles)
+            or type(response["required_raw_determinant_count"]) is not int
+            or response["required_raw_determinant_count"]
+            != diagnostic_contract.required_raw_determinant_count
+        ):
+            raise JuliaResponseBackendError(
+                "M02 Julia response raw determinant contract is invalid"
+            )
 
         try:
             numerical_conditioning = NumericalConditioningEvidence.from_mapping(
@@ -4436,33 +5641,10 @@ class JuliaPrecisionRootBackend:
             raise JuliaResponseBackendError(
                 "M02 Julia PRIMARY acceptance evidence is invalid"
             ) from error
-        if legacy_wire:
-            legacy_model = policy.get("determinant_error_model")
-            if legacy_model == _EXTERIOR_ADDITIVE_CHANNEL_SCHEMA:
-                raise JuliaResponseBackendError(
-                    "M02 Julia wire-10 cannot carry a provisional exterior contract"
-                )
-            uncalibrated_exterior = False
-            expected_error_model_id = (
-                VERIFIED_ENDPOINT_ERROR_MODEL
-                if legacy_model == VERIFIED_ENDPOINT_ERROR_MODEL
-                else EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE
-            )
-        else:
-            assert diagnostic_contract is not None
-            uncalibrated_exterior = not diagnostic_contract.empirical_certificate_required
-            expected_error_model_id = (
-                diagnostic_contract.permitted_response_receipt_identity
-            )
-        if (
-            legacy_wire
-            and job.mechanism_id == "horizon-admittance"
-            and policy.get("determinant_error_model")
-            != VERIFIED_ENDPOINT_ERROR_MODEL
-        ):
-            raise JuliaResponseBackendError(
-                "M02 Julia determinant certificate policy is invalid"
-            )
+        uncalibrated_exterior = not diagnostic_contract.empirical_certificate_required
+        expected_error_model_id = (
+            diagnostic_contract.permitted_response_receipt_identity
+        )
         if primary_acceptance.error_model_id != expected_error_model_id:
             raise JuliaResponseBackendError(
                 "M02 Julia PRIMARY determinant telemetry identity is invalid"
@@ -4611,25 +5793,9 @@ class JuliaPrecisionRootBackend:
             "raw_determinant_evaluation_count",
             "root_converged",
         }
-        if legacy_wire:
-            legacy_model = policy.get("determinant_error_model")
-            if legacy_model == VERIFIED_ENDPOINT_ERROR_MODEL:
-                expected_raw_determinant_count = 1
-            elif legacy_model == EXTERIOR_DETERMINANT_ABSOLUTE_ERROR_CERTIFICATE:
-                expected_raw_determinant_count = 3
-            elif legacy_model == _EXTERIOR_ADDITIVE_CHANNEL_SCHEMA:
-                raise JuliaResponseBackendError(
-                    "M02 Julia wire-10 cannot carry a provisional exterior contract"
-                )
-            else:
-                raise JuliaResponseBackendError(
-                    "M02 Julia legacy raw determinant model is invalid"
-                )
-        else:
-            assert diagnostic_contract is not None
-            expected_raw_determinant_count = (
-                diagnostic_contract.required_raw_determinant_count
-            )
+        expected_raw_determinant_count = (
+            diagnostic_contract.required_raw_determinant_count
+        )
         expected_families = {"truncation", "resolution"}
         if (
             not isinstance(raw_diagnostics, Mapping)
@@ -5747,6 +6913,45 @@ def build_promoted_request_contract_fixture(
         request["policy"]["determinant_error_safety_factor"] = value
         _, document, _ = _worker_request_document(request)
         invalid_cases.append({"label": label, "document": document})
+    common_exterior_fields = (
+        "determinant_error_model",
+        "determinant_error_missing_evidence_outcome",
+        "determinant_error_preceding_precision_tier",
+    )
+    provisional_only_exterior_fields = (
+        "determinant_error_channel_schema",
+        "determinant_error_required_channels",
+        "determinant_error_calibration_status",
+    )
+    empirical_only_exterior_fields = (
+        "determinant_error_required_term_classes",
+        "determinant_error_certificate_statement",
+        "determinant_error_safety_factor",
+        "promoted_control_calibration_receipt_sha256",
+        "empirical_control_profile_sha256",
+    )
+    exterior_policy_field_cases: list[dict[str, object]] = []
+    for field in common_exterior_fields + provisional_only_exterior_fields:
+        missing = copy.deepcopy(exterior)
+        del missing["policy"][field]
+        _, missing_document, _ = _worker_request_document(missing)
+        corrupt = copy.deepcopy(exterior)
+        corrupt["policy"][field] = f"forged-{field}"
+        _, corrupt_document, _ = _worker_request_document(corrupt)
+        exterior_policy_field_cases.append({
+            "field": field,
+            "missing_document": missing_document,
+            "corrupt_document": corrupt_document,
+        })
+    exterior_policy_injection_cases: list[dict[str, object]] = []
+    for field in empirical_only_exterior_fields:
+        injected = copy.deepcopy(exterior)
+        injected["policy"][field] = f"forged-{field}"
+        _, injected_document, _ = _worker_request_document(injected)
+        exterior_policy_injection_cases.append({
+            "field": field,
+            "document": injected_document,
+        })
     golden_contracts = copy.deepcopy(
         list(raw_determinant_contract_golden_cases())
     )
@@ -5844,5 +7049,7 @@ def build_promoted_request_contract_fixture(
         "empirical_safety_factor_invalid_cases": (
             empirical_safety_factor_invalid_cases
         ),
+        "exterior_policy_field_cases": exterior_policy_field_cases,
+        "exterior_policy_injection_cases": exterior_policy_injection_cases,
         "golden_contracts": golden_contracts,
     }

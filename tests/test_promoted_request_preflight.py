@@ -15,6 +15,7 @@ from windows_solver.julia_response_backend import (
     FIXED_ROOT_SURVEY_BATCH_OPERATION,
     JuliaResponseAdapter,
     JuliaResponseBackendError,
+    _worker_request_document,
     _validate_promoted_request_preflight_response,
     build_promoted_request_contract_fixture,
     promoted_request_preflight_documents,
@@ -130,6 +131,24 @@ class _PreflightRunner:
 
 
 class PromotedRequestPreflightTests(unittest.TestCase):
+    def test_rebinding_wire_documents_excludes_derived_identity_fields(self):
+        _, _, documents = _preflight_documents()
+
+        for request in documents:
+            _, original, _ = _worker_request_document(request)
+            with self.subTest(
+                operation=original["operation"],
+                request_sha256=original["request_sha256"],
+            ):
+                binding, rebound, request_sha256 = _worker_request_document(
+                    copy.deepcopy(original)
+                )
+
+                self.assertNotIn("request_sha256", binding)
+                self.assertNotIn("execution_identity", binding)
+                self.assertEqual(request_sha256, original["request_sha256"])
+                self.assertEqual(rebound, original)
+
     def test_worker_batch_mode_is_structurally_no_solver(self):
         source = WORKER.read_text(encoding="utf-8")
         start = source.index("function validate_request_batch(")
@@ -334,6 +353,45 @@ class PromotedRequestPreflightTests(unittest.TestCase):
             ],
             3,
         )
+        self.assertEqual(
+            {case["field"] for case in round_tripped["exterior_policy_field_cases"]},
+            {
+                "determinant_error_model",
+                "determinant_error_missing_evidence_outcome",
+                "determinant_error_preceding_precision_tier",
+                "determinant_error_channel_schema",
+                "determinant_error_required_channels",
+                "determinant_error_calibration_status",
+            },
+        )
+        self.assertEqual(
+            {
+                case["field"]
+                for case in round_tripped["exterior_policy_injection_cases"]
+            },
+            {
+                "determinant_error_required_term_classes",
+                "determinant_error_certificate_statement",
+                "determinant_error_safety_factor",
+                "promoted_control_calibration_receipt_sha256",
+                "empirical_control_profile_sha256",
+            },
+        )
+        negative_documents = [
+            document
+            for case in round_tripped["exterior_policy_field_cases"]
+            for document in (
+                case["missing_document"],
+                case["corrupt_document"],
+            )
+        ] + [
+            case["document"]
+            for case in round_tripped["exterior_policy_injection_cases"]
+        ]
+        for document in negative_documents:
+            _, rebound, request_sha256 = _worker_request_document(document)
+            self.assertEqual(request_sha256, document["request_sha256"])
+            self.assertEqual(rebound, document)
 
     def test_preflight_response_integer_fields_are_type_exact(self):
         request_sha256s = ("a" * 64,)

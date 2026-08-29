@@ -86,10 +86,17 @@ _PROMOTED_RUNTIME_IDENTITY_FILES = (
     "campaign_policy.py",
     "campaign_runtime.py",
     "campaign_survey.py",
+    "data/fixed_root_reliability_projection_authority_v1.json",
+    "fixed_root_reliability.py",
+    "julia_response_backend.py",
+    "operation_control.py",
     "promoted_artifacts.py",
     "promoted_admission.py",
+    "promoted_control_authority.py",
     "production_wiring.py",
+    "response_engine.py",
     "response_batches.py",
+    "root_readout_cache.py",
     "structural_diagnostics.py",
 )
 

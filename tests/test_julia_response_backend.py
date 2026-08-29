@@ -18,6 +18,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import windows_solver.julia_response_backend as julia_backend
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.julia_response_backend import (
     JULIA_PROGRESS_PREFIX,
@@ -25,9 +26,17 @@ from windows_solver.julia_response_backend import (
     JuliaResponseAdapter,
     JuliaResponseBackendError,
     _forward_julia_progress_line,
+    _control_receipt_diagnostics_validator,
+    _execution_resource_policy,
     _mode_specific_branch_enclosure_radius,
     _run_streamed_julia,
     _valid_numerical_control_diagnostics,
+)
+from windows_solver.operation_control import (
+    JULIA_PRODUCER_RETRYABILITY_BASIS,
+    JULIA_WORKER_ORIGIN,
+    build_operation_control_receipt,
+    operation_execution_identity,
 )
 from windows_solver.progress import (
     PROGRESS_SCHEMA,
@@ -96,6 +105,34 @@ def _job_for_mechanism(mechanism_id: str):
     )
 
 
+def _worker_control_receipt(
+    request: dict[str, object],
+    failure_code: str,
+    *,
+    request_sha256: str | None = None,
+) -> dict[str, object]:
+    identity_mapping = dict(request["execution_identity"])
+    if request_sha256 is not None:
+        identity_mapping["request_sha256"] = request_sha256
+    identity = operation_execution_identity(identity_mapping)
+    return build_operation_control_receipt(
+        origin=JULIA_WORKER_ORIGIN,
+        failure_code=failure_code,
+        stage=control_failure_stage(failure_code),
+        identity=identity,
+        retryable=failure_code in {
+            "COORDINATE_INVERSION_STALLED",
+            "DETERMINANT_UNCERTAINTY_TOO_LARGE",
+            "FINITE_DIFFERENCE_NOISE_LIMIT",
+            "HORIZON_ARITHMETIC_INADEQUATE",
+            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+        },
+        retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
+        diagnostics=valid_control_failure_diagnostics(
+            failure_code,
+            precision_bits=int(request["working_precision_bits"]),
+        ),
+    )
 def _production_promoted_backend(
     mechanism_id: str,
     adapter,
@@ -236,6 +273,91 @@ def _set_distinct_derivative_binding(response, wire_derivative_abs):
 
 
 class JuliaResponseBackendTests(unittest.TestCase):
+    def test_operation_resource_receipts_require_code_specific_evidence(self):
+        ode = {
+            "failure_code": "ODE_RESOURCE_LIMIT",
+            "stage": "homogeneous-propagation",
+            "diagnostics": {
+                "limit_kind": "ode_solver_iterations",
+                "limiting_resource": "homogeneous_ode_maxiters",
+                "elapsed_leg_seconds": 12.5,
+                "ode_leg": "Xup_outer_to_match",
+                "ode_snapshot": {
+                    "ode_leg": "Xup_outer_to_match",
+                    "ode_retcode": "MaxIters",
+                    "ode_endpoint_reached": False,
+                    "elapsed_seconds": 12.5,
+                },
+            },
+        }
+        self.assertTrue(
+            _control_receipt_diagnostics_validator(ode, request_binding={})
+        )
+        forged_ode = json.loads(canonical_json_bytes(ode))
+        forged_ode["diagnostics"]["limiting_resource"] = "rhs_evaluations"
+        self.assertFalse(
+            _control_receipt_diagnostics_validator(
+                forged_ode, request_binding={}
+            )
+        )
+
+        root = {
+            "failure_code": "ROOT_READOUT_RESOURCE_INFEASIBLE",
+            "stage": "request-policy",
+            "diagnostics": {
+                "limiting_resource": "cooperative_request_deadline",
+                "measured_determinant_seconds": 800.0,
+                "minimum_remaining_determinant_count": 8,
+                "remaining_wall_time_seconds": 5000.0,
+                "estimated_mandatory_seconds": 6400.0,
+                "estimator": "first-determinant-linear-lower-bound/v1",
+            },
+        }
+        self.assertTrue(
+            _control_receipt_diagnostics_validator(root, request_binding={})
+        )
+        forged_root = json.loads(canonical_json_bytes(root))
+        forged_root["diagnostics"]["estimated_mandatory_seconds"] = 6000.0
+        self.assertFalse(
+            _control_receipt_diagnostics_validator(
+                forged_root, request_binding={}
+            )
+        )
+
+    def test_supervisor_timeout_receipt_is_bound_to_request_resources(self):
+        resource = _execution_resource_policy()
+        request = {
+            "precision_digits": 40,
+            "execution_resource": resource,
+        }
+        timeout = {
+            "origin": "PYTHON_SUPERVISOR",
+            "failure_code": "WORKER_TIMEOUT",
+            "stage": "worker-supervision",
+            "diagnostics": {
+                "elapsed_request_seconds": (
+                    resource["worker_request_wall_clock_seconds"] + 0.25
+                ),
+                "limiting_resource": "worker_request_wall_clock",
+                "precision_digits": 40,
+                "execution_resource_policy": resource,
+            },
+        }
+        self.assertTrue(
+            _control_receipt_diagnostics_validator(
+                timeout, request_binding=request
+            )
+        )
+        forged = json.loads(canonical_json_bytes(timeout))
+        forged["diagnostics"]["elapsed_request_seconds"] = (
+            resource["worker_request_wall_clock_seconds"] - 0.25
+        )
+        self.assertFalse(
+            _control_receipt_diagnostics_validator(
+                forged, request_binding=request
+            )
+        )
+
     def test_empirical_exterior_root_requires_three_term_certificate(self):
         job = _job_for_mechanism("exterior-light-ring")
         receipt = load_default_calibration_receipt()
@@ -358,6 +480,25 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertFalse(_valid_numerical_control_diagnostics(
             forged, request_binding=request
         ))
+
+    def test_factored_coordinate_stall_survives_shared_control_binding(self):
+        failure = {
+            "failure_code": "COORDINATE_INVERSION_STALLED",
+            "failure_class": "CONTROL",
+            "stage": "coordinate-inversion",
+            "retryable": False,
+            "diagnostics": {
+                "reason": "COORDINATE_INVERSION_STALLED",
+                "precision_bits": 165,
+                "factored_homogeneous_rhs_evaluations": 0,
+                "avoided_ode_scope": "factored-homogeneous-gsn/v1",
+            },
+        }
+        self.assertTrue(_valid_numerical_control_diagnostics(failure))
+
+        forged = json.loads(canonical_json_bytes(failure))
+        forged["stage"] = "homogeneous-propagation"
+        self.assertFalse(_valid_numerical_control_diagnostics(forged))
 
     def test_horizon_failure_outcome_cannot_be_resealed_from_order_to_arithmetic(self):
         job = _job_for_mechanism("horizon-admittance")
@@ -785,8 +926,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 backend.read_root(_deep_job(), 0.0j)
             self.assertEqual(store.stored_count, 0)
 
-    def test_invalid_cached_success_is_evicted_then_valid_retry_is_reused(self):
-        """Catches one poisoned entry permanently blocking exact recomputation."""
+    def test_incompatible_cached_success_recomputes_without_campaign_failure(self):
+        """An old response contract is a cache miss, never a fatal campaign input."""
 
         calls = []
 
@@ -819,14 +960,6 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 ),
                 response=poisoned,
             )
-
-            with self.assertRaisesRegex(
-                JuliaResponseBackendError,
-                "response policy/wire schema is inconsistent",
-            ):
-                backend.read_root(job, 0.0j)
-            self.assertEqual(store.stored_count, 0)
-            self.assertEqual(calls, [])
 
             first = backend.read_root(job, 0.0j)
             second = backend.read_root(job, 0.0j)
@@ -893,13 +1026,12 @@ class JuliaResponseBackendTests(unittest.TestCase):
             backend.read_root(_deep_job(), 0.0j)
             self.assertEqual(len(calls), 2)
 
-    def test_success_wire_schema_is_eleven_and_worker_errors_remain_schema_one(self):
+    def test_success_wire_schema_is_twelve_and_worker_errors_remain_schema_one(self):
         """Catches changing the successful wire without preserving error parsing.
 
         The success wire and the error envelope are versioned independently.
-        Schema 11 binds the explicit diagnostic model and raw-role contract;
-        the error envelope stays independently
-        versioned at 1.
+        Schema 12 binds the successful response to the operation execution
+        identity; the error envelope stays independently versioned at 1.
         """
 
         request = JuliaPrecisionRootBackend(
@@ -911,7 +1043,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             valid_julia_root_response(request)["schema_version"],
             WORKER_RESPONSE_WIRE_SCHEMA,
         )
-        self.assertEqual(WORKER_RESPONSE_WIRE_SCHEMA, 11)
+        self.assertEqual(WORKER_RESPONSE_WIRE_SCHEMA, 12)
         root = Path(__file__).resolve().parents[1]
         worker = (
             root / "src/windows_solver/data/julia/m02_worker.jl"
@@ -920,7 +1052,7 @@ class JuliaResponseBackendTests(unittest.TestCase):
             worker.index("function result_fields(") :
             worker.index("function evaluate_request(")
         ]
-        self.assertEqual(result_fields.count('"schema_version" => 11'), 2)
+        self.assertEqual(result_fields.count('"schema_version" => 12'), 2)
         self.assertNotIn('"schema_version" => 6', result_fields)
         error_path = worker[
             worker.rindex("catch failure") : worker.index(
@@ -1952,19 +2084,24 @@ class JuliaResponseBackendTests(unittest.TestCase):
             worker.index("function control_failure_context(") :
             worker.index("function throw_ode_resource_limit(")
         ]
-        for field in (
-            "job_id",
-            "leaf_id",
-            "role",
-            "job_policy_sha256",
-            "backend_identity_sha256",
-            "refinement_level",
-            "request_sha256",
-        ):
+        for field in ("job_id", "leaf_id", "request_sha256"):
             self.assertIn(f'"{field}" =>', flatten)
             self.assertIn(f'required(document, "{field}")', flatten)
             self.assertIn(f'"{field}" =>', context)
             self.assertIn(f'required(request, "{field}")', context)
+        for field in (
+            "role",
+            "job_policy_sha256",
+            "refinement_level",
+        ):
+            self.assertIn(f'"{field}" =>', flatten)
+            self.assertIn(f'required(document, "{field}")', flatten)
+            self.assertIn(
+                f'failure_context["{field}"] = required(identity, "{field}")',
+                context,
+            )
+        self.assertIn('"execution_identity" => identity', context)
+        self.assertIn('"operation" => required(identity, "operation")', context)
 
     @staticmethod
     def _force_stop_process(pid_path: Path) -> None:
@@ -2264,7 +2401,8 @@ class JuliaResponseBackendTests(unittest.TestCase):
         self.assertIn('"ODE_RESOURCE_LIMIT"', worker)
         self.assertIn('"ODE_SOLVER_FAILURE"', worker)
         self.assertIn("failure isa ODEControlFailure && rethrow()", worker)
-        self.assertIn('"failure" => failure_details(failure)', worker)
+        self.assertIn("operation_control_receipt(", worker)
+        self.assertIn("failure_details(failure)", worker)
         self.assertIn("homogeneous_ode_maxiters", worker)
         self.assertNotIn("maxiters=Inf", worker)
         self.assertNotIn("maxiters=Inf", complex_frequencies)
@@ -2681,6 +2819,10 @@ class JuliaResponseBackendTests(unittest.TestCase):
             if match is None:
                 continue
             name, expression = match.groups()
+            if name == "failure_context":
+                # Operation-control failure context is serialized evidence,
+                # not an out-of-band progress context.
+                continue
             if not expression.startswith(("Dict", "merge(")):
                 continue
             assigned_context_names.add(name)
@@ -3657,37 +3799,10 @@ class JuliaResponseBackendTests(unittest.TestCase):
                     "status": "error",
                     "error_type": "AsymptoticPrecisionError",
                     "message": "preflight rejected 80 digits",
-                    "failure": {
-                        "failure_code": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
-                        "failure_class": "CONTROL",
-                        "retryable": True,
-                        "precision_digits": request["precision_digits"],
-                        "request_sha256": request["request_sha256"],
-                        "job_id": request["job_id"],
-                        "leaf_id": request["leaf_id"],
-                        "role": request["role"],
-                        "job_policy_sha256": request["job_policy_sha256"],
-                        "backend_identity_sha256": request[
-                            "backend_identity_sha256"
-                        ],
-                        "refinement_level": request["refinement_level"],
-                        "execution_resource_policy": {
-                            name: request["execution_resource"][name]
-                            for name in ("schema", "version", "sha256")
-                        },
-                        "diagnostics": {
-                            "predicted_reliable_digits": "11",
-                            "required_reliable_digits": "24",
-                            "asymptotic_preflight_avoided_ode": True,
-                            "asymptotic_preflight_reason": (
-                                "INSUFFICIENT_ASYMPTOTIC_PRECISION"
-                            ),
-                            "factored_homogeneous_rhs_evaluations": 0,
-                            "avoided_ode_scope": (
-                                "factored-homogeneous-gsn/v1"
-                            ),
-                        },
-                    },
+                    "failure": _worker_control_receipt(
+                        request,
+                        "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                    ),
                 }))
                 return SimpleNamespace(returncode=21, stdout="", stderr="")
 
@@ -3702,10 +3817,13 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 adapter.evaluate(request)
 
         failure = raised.exception.worker_failure["failure"]
-        self.assertEqual(failure["request_binding"], request)
         self.assertEqual(
-            failure["request_sha256"],
+            failure["canonical_request_binding"]["request_sha256"],
             hashlib.sha256(canonical_json_bytes(request)).hexdigest(),
+        )
+        self.assertEqual(
+            dict(raised.exception.control_receipt.canonical_request),
+            request,
         )
 
     def test_failed_preflight_worker_cannot_substitute_valid_request_digest(self):
@@ -3726,37 +3844,11 @@ class JuliaResponseBackendTests(unittest.TestCase):
                     "status": "error",
                     "error_type": "AsymptoticPrecisionError",
                     "message": "forged request digest",
-                    "failure": {
-                        "failure_code": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
-                        "failure_class": "CONTROL",
-                        "retryable": True,
-                        "precision_digits": request["precision_digits"],
-                        "request_sha256": "0" * 64,
-                        "job_id": request["job_id"],
-                        "leaf_id": request["leaf_id"],
-                        "role": request["role"],
-                        "job_policy_sha256": request["job_policy_sha256"],
-                        "backend_identity_sha256": request[
-                            "backend_identity_sha256"
-                        ],
-                        "refinement_level": request["refinement_level"],
-                        "execution_resource_policy": {
-                            name: request["execution_resource"][name]
-                            for name in ("schema", "version", "sha256")
-                        },
-                        "diagnostics": {
-                            "predicted_reliable_digits": "11",
-                            "required_reliable_digits": "24",
-                            "asymptotic_preflight_avoided_ode": True,
-                            "asymptotic_preflight_reason": (
-                                "INSUFFICIENT_ASYMPTOTIC_PRECISION"
-                            ),
-                            "factored_homogeneous_rhs_evaluations": 0,
-                            "avoided_ode_scope": (
-                                "factored-homogeneous-gsn/v1"
-                            ),
-                        },
-                    },
+                    "failure": _worker_control_receipt(
+                        request,
+                        "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                        request_sha256="0" * 64,
+                    ),
                 }))
                 return SimpleNamespace(returncode=21, stdout="", stderr="")
 
@@ -3936,16 +4028,33 @@ class JuliaResponseBackendTests(unittest.TestCase):
             depot.mkdir()
 
             def runner(command, **kwargs):
+                document = json.loads(
+                    Path(command[-2]).read_text(encoding="utf-8")
+                )
+                identity = document["execution_identity"]
+                identity_sha256 = hashlib.sha256(
+                    canonical_json_bytes(identity)
+                ).hexdigest()
                 return SimpleNamespace(
                     returncode=-9,
                     stdout="",
                     stderr="Julia worker timed out after 60 seconds\n",
                     timed_out=True,
+                    elapsed_seconds=(
+                        document["execution_resource"][
+                            "worker_request_wall_clock_seconds"
+                        ]
+                        + 0.25
+                    ),
                     last_progress_event_validated=True,
                     last_progress_event={
                         "schema": PROGRESS_SCHEMA,
                         "kind": "ode_solve_progress",
                         "context": {
+                            "operation": identity["operation"],
+                            "scope": identity["scope"],
+                            "request_sha256": identity["request_sha256"],
+                            "execution_identity_sha256": identity_sha256,
                             "readout_index": 1,
                             "readout_role": "baseline",
                             "phase": "PRIMARY",
@@ -3973,8 +4082,27 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 {},
                 runner,
             )
-            with self.assertRaisesRegex(JuliaResponseBackendError, "timed out") as raised:
-                adapter.evaluate({"schema_version": 1})
+            job = _deep_job()
+            request = JuliaPrecisionRootBackend(
+                job.backend_identity,
+                object(),
+                80,
+                ode_error_budget=synthetic_ode_error_budget(80),
+            )._request(job, 0.0j)
+            configured_limit = request["execution_resource"][
+                "worker_request_wall_clock_seconds"
+            ]
+            with (
+                patch.object(
+                    julia_backend.time,
+                    "monotonic",
+                    side_effect=[100.0, 100.0 + configured_limit + 0.25],
+                ),
+                self.assertRaisesRegex(
+                    JuliaResponseBackendError, "timed out"
+                ) as raised,
+            ):
+                adapter.evaluate(request)
 
         receipt = raised.exception.worker_failure
         self.assertEqual(receipt["worker_exit_code"], -9)
@@ -3983,24 +4111,127 @@ class JuliaResponseBackendTests(unittest.TestCase):
             receipt["worker_stderr_tail"],
             "Julia worker timed out after 60 seconds\n",
         )
-        self.assertEqual(receipt["failure"]["failure_code"], "WORKER_TIMEOUT")
-        self.assertEqual(receipt["failure"]["failure_class"], "CONTROL")
-        self.assertIs(receipt["failure"]["retryable"], True)
-        self.assertEqual(receipt["failure"]["root_phase"], "PRIMARY")
-        self.assertEqual(receipt["failure"]["determinant_index"], 3)
-        self.assertEqual(receipt["failure"]["elapsed_request_seconds"], 5271.5)
+        failure = receipt["failure"]
         self.assertEqual(
-            receipt["failure"]["ode_leg"], "Xup_match_to_inner"
+            failure["schema"], "windows-solver.operation-control-receipt/1"
         )
+        self.assertEqual(failure["failure_code"], "WORKER_TIMEOUT")
+        self.assertEqual(failure["failure_class"], "CONTROL")
+        self.assertIs(failure["retryable_evidence"]["retryable"], True)
+        diagnostics = failure["diagnostics"]
         self.assertEqual(
-            receipt["failure"]["ode_snapshot"]["ode_rhs_evaluations"],
+            diagnostics["elapsed_request_seconds"],
+            request["execution_resource"]["worker_request_wall_clock_seconds"]
+            + 0.25,
+        )
+        progress = diagnostics["last_validated_progress"]
+        self.assertEqual(progress["context"]["phase"], "PRIMARY")
+        self.assertEqual(progress["context"]["determinant_index_leaf"], 3)
+        self.assertEqual(progress["payload"]["request_elapsed_seconds"], 5271.5)
+        self.assertEqual(progress["payload"]["ode_leg"], "Xup_match_to_inner")
+        self.assertEqual(
+            progress["payload"]["ode_rhs_evaluations"],
             1960000,
         )
-        policy = receipt["failure"]["execution_resource_policy"]
+        policy = diagnostics["execution_resource_policy"]
         self.assertEqual(
             policy["schema"], "windows-solver.execution-resource-policy/1"
         )
         self.assertEqual(len(policy["sha256"]), 64)
+        self.assertEqual(
+            failure["execution_identity"][
+                "execution_resource_policy_identity"
+            ],
+            {
+                "schema": policy["schema"],
+                "version": policy["version"],
+                "sha256": policy["sha256"],
+            },
+        )
+
+    def test_timeout_drops_progress_from_another_authenticated_request(self):
+        job = _deep_job()
+        request = JuliaPrecisionRootBackend(
+            job.backend_identity,
+            object(),
+            80,
+            ode_error_budget=synthetic_ode_error_budget(80),
+        )._request(job, 0.0j)
+        _binding, document, _request_sha256 = (
+            julia_backend._worker_request_document(request)
+        )
+        stale = {
+            "schema": PROGRESS_SCHEMA,
+            "kind": "request_started",
+            "context": {
+                "operation": document["execution_identity"]["operation"],
+                "scope": document["execution_identity"]["scope"],
+                "request_sha256": "0" * 64,
+                "execution_identity_sha256": "1" * 64,
+            },
+            "payload": {},
+        }
+
+        details = julia_backend._timeout_worker_failure_details(
+            {
+                "worker_exit_code": -9,
+                "worker_timed_out": True,
+                "worker_stderr_tail": "timeout",
+                "worker_error_type": None,
+                "worker_error_message": None,
+            },
+            document,
+            document["execution_resource"],
+            document["execution_resource"][
+                "worker_request_wall_clock_seconds"
+            ]
+            + 0.5,
+            stale,
+        )
+
+        self.assertNotIn(
+            "last_validated_progress", details["failure"]["diagnostics"]
+        )
+
+    def test_runner_timeout_flag_before_budget_expiry_cannot_authorize_control(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("julia.exe", "Project.toml", "Manifest.toml", "worker.jl"):
+                (root / name).write_text(name, encoding="ascii")
+            depot = root / "depot"
+            depot.mkdir()
+
+            def runner(_command, **_kwargs):
+                return SimpleNamespace(
+                    returncode=-9,
+                    stdout="",
+                    stderr="premature timeout flag",
+                    timed_out=True,
+                    last_progress_event_validated=False,
+                )
+
+            adapter = JuliaResponseAdapter(
+                root / "julia.exe", root, depot, root / "worker.jl", {}, runner
+            )
+            job = _deep_job()
+            request = JuliaPrecisionRootBackend(
+                job.backend_identity,
+                object(),
+                80,
+                ode_error_budget=synthetic_ode_error_budget(80),
+            )._request(job, 0.0j)
+            with (
+                patch.object(
+                    julia_backend.time,
+                    "monotonic",
+                    side_effect=[100.0, 101.0],
+                ),
+                self.assertRaises(JuliaResponseBackendError) as raised,
+            ):
+                adapter.evaluate(request)
+
+        self.assertNotIn("failure", raised.exception.worker_failure)
+        self.assertIsNone(getattr(raised.exception, "control_receipt", None))
 
     def test_campaign_failure_status_persists_worker_diagnostic(self):
         """Catches final status overwriting the failed worker's exact diagnostic."""

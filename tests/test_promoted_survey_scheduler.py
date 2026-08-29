@@ -8,16 +8,25 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace
 
 from windows_solver.campaign_failures import CampaignSystemFailure
 from windows_solver.campaign_policy import (
+    PROMOTED_CONTROL_CONTINUATION_PROOF_SCHEMA,
+    PROMOTED_CONTROL_CONTINUATION_STAGE_SCHEMA,
+    PROMOTED_CONTROL_DECISION_SCHEMA,
+    PROMOTED_CONTROL_DECISION_STAGE_SCHEMA,
+    PROMOTED_POLICY_TERMINAL_STAGE_SCHEMA,
+    PromotionQueueDisposition,
     PromotionQueueKind,
     SurveyDisposition,
     SurveyPass,
     append_promotion,
     empty_schema11_checkpoint,
     record_survey_disposition,
+    retain_promoted_control_decision,
+    validate_schema11_checkpoint,
 )
 from windows_solver.campaign_recovery import RecoverySelection
 from windows_solver.campaign_timing import CampaignTimingLog
@@ -29,17 +38,39 @@ from windows_solver.campaign_survey import (
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.julia_response_backend import (
     FixedRootSurveyConditioning,
+    FixedRootSurveyPlan,
     JuliaFixedRootSurveyBatch,
     JuliaFixedRootSurveySample,
     JuliaNumericalControlError,
+    JuliaODEResourceLimitError,
+    JuliaPrecisionRootBackend,
+    PreparedFixedRootSurveyRequest,
+    _execution_resource_policy,
     fixed_root_survey_request_contract,
 )
+from windows_solver.operation_control import (
+    JULIA_PRODUCER_RETRYABILITY_BASIS,
+    JULIA_WORKER_ORIGIN,
+    OPERATION_EXECUTION_IDENTITY_SCHEMA,
+    OperationExecutionIdentity,
+    build_operation_control_receipt,
+    execution_identity_from_request,
+    operation_execution_identity,
+    validate_operation_control_receipt,
+)
 from windows_solver.precision_tiers import PrecisionTier, working_precision_bits
+from windows_solver.root_evidence import AuthenticatedRootEvidence, RootDependencyKey
 from windows_solver.reviewed_determinant_error_issuance import (
     PromotedExecutionPreflight,
     require_locked_bf40_determinant_error_issuance_authority,
 )
+from windows_solver.schema11_dashboard import project_schema11_dashboard
 from windows_solver.promoted_control_calibration import PromotedExecutionMode
+from windows_solver.promoted_control_authority import (
+    authenticate_persisted_control_decision,
+    authenticate_persisted_control_return,
+    resolve_persisted_control_return,
+)
 from windows_solver.structural_diagnostics import StructuralDiagnosticSession
 from windows_solver.response_batches import (
     PrecisionCapabilities,
@@ -60,16 +91,210 @@ from windows_solver.response_engine import (
     build_exterior_provisional_stage,
     canonical_background_from_binary64_batch,
 )
+from tests.test_julia_response_backend import (
+    FakeAdapter,
+    valid_control_failure_diagnostics,
+)
 
 
 def _sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+def _durable_root_result(leaf, digits: int) -> PromotedRootSolveResult:
+    """Supply the no-numeric scheduler with typed, leaf-bound root authority."""
+
+    evidence = AuthenticatedRootEvidence.from_bound_leaf(leaf)
+    return PromotedRootSolveResult(
+        AuthenticatedRootSeal(
+            evidence.fixed_root,
+            evidence.branch_identity,
+            evidence.root_seal_sha256,
+            root_success_evidence=evidence.to_mapping(),
+        ),
+        precision_tier=f"BF{digits}",
+        root_success_evidence=evidence.to_mapping(),
+    )
+
+
 def _requested_contract(kwargs):
     """Resolve fake-worker identity and roles through the production contract."""
 
     return fixed_root_survey_request_contract(kwargs["plan"])
+
+
+def _fixture_fixed_root_request(job, digits: int, kwargs):
+    contract = _requested_contract(kwargs)
+    recovery_binding = {
+        "schema": "windows-solver.fixed-root-endpoint-recovery-policy/1",
+        "identity": "cause-aware-fixed-root-exterior-endpoint-recovery/v1",
+        "endpoint_order_rule": "bounded-doubling-prefix/v1",
+        "base_endpoint_order": 28,
+        "generated_maximum_order": 112,
+        "endpoint_order_schedule": [28, 56, 112],
+        "horizon_geometry_rule": "bounded-negative-rho-depth/v1",
+        "horizon_geometry_schedule": ["-5000", "-10000", "-20000"],
+        "infinity_geometry_rule": "bounded-positive-rho-depth/v1",
+        "infinity_geometry_schedule": [
+            "100", "250", "500", "1000", "2000", "5000", "10000", "20000"
+        ],
+        "fixed_root_reliability_target_abs": "2e-11",
+        "fixed_root_reliability_rule": (
+            "minus-log10-target-plus-required-digit-guard/v1"
+        ),
+        "required_digit_guard": 6,
+        "precision_digits": digits,
+        "semantic_precision_tier": f"bigfloat-{digits}",
+    }
+    recovery = {
+        **recovery_binding,
+        "policy_sha256": _sha256(recovery_binding),
+    }
+    return {
+        "schema_version": 3,
+        "schema": "windows-solver.fixed-root-survey-batch/3",
+        "operation": "fixed-root-survey-batch",
+        "control_profile": "fixed-root-deep-v1",
+        "leaf_id": job.leaf_id,
+        "job_id": job.job_id,
+        "backend_identity_sha256": job.backend_identity.identity_sha256,
+        "precision_digits": digits,
+        "working_precision_bits": working_precision_bits(
+            PrecisionTier.BIGFLOAT_40
+            if digits == 40
+            else PrecisionTier.BIGFLOAT_80
+        ),
+        "semantic_precision_tier": f"bigfloat-{digits}",
+        "policy": {
+            "job_policy_sha256": job.policy.identity_sha256,
+            "endpoint_series_order": 28,
+            "rho_in": "-20000",
+            "rho_out": "20000",
+        },
+        "fixed_root_endpoint_recovery_policy": recovery,
+        "execution_resource": _execution_resource_policy(),
+        "plan": contract.plan.value,
+        "scientific_operation_identity": contract.scientific_operation_identity,
+        "root_reference_id": job.root.root_reference_id,
+        "root_seal_sha256": kwargs["root_seal_sha256"],
+        "branch_identity": kwargs["branch_identity"],
+        "sample_roles": list(contract.sample_roles),
+    }
+
+
+def _endpoint_control_diagnostics(request, failure_code: str):
+    policy = request["fixed_root_endpoint_recovery_policy"]
+    limitation, intervention, outcome = {
+        "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE": (
+            "insufficient-series-order/v1",
+            "ENDPOINT_ORDER_RECOVERY_EXHAUSTED",
+            "UNRESOLVED",
+        ),
+        "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED": (
+            "insufficient-geometric-depth/v1",
+            "ENDPOINT_GEOMETRY_RECOVERY_EXHAUSTED",
+            "UNRESOLVED",
+        ),
+        "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE": (
+            "insufficient-arithmetic-precision/v1",
+            "ARITHMETIC_PRECISION_PROMOTION",
+            "ARITHMETIC_INADEQUATE",
+        ),
+    }[failure_code]
+    receipts = []
+    for branch, geometry_field in (
+        ("horizon-ingoing", "horizon_geometry_schedule"),
+        ("infinity-outgoing", "infinity_geometry_schedule"),
+    ):
+        geometries = policy[geometry_field]
+        orders = policy["endpoint_order_schedule"]
+        coordinates = (
+            [(order, geometries[0]) for order in orders]
+            if limitation == "insufficient-series-order/v1"
+            else [(orders[0], geometry) for geometry in geometries]
+            if limitation == "insufficient-geometric-depth/v1"
+            else [(orders[0], geometries[0])]
+        )
+        attempts = []
+        for index, (order, geometry) in enumerate(coordinates):
+            terminal = index == len(coordinates) - 1
+            last_ratio = (
+                "1" if limitation == "insufficient-geometric-depth/v1" else "0.1"
+            )
+            truncation = (
+                "2" if limitation == "insufficient-arithmetic-precision/v1" else "10"
+            )
+            selected = (
+                "PROMOTE_ARITHMETIC_TIER_IF_AGGREGATE_ALLOWS"
+                if limitation == "insufficient-arithmetic-precision/v1"
+                else "NONE" if terminal
+                else "INCREASE_ENDPOINT_ORDER"
+                if limitation == "insufficient-series-order/v1"
+                else "DEEPEN_ENDPOINT_GEOMETRY"
+            )
+            result = (
+                "ARITHMETIC_INADEQUATE"
+                if limitation == "insufficient-arithmetic-precision/v1"
+                else "ORDER_EXHAUSTED"
+                if terminal and limitation == "insufficient-series-order/v1"
+                else "GEOMETRY_EXHAUSTED"
+                if terminal else "RETRY"
+            )
+            attempts.append({
+                "endpoint_branch": branch,
+                "attempted_endpoint_order": order,
+                "attempted_geometry": geometry,
+                "maximum_last_term_ratio": last_ratio,
+                "maximum_truncation_digits_lost": truncation,
+                "maximum_recurrence_digits_lost": "1",
+                "maximum_series_evaluation_digits_lost": "1",
+                "predicted_reliable_digits": "10",
+                "required_reliable_digits": "20",
+                "candidate_limitation": limitation,
+                "selected_intervention": selected,
+                "result": result,
+            })
+        terminal_attempt = attempts[-1]
+        receipts.append({
+            "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
+            "endpoint_branch": branch,
+            "recovery_policy_identity": policy["identity"],
+            "recovery_policy_sha256": policy["policy_sha256"],
+            "base_endpoint_order": policy["base_endpoint_order"],
+            "generated_maximum_order": policy["generated_maximum_order"],
+            "attempted_endpoint_orders": [
+                attempt["attempted_endpoint_order"] for attempt in attempts
+            ],
+            "terminal_endpoint_order": terminal_attempt[
+                "attempted_endpoint_order"
+            ],
+            "candidate_geometry_schedule": geometries,
+            "terminal_geometry": terminal_attempt["attempted_geometry"],
+            "maximum_last_term_ratio": terminal_attempt[
+                "maximum_last_term_ratio"
+            ],
+            "maximum_truncation_digits_lost": terminal_attempt[
+                "maximum_truncation_digits_lost"
+            ],
+            "maximum_recurrence_digits_lost": "1",
+            "maximum_series_evaluation_digits_lost": "1",
+            "predicted_reliable_digits": "10",
+            "required_reliable_digits": "20",
+            "candidate_limitation": limitation,
+            "aggregate_limitation": limitation,
+            "factored_homogeneous_rhs_evaluations": 0,
+            "attempts": attempts,
+        })
+    return {
+        "reason": failure_code,
+        "aggregate_limitation": limitation,
+        "endpoint_recovery_policy_identity": policy["identity"],
+        "endpoint_recovery_policy_sha256": policy["policy_sha256"],
+        "endpoint_receipts": receipts,
+        "selected_intervention": intervention,
+        "result": outcome,
+        "factored_homogeneous_rhs_evaluations": 0,
+    }
 
 
 class _TestLayer1Guard:
@@ -150,8 +375,62 @@ def _conditioning(
     *,
     precision_limited: bool = False,
 ) -> FixedRootSurveyConditioning:
+    del precision_limited
+    required = "16.698970004336018804786261105275506973231810118538"
+    receipts = []
+    for branch, geometry, schedule in (
+        ("horizon-ingoing", "-5000", ["-5000", "-10000", "-20000"]),
+        (
+            "infinity-outgoing", "100",
+            ["100", "250", "500", "1000", "2000", "5000", "10000", "20000"],
+        ),
+    ):
+        attempt = {
+            "endpoint_branch": branch,
+            "attempted_endpoint_order": 28,
+            "attempted_geometry": geometry,
+            "maximum_last_term_ratio": "1e-20",
+            "maximum_truncation_digits_lost": "0",
+            "maximum_recurrence_digits_lost": "1",
+            "maximum_series_evaluation_digits_lost": "1",
+            "predicted_reliable_digits": str(digits - 5),
+            "required_reliable_digits": required,
+            "candidate_limitation": "adequate/v1",
+            "selected_intervention": "ENTER_HOMOGENEOUS_ODE",
+            "result": "ADEQUATE",
+        }
+        receipts.append({
+            "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
+            "endpoint_branch": branch,
+            "recovery_policy_identity": (
+                "cause-aware-fixed-root-exterior-endpoint-recovery/v1"
+            ),
+            "recovery_policy_sha256": "f" * 64,
+            "base_endpoint_order": 28,
+            "generated_maximum_order": 112,
+            "attempted_endpoint_orders": [28],
+            "terminal_endpoint_order": 28,
+            "candidate_geometry_schedule": schedule,
+            "terminal_geometry": geometry,
+            "maximum_last_term_ratio": "1e-20",
+            "maximum_truncation_digits_lost": "0",
+            "maximum_recurrence_digits_lost": "1",
+            "maximum_series_evaluation_digits_lost": "1",
+            "predicted_reliable_digits": str(digits - 5),
+            "required_reliable_digits": required,
+            "candidate_limitation": "adequate/v1",
+            "aggregate_limitation": "adequate/v1",
+            "factored_homogeneous_rhs_evaluations": 0,
+            "attempts": [attempt],
+        })
     return FixedRootSurveyConditioning({
-        "schema": "windows-solver.fixed-root-survey-conditioning/1",
+        "schema": "windows-solver.fixed-root-survey-conditioning/3",
+        "fixed_root_reliability_target_abs": "2e-11",
+        "fixed_root_reliability_rule": (
+            "minus-log10-target-plus-required-digit-guard/v1"
+        ),
+        "required_digit_guard": 6,
+        "fixed_root_reliability_projection_sha256": "a" * 64,
         "determinant_family": "exterior-wronskian/v1",
         "homogeneous_representation": "factored-plane-wave-gsn/v1",
         "branch_convention": "gsn-complex-rho/v1",
@@ -159,18 +438,42 @@ def _conditioning(
         "determinant_normalisation": "unit-asymptotic-branch-wronskian/v1",
         "maximum_series_digits_lost": "1",
         "maximum_recurrence_digits_lost": "1",
-        "minimum_asymptotic_predicted_reliable_digits": str(digits - 5),
+        "maximum_series_evaluation_digits_lost": "1",
+        "maximum_last_term_ratio": "1e-20",
+        "maximum_truncation_digits_lost": "0",
+        "minimum_asymptotic_predicted_reliable_digits": (
+            str(digits - 5)
+        ),
         "endpoint_remainders_regular": True,
         "maximum_endpoint_reconstruction_error": f"1e-{digits - 5}",
         "maximum_contour_angle_deformation": "0",
-        "predicted_reliable_digits": str(digits - 6),
-        "required_reliable_digits": "20",
-        "precision_limited": precision_limited,
+        "predicted_reliable_digits": (
+            str(digits - 6)
+        ),
+        "required_reliable_digits": (
+            "16.698970004336018804786261105275506973231810118538"
+        ),
+        "precision_limited": False,
+        "endpoint_recovery_policy_identity": (
+            "cause-aware-fixed-root-exterior-endpoint-recovery/v1"
+        ),
+        "endpoint_recovery_policy_sha256": "f" * 64,
+        "endpoint_receipts": receipts,
+        "aggregate_limitation": "adequate/v1",
+        "factored_homogeneous_rhs_evaluations_before_recovery_decision": 0,
         "determinant_count": 1,
     })
 
 
-def _batch(leaf, seal: AuthenticatedRootSeal, digits: int, *, flat=False):
+def _batch(
+    leaf,
+    seal: AuthenticatedRootSeal,
+    digits: int,
+    *,
+    flat=False,
+    plan: FixedRootSurveyPlan = FixedRootSurveyPlan.FULL_NINE,
+    prepared_request: PreparedFixedRootSurveyRequest | None = None,
+):
     root = seal.fixed_root
     h = 1.0e-5 * (1.0 + abs(root))
     epsilon = float(leaf.job.policy.epsilons[0])
@@ -185,18 +488,59 @@ def _batch(leaf, seal: AuthenticatedRootSeal, digits: int, *, flat=False):
         (root, epsilon / 2.0),
         (root, -epsilon / 2.0),
     )
+    contract = fixed_root_survey_request_contract(plan)
+    point_by_role = dict(zip(BINARY64_FIXED_ROOT_SAMPLE_ROLES, points))
+    if prepared_request is None:
+        request_sha256 = _sha256({
+            "leaf_id": leaf.leaf_id,
+            "digits": digits,
+            "plan": contract.plan.value,
+        })
+        identity = OperationExecutionIdentity({
+            "schema": OPERATION_EXECUTION_IDENTITY_SCHEMA,
+            "scope": "REQUEST",
+            "operation": "fixed-root-survey-batch",
+            "control_profile": "fixed-root-deep-v1",
+            "request_schema": "windows-solver.fixed-root-survey-batch/3",
+            "request_sha256": request_sha256,
+            "leaf_id": leaf.leaf_id,
+            "job_id": leaf.job.job_id,
+            "backend_identity_sha256": leaf.job.backend_identity.identity_sha256,
+            "precision_digits": digits,
+            "working_precision_bits": working_precision_bits(
+                PrecisionTier.BIGFLOAT_40
+                if digits == 40 else PrecisionTier.BIGFLOAT_80
+            ),
+            "semantic_precision_tier": f"bigfloat-{digits}",
+            "effective_policy_identity": leaf.job.policy.identity_sha256,
+            "execution_resource_policy_identity": {"sha256": "3" * 64},
+            "plan": contract.plan.value,
+            "scientific_operation_identity": contract.scientific_operation_identity,
+            "root_reference_id": leaf.job.root.root_reference_id,
+            "root_seal_sha256": seal.root_seal_sha256,
+            "branch_identity": seal.branch_identity,
+            "sample_roles": list(contract.sample_roles),
+        })
+    else:
+        request_sha256 = prepared_request.request_sha256
+        identity = operation_execution_identity(
+            prepared_request.document["execution_identity"]
+        )
     samples = []
-    for role, (omega, amplitude) in zip(BINARY64_FIXED_ROOT_SAMPLE_ROLES, points):
+    for index, role in enumerate(contract.sample_roles):
+        omega, amplitude = point_by_role[role]
         frequency = 0.0 if flat else 3.0 * (omega.real - root.real)
         determinant = DecimalComplex(
             Decimal(str(frequency + 2.0 * amplitude)), Decimal(0)
         )
         samples.append(JuliaFixedRootSurveySample(
+            index,
             role,
             complex(omega),
             complex(amplitude),
             determinant,
             _conditioning(digits, precision_limited=flat),
+            identity.select_sample(index, role).to_mapping(),
         ))
     tier = (
         PrecisionTier.BIGFLOAT_40
@@ -212,8 +556,10 @@ def _batch(leaf, seal: AuthenticatedRootSeal, digits: int, *, flat=False):
         fixed_root=root,
         frequency_step=Decimal(format(h, ".17g")),
         coordinate_step=Decimal(str(epsilon)),
-        scientific_operation_identity="exterior-fixed-root-survey-raw/v1",
-        request_sha256=str(digits // 40) * 64,
+        scientific_operation_identity=contract.scientific_operation_identity,
+        plan=contract.plan,
+        execution_identity=identity.to_mapping(),
+        request_sha256=request_sha256,
         precision_tier=tier,
         working_precision_bits=working_precision_bits(tier),
         samples=tuple(samples),
@@ -295,31 +641,105 @@ class _Backend:
         self.calls = calls
         self.failure_code = failure_code
 
+    def prepare_fixed_root_survey_request(self, job, **kwargs):
+        return PreparedFixedRootSurveyRequest.from_request(
+            _fixture_fixed_root_request(job, self.digits, kwargs)
+        )
+
     def fixed_root_survey_batch(self, job, **kwargs):
         self.calls.append(self.digits)
+        prepared_request = kwargs.get("prepared_request")
+        if prepared_request is not None:
+            expected = self.prepare_fixed_root_survey_request(job, **kwargs)
+            if prepared_request != expected:
+                raise AssertionError("scheduler changed its prepared request")
         if self.failure_code is not None:
+            contract = _requested_contract(kwargs)
+            if prepared_request is None:
+                canonical_request = _fixture_fixed_root_request(
+                    job, self.digits, kwargs
+                )
+                request_sha256 = _sha256(canonical_request)
+            else:
+                canonical_request = dict(prepared_request.request_binding)
+                request_sha256 = prepared_request.request_sha256
+            identity = execution_identity_from_request(
+                canonical_request,
+                request_sha256=request_sha256,
+                sample_index=0,
+                sample_role=contract.sample_roles[0],
+            )
+            if self.failure_code == "ODE_RESOURCE_LIMIT":
+                stage = "homogeneous-propagation"
+                diagnostics = {
+                    "limit_kind": "accepted_steps",
+                    "limiting_resource": "accepted_steps",
+                    "ode_leg": "infinity",
+                    "elapsed_leg_seconds": "1.25",
+                    "ode_snapshot": {
+                        "ode_leg": "infinity",
+                        "ode_endpoint_reached": False,
+                        "ode_retcode": "ResourceLimit",
+                        "elapsed_seconds": "1.25",
+                    },
+                }
+            elif self.failure_code.startswith("EXTERIOR_ENDPOINT_"):
+                stage = "asymptotic-preflight"
+                diagnostics = _endpoint_control_diagnostics(
+                    canonical_request, self.failure_code
+                )
+            else:
+                stage = "asymptotic-preflight"
+                diagnostics = {
+                    "reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                    "precision_bits": canonical_request[
+                        "working_precision_bits"
+                    ],
+                    "factored_homogeneous_rhs_evaluations": 0,
+                    "avoided_ode_scope": "factored-homogeneous-gsn/v1",
+                    "predicted_reliable_digits": "10",
+                    "required_reliable_digits": "20",
+                    "asymptotic_preflight_avoided_ode": True,
+                    "asymptotic_preflight_reason": (
+                        "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+                    ),
+                    "maximum_series_digits_lost": "30",
+                    "maximum_recurrence_digits_lost": "5",
+                }
+            receipt = validate_operation_control_receipt(
+                build_operation_control_receipt(
+                    origin=JULIA_WORKER_ORIGIN,
+                    failure_code=self.failure_code,
+                    stage=stage,
+                    identity=identity,
+                    diagnostics=diagnostics,
+                ),
+                request=canonical_request,
+                request_sha256=request_sha256,
+                diagnostics_validator=lambda _receipt: True,
+            )
+            if self.failure_code == "ODE_RESOURCE_LIMIT":
+                error = JuliaODEResourceLimitError(
+                    "reviewed ODE resource limit"
+                )
+                error.control_receipt = receipt
+                raise error
             raise JuliaNumericalControlError(
-                "reviewed numerical insufficiency", self.failure_code
+                "reviewed numerical insufficiency",
+                self.failure_code,
+                control_receipt=receipt,
             )
         seal = AuthenticatedRootSeal(
             kwargs["fixed_root"], kwargs["branch_identity"],
             kwargs["root_seal_sha256"],
         )
-        batch = _batch(self.leaf, seal, self.digits, flat=self.flat)
-        contract = _requested_contract(kwargs)
-        return replace(
-            batch,
-            scientific_operation_identity=contract.scientific_operation_identity,
-            request_sha256=_sha256({
-                "leaf_id": self.leaf.leaf_id,
-                "digits": self.digits,
-                "plan": contract.plan.value,
-            }),
-            samples=tuple(
-                sample
-                for sample in batch.samples
-                if sample.role in contract.sample_roles
-            ),
+        return _batch(
+            self.leaf,
+            seal,
+            self.digits,
+            flat=self.flat,
+            plan=_requested_contract(kwargs).plan,
+            prepared_request=prepared_request,
         )
 
 
@@ -425,6 +845,8 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         diagnostic_session=None,
         calculate_only=False,
         block_all=False,
+        checkpoint_committed=None,
+        backend_factory=None,
     ):
         calls: list[int] = []
         published: dict[str, AuthenticatedRootSeal] = {}
@@ -469,22 +891,21 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 root_seal_publish=lambda leaf, seal: published.__setitem__(
                     leaf.leaf_id, seal
                 ),
-                backend_factory=lambda leaf, digits: _Backend(
-                    leaf, digits,
-                    flat40 if digits == 40 else flat80,
-                    calls,
-                    failure40 if digits == 40 else failure80,
+                backend_factory=(
+                    backend_factory
+                    if backend_factory is not None
+                    else lambda leaf, digits: _Backend(
+                        leaf, digits,
+                        flat40 if digits == 40 else flat80,
+                        calls,
+                        failure40 if digits == 40 else failure80,
+                    )
                 ),
                 primary_root_runner=(
                     root_runner
                     if root_runner is not None
-                    else lambda leaf, backend, digits: PromotedRootSolveResult(
-                        AuthenticatedRootSeal(
-                            leaf.job.root.omega,
-                            leaf.job.root.branch_id,
-                            str(digits // 40) * 64,
-                        ),
-                        precision_tier=f"BF{digits}",
+                    else lambda leaf, backend, digits: _durable_root_result(
+                        leaf, digits
                     )
                 ),
                 horizon_runner=lambda leaf: self.fail("unexpected horizon"),
@@ -493,8 +914,146 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 promoted_preflights_by_ordinal=preflights,
                 layer1_lock_receipt_sha256="f" * 64,
                 diagnostic_session=diagnostic_session,
+                checkpoint_committed=checkpoint_committed,
             )
         return result, calls
+
+    def _interrupt_after_control_state(
+        self,
+        target: str,
+        *,
+        failure_code: str = "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
+    ):
+        durable: list[dict[str, object]] = []
+
+        def stop_after_commit(checkpoint):
+            entry = checkpoint["promotion_queue"]["entries"][0]
+            if entry["disposition"] == target:
+                durable.append(copy.deepcopy(checkpoint))
+                raise KeyboardInterrupt
+            return checkpoint
+
+        with self.assertRaises(KeyboardInterrupt):
+            self._run(
+                self._checkpoint(),
+                failure40=failure_code,
+                checkpoint_committed=stop_after_commit,
+            )
+        self.assertEqual(1, len(durable))
+        return durable[0]
+
+    def _forged_bf80_decision_stage(self, checkpoint):
+        """Reseal a promotion decision over an actually deferred return."""
+
+        leaf_id = self.leaves[0].leaf_id
+        return_stage = copy.deepcopy(
+            checkpoint["promoted_stage_ledger"]["0"][leaf_id]
+        )
+        control_return = return_stage["control_return"]
+        return_authority = authenticate_persisted_control_return(
+            control_return,
+            expected_schema=str(control_return["schema"]),
+            expected_leaf_id=leaf_id,
+            expected_current_action_kind="RESPONSE",
+            expected_queue_ordinal=0,
+        )
+        authority = resolve_persisted_control_return(return_authority)
+        decision = authority.normalized_decision(
+            schema=PROMOTED_CONTROL_DECISION_SCHEMA,
+            current_tier="BF40",
+            current_action_kind="RESPONSE",
+        )
+        self.assertEqual("DEFERRED", decision["disposition"])
+        decision.update({
+            "disposition": "PROMOTION_PENDING",
+            "queue_kind": "RESPONSE",
+            "next_tier": "BF80",
+            "next_action_kind": "RESPONSE",
+        })
+        decision["control_decision_sha256"] = _sha256({
+            key: value
+            for key, value in decision.items()
+            if key != "control_decision_sha256"
+        })
+
+        decision_stage = copy.deepcopy(return_stage)
+        decision_stage.update({
+            "schema": PROMOTED_CONTROL_DECISION_STAGE_SCHEMA,
+            "admission_state": (
+                PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value
+            ),
+            "operation_identity": "promoted-exterior-control-decision/v1",
+            "numerical_disposition": "PROMOTION_PENDING",
+            "source_calculation_stage_sha256": return_stage["stage_sha256"],
+            "calculation_chain": [
+                *copy.deepcopy(return_stage["calculation_chain"]),
+                copy.deepcopy(return_stage),
+            ],
+            "control_decision": decision,
+        })
+        decision_stage.pop("control_return")
+        decision_stage["stage_sha256"] = _sha256({
+            key: value
+            for key, value in decision_stage.items()
+            if key != "stage_sha256"
+        })
+        return decision_stage
+
+    def _forged_bf80_continuation_stage(self, decision_stage):
+        return_stage = decision_stage["calculation_chain"][-1]
+        control_return = return_stage["control_return"]
+        decision = decision_stage["control_decision"]
+        proof_content = {
+            "schema": PROMOTED_CONTROL_CONTINUATION_PROOF_SCHEMA,
+            "control_return_stage_sha256": return_stage["stage_sha256"],
+            "control_return_sha256": control_return["control_return_sha256"],
+            "control_decision_stage_sha256": decision_stage["stage_sha256"],
+            "control_decision_sha256": decision["control_decision_sha256"],
+            "transition_id": decision["transition_id"],
+            "current_tier": "BF40",
+            "current_action_kind": "RESPONSE",
+            "next_tier": "BF80",
+            "next_action_kind": "RESPONSE",
+        }
+        continuation = copy.deepcopy(decision_stage)
+        continuation.update({
+            "schema": PROMOTED_CONTROL_CONTINUATION_STAGE_SCHEMA,
+            "admission_state": (
+                PromotionQueueDisposition.NUMERICAL_CONTINUATION.value
+            ),
+            "next_precision_tier": "BF80",
+            "numerical_disposition": "AWAITING_BF80",
+            "source_calculation_stage_sha256": decision_stage["stage_sha256"],
+            "calculation_chain": [
+                *copy.deepcopy(decision_stage["calculation_chain"]),
+                copy.deepcopy(decision_stage),
+            ],
+            "control_proof": {
+                **proof_content,
+                "proof_sha256": _sha256(proof_content),
+            },
+        })
+        continuation.pop("control_decision")
+        continuation["stage_sha256"] = _sha256({
+            key: value
+            for key, value in continuation.items()
+            if key != "stage_sha256"
+        })
+        return continuation
+
+    def _reseal_current_promoted_stage(self, checkpoint):
+        leaf_id = self.leaves[0].leaf_id
+        stage = checkpoint["promoted_stage_ledger"]["0"][leaf_id]
+        stage["stage_sha256"] = _sha256({
+            key: value for key, value in stage.items() if key != "stage_sha256"
+        })
+        entry = checkpoint["promotion_queue"]["entries"][0]
+        entry["retained_promoted_stage_sha256"] = stage["stage_sha256"]
+        entry["disposition_receipt_sha256"] = _sha256({
+            "schema": "windows-solver.test-resealed-stage-pointer/1",
+            "stage_sha256": stage["stage_sha256"],
+            "disposition": entry["disposition"],
+        })
 
     def test_calculate_only_stops_at_bf40_and_retains_without_admission(self):
         first, calls = self._run(
@@ -538,15 +1097,30 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
 
         self.assertEqual([], calls)
         self.assertEqual(1, result.policy_blocked_count)
-        self.assertEqual("DEFERRED", result.checkpoint[
-            "promotion_queue"
-        ]["entries"][0]["disposition"])
+        entry = result.checkpoint["promotion_queue"]["entries"][0]
+        leaf_id = entry["leaf_id"]
+        stage = result.checkpoint["promoted_stage_ledger"]["0"][leaf_id]
+        self.assertEqual("DEFERRED", entry["disposition"])
+        self.assertEqual(PROMOTED_POLICY_TERMINAL_STAGE_SCHEMA, stage["schema"])
+        self.assertEqual(stage["stage_sha256"], entry[
+            "retained_promoted_stage_sha256"
+        ])
+        self.assertEqual("DEFERRED", stage["policy_terminal"]["disposition"])
         self.assertEqual(1, len(result.route_results))
         self.assertEqual(
             "BLOCKED_BY_ADMISSION_POLICY",
             result.route_results[0].result_code,
         )
         self.assertFalse(result.route_results[0].numerical_work_performed)
+
+        erased = copy.deepcopy(result.checkpoint)
+        del erased["promoted_stage_ledger"]["0"]
+        erased["promotion_queue"]["entries"][0][
+            "retained_promoted_stage_sha256"
+        ] = None
+        del erased["survey_pass_ledger"]["promoted"][leaf_id]
+        with self.assertRaisesRegex(ValueError, "retained authority stage"):
+            validate_schema11_checkpoint(erased)
 
     def test_calculate_only_reuses_same_tier_promoted_background(self):
         result, calls = self._run(
@@ -587,8 +1161,8 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         result, calls = self._run(
             self._checkpoint(),
             calculate_only=True,
-            failure40="INSUFFICIENT_ASYMPTOTIC_PRECISION",
-            failure80="INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            failure40="EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
+            failure80="EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
         )
 
         leaf_id = self.leaves[0].leaf_id
@@ -603,7 +1177,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            "INSUFFICIENT_ASYMPTOTIC_PRECISION", retained["reason_code"]
+            "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE", retained["reason_code"]
         )
         self.assertEqual(["BF40", "BF80"], retained["precision_tiers"])
         self.assertEqual({}, result.checkpoint["evidence_ledger"])
@@ -620,23 +1194,13 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
 
         def primary_root_runner(leaf, _backend, digits):
             root_calls.append(digits)
-            return PromotedRootSolveResult(
-                AuthenticatedRootSeal(
-                    leaf.job.root.omega,
-                    leaf.job.root.branch_id,
-                    "b" * 64,
-                ),
-                precision_tier=f"BF{digits}",
-            )
+            return _durable_root_result(leaf, digits)
 
         class InterruptingBackend(_Backend):
             def fixed_root_survey_batch(self, job, **kwargs):
                 if self.digits == 40:
-                    self.calls.append(self.digits)
-                    raise JuliaNumericalControlError(
-                        "reviewed numerical insufficiency",
-                        "INSUFFICIENT_ASYMPTOTIC_PRECISION",
-                    )
+                    self.failure_code = "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE"
+                    return super().fixed_root_survey_batch(job, **kwargs)
                 if self.digits == 80:
                     self.calls.append(self.digits)
                     raise KeyboardInterrupt
@@ -780,21 +1344,13 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 kwargs["branch_identity"],
                 kwargs["root_seal_sha256"],
             )
-            full = _batch(backend.leaf, seal, backend.digits)
             contract = _requested_contract(kwargs)
-            return replace(
-                full,
-                scientific_operation_identity=contract.scientific_operation_identity,
-                request_sha256=_sha256({
-                    "leaf_id": backend.leaf.leaf_id,
-                    "digits": backend.digits,
-                    "plan": contract.plan.value,
-                }),
-                samples=tuple(
-                    sample
-                    for sample in full.samples
-                    if sample.role in contract.sample_roles
-                ),
+            return _batch(
+                backend.leaf,
+                seal,
+                backend.digits,
+                plan=contract.plan,
+                prepared_request=kwargs.get("prepared_request"),
             )
 
         class InterruptingBackend(_Backend):
@@ -896,6 +1452,112 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         self.assertEqual(9, promoted["sample_count"])
         self.assertEqual(2, promoted["worker_launch_count"])
 
+    def test_component_control_accounts_from_durable_background_and_attempt(self):
+        durable: list[dict[str, object]] = []
+        calls: list[int] = []
+
+        class ComponentFailureBackend(_Backend):
+            def fixed_root_survey_batch(self, job, **kwargs):
+                if (
+                    self.digits == 40
+                    and FixedRootSurveyPlan(kwargs["plan"])
+                    is FixedRootSurveyPlan.MECHANISM_COMPONENT_FOUR
+                ):
+                    self.failure_code = "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE"
+                return super().fixed_root_survey_batch(job, **kwargs)
+
+        def stop_after_control_return(checkpoint):
+            if checkpoint["promotion_queue"]["entries"][0]["disposition"] == (
+                PromotionQueueDisposition.CONTROL_RETURN_RETAINED.value
+            ):
+                durable.append(copy.deepcopy(checkpoint))
+                raise KeyboardInterrupt
+            return checkpoint
+
+        with self.assertRaises(KeyboardInterrupt):
+            self._run(
+                self._checkpoint(),
+                backend_factory=lambda leaf, digits: ComponentFailureBackend(
+                    leaf, digits, False, calls
+                ),
+                checkpoint_committed=stop_after_control_return,
+            )
+
+        stage = durable[0]["promoted_stage_ledger"]["0"][self.leaves[0].leaf_id]
+        control_return = stage["control_return"]
+        self.assertEqual(
+            "windows-solver.promoted-exterior-control-return/4",
+            control_return["schema"],
+        )
+        self.assertEqual(
+            {"schema", "evidence_receipts", "attempt_records"},
+            set(control_return["partial_work"]),
+        )
+        self.assertEqual(5, stage["sample_count"])
+        self.assertEqual(0, stage["root_read_count"])
+        self.assertEqual(2, stage["worker_launch_count"])
+        self.assertEqual(1, len(control_return["partial_work"]["attempt_records"]))
+        expected = control_return["expected_action"]
+        self.assertEqual(
+            FixedRootSurveyPlan.MECHANISM_COMPONENT_FOUR.value,
+            expected["plan"],
+        )
+        self.assertEqual(control_return["request_sha256"], expected["request_sha256"])
+
+    def test_background_control_rejects_component_phase_receipt(self):
+        calls: list[int] = []
+
+        class WrongPhaseBackend(_Backend):
+            def fixed_root_survey_batch(self, job, **kwargs):
+                if FixedRootSurveyPlan(kwargs["plan"]) is (
+                    FixedRootSurveyPlan.CANONICAL_BACKGROUND_FIVE
+                ):
+                    forged = dict(kwargs)
+                    forged.pop("prepared_request", None)
+                    forged["plan"] = FixedRootSurveyPlan.MECHANISM_COMPONENT_FOUR
+                    self.failure_code = "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE"
+                    return super().fixed_root_survey_batch(job, **forged)
+                return super().fixed_root_survey_batch(job, **kwargs)
+
+        with self.assertRaises(CampaignSystemFailure):
+            self._run(
+                self._checkpoint(),
+                backend_factory=lambda leaf, digits: WrongPhaseBackend(
+                    leaf, digits, False, calls
+                ),
+            )
+
+    def test_requested_events_name_the_exact_dispatched_authority(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            session = StructuralDiagnosticSession.open(
+                checkpoint_path=Path(temporary) / "diagnostic-checkpoint.json",
+                session_id="prepared-request-events",
+                campaign_id=self.selection.campaign_id,
+                selection_id=self.selection.selection_id,
+            )
+            try:
+                self._run(self._checkpoint(), diagnostic_session=session)
+                events = session.final_events()
+            finally:
+                session.close_completed()
+
+        for prefix in ("PROMOTED_BACKGROUND", "PROMOTED_COMPONENT"):
+            requested = next(
+                event for event in events
+                if event["event_kind"] == f"{prefix}_REQUESTED"
+            )["compact_diagnostics"]
+            returned = next(
+                event for event in events
+                if event["event_kind"] == f"{prefix}_RETURNED"
+            )["compact_diagnostics"]
+            self.assertEqual(
+                returned["worker_request_sha256"], requested["request_sha256"]
+            )
+            self.assertEqual(
+                returned["execution_identity_sha256"],
+                requested["execution_identity_sha256"],
+            )
+
     def test_calculated_root_evidence_is_retained_in_root_ledger(self):
         result, calls = self._run(
             self._checkpoint(PromotionQueueKind.ROOT),
@@ -996,59 +1658,624 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             ]["disposition"],
         )
 
-    def test_response_queue_escalates_once_to_bf80_then_awaits_admission(self):
+    def test_success_response_cannot_authorize_bf80_without_control_proof(self):
         result, calls = self._run(
             self._checkpoint(), flat40=True, flat80=False
         )
-        self.assertEqual([40, 40, 80, 80], calls)
+        self.assertEqual([40, 40], calls)
         self.assertEqual(0, result.completed_count)
         self.assertEqual(0, result.unresolved_count)
         self.assertEqual(1, result.review_pending_count)
         tiers = result.checkpoint["survey_pass_ledger"]["promoted"][
             self.leaves[0].leaf_id
         ]["precision_tiers"]
-        self.assertEqual(["BF40", "BF80"], tiers)
+        self.assertEqual(["BF40"], tiers)
         self.assertEqual("AWAITING_ADMISSION", result.checkpoint[
             "promotion_queue"
         ]["entries"][0]["disposition"])
-        self.assertNotIn("BF120", str(result.checkpoint))
+        self.assertNotIn("BF80", str(tiers))
 
-    def test_bf80_exhaustion_is_unresolved_not_another_promotion(self):
+    def test_bf80_control_exhaustion_is_unresolved_not_another_promotion(self):
         result, calls = self._run(
-            self._checkpoint(), flat40=True, flat80=True
+            self._checkpoint(),
+            failure40="EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
+            failure80="EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
         )
-        self.assertEqual([40, 40, 80, 80], calls)
+        self.assertEqual([40, 80], calls)
         self.assertEqual(1, result.unresolved_count)
         self.assertEqual([], result.checkpoint["records"])
         self.assertEqual("UNRESOLVED", result.checkpoint[
             "promotion_queue"
         ]["entries"][0]["disposition"])
+        self.assertNotIn("BF120", str(result.checkpoint))
 
     def test_allowlisted_bf40_control_failure_advances_only_to_bf80(self):
         result, calls = self._run(
             self._checkpoint(),
-            failure40="INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            failure40="EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
         )
         self.assertEqual([40, 80, 80], calls)
         self.assertEqual(0, result.completed_count)
         self.assertEqual(0, result.unresolved_count)
         self.assertEqual(1, result.review_pending_count)
-        self.assertEqual("AWAITING_ADMISSION", result.checkpoint[
-            "promotion_queue"
-        ]["entries"][0]["disposition"])
-        self.assertNotIn("BF120", str(result.checkpoint))
+
+    def test_generic_asymptotic_condition_cannot_authorize_bf80(self):
+        result, calls = self._run(
+            self._checkpoint(),
+            failure40="INSUFFICIENT_ASYMPTOTIC_PRECISION",
+        )
+        self.assertEqual([40], calls)
+        self.assertEqual(1, result.unresolved_count)
+
+    def test_order_and_geometry_exhaustion_remain_at_bf40(self):
+        for failure_code in (
+            "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE",
+            "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED",
+        ):
+            with self.subTest(failure_code=failure_code):
+                result, calls = self._run(
+                    self._checkpoint(), failure40=failure_code
+                )
+                self.assertEqual([40], calls)
+                self.assertEqual(1, result.unresolved_count)
+                self.assertEqual("UNRESOLVED", result.checkpoint[
+                    "promotion_queue"
+                ]["entries"][0]["disposition"])
+                self.assertNotIn("BF80", str(result.checkpoint[
+                    "survey_pass_ledger"
+                ]["promoted"][self.leaves[0].leaf_id]["precision_tiers"]))
+
+    def test_interrupt_after_control_return_resumes_through_durable_decision(self):
+        interrupted = self._interrupt_after_control_state(
+            PromotionQueueDisposition.CONTROL_RETURN_RETAINED.value
+        )
+        leaf_id = self.leaves[0].leaf_id
+        stage = interrupted["promoted_stage_ledger"]["0"][leaf_id]
+        self.assertEqual(
+            "windows-solver.promoted-control-return-stage/1", stage["schema"]
+        )
+        self.assertIn("control_return", stage)
+        self.assertNotIn("calculation_artifact", stage)
+
+        resumed, calls = self._run(interrupted)
+        self.assertEqual([80, 80], calls)
+        self.assertEqual(
+            PromotionQueueDisposition.AWAITING_ADMISSION.value,
+            resumed.checkpoint["promotion_queue"]["entries"][0]["disposition"],
+        )
+
+    def test_interrupt_after_control_decision_resumes_without_decision_loss(self):
+        interrupted = self._interrupt_after_control_state(
+            PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value
+        )
+        leaf_id = self.leaves[0].leaf_id
+        stage = interrupted["promoted_stage_ledger"]["0"][leaf_id]
+        self.assertEqual(
+            "windows-solver.promoted-control-decision-stage/1", stage["schema"]
+        )
+        self.assertIn("control_decision", stage)
+        self.assertEqual(
+            "windows-solver.promoted-control-return-stage/1",
+            stage["calculation_chain"][-1]["schema"],
+        )
+
+        resumed, calls = self._run(interrupted)
+        self.assertEqual([80, 80], calls)
+        self.assertEqual(
+            PromotionQueueDisposition.AWAITING_ADMISSION.value,
+            resumed.checkpoint["promotion_queue"]["entries"][0]["disposition"],
+        )
+
+    def test_retained_decision_round_trips_canonical_transition(self):
+        interrupted = self._interrupt_after_control_state(
+            PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value
+        )
+        leaf_id = self.leaves[0].leaf_id
+        decision_stage = interrupted["promoted_stage_ledger"]["0"][leaf_id]
+        return_stage = decision_stage["calculation_chain"][-1]
+        decision = decision_stage["control_decision"]
+        with patch(
+            "windows_solver.promoted_control_authority."
+            "classify_control_receipt_material",
+            side_effect=AssertionError("durable replay reclassified raw receipt"),
+        ):
+            authority = authenticate_persisted_control_decision(
+                return_stage["control_return"],
+                decision,
+                expected_return_schema=return_stage["control_return"]["schema"],
+                expected_decision_schema=PROMOTED_CONTROL_DECISION_SCHEMA,
+                expected_leaf_id=leaf_id,
+                expected_current_action_kind="RESPONSE",
+                expected_queue_ordinal=0,
+            )
+        transition = authority.transition
+        self.assertEqual(transition.transition_id, decision["transition_id"])
+        self.assertEqual(transition.to_mapping(), decision["transition"])
+        self.assertEqual(
+            "PROMOTION_PENDING", decision["transition"]["outcome"]["kind"]
+        )
+        self.assertTrue(decision["transition"]["outcome"]["retryable"])
+        self.assertFalse(decision["transition"]["outcome"]["terminal"])
+        dashboard = project_schema11_dashboard(
+            interrupted,
+            selected_leaf_ids=[leaf_id],
+            leaf_metadata=None,
+        )
+        self.assertEqual(1, len(dashboard.control_transition_rows))
+        row = dashboard.control_transition_rows[0]
+        self.assertEqual(transition.transition_id, row.transition_id)
+        self.assertEqual("PROMOTION_PENDING", row.outcome_kind)
+        self.assertEqual("BF80", row.next_tier)
+
+        forged = copy.deepcopy(decision)
+        forged["transition"]["outcome"]["terminal"] = True
+        forged["control_decision_sha256"] = _sha256({
+            key: value
+            for key, value in forged.items()
+            if key != "control_decision_sha256"
+        })
+        with self.assertRaisesRegex(
+            ValueError, "does not match registry authority"
+        ):
+            authenticate_persisted_control_decision(
+                return_stage["control_return"],
+                forged,
+                expected_return_schema=return_stage["control_return"]["schema"],
+                expected_decision_schema=PROMOTED_CONTROL_DECISION_SCHEMA,
+                expected_leaf_id=leaf_id,
+                expected_current_action_kind="RESPONSE",
+                expected_queue_ordinal=0,
+            )
+
+    def test_deferred_control_cannot_be_resealed_as_promotion_on_retention(self):
+        interrupted = self._interrupt_after_control_state(
+            PromotionQueueDisposition.CONTROL_RETURN_RETAINED.value,
+            failure_code="ODE_RESOURCE_LIMIT",
+        )
+        forged_stage = self._forged_bf80_decision_stage(interrupted)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "does not match registry authority",
+        ):
+            retain_promoted_control_decision(
+                interrupted,
+                queue_ordinal=0,
+                promoted_stage=forged_stage,
+                execution_mode="CALCULATE_ONLY",
+                disposition_receipt={
+                    "schema": (
+                        "windows-solver.promoted-control-decision-retention/1"
+                    ),
+                    "queue_ordinal": 0,
+                },
+            )
+
+    def test_checkpoint_rejects_resealed_deferred_as_bf80_decision_and_proof(
+        self,
+    ):
+        interrupted = self._interrupt_after_control_state(
+            PromotionQueueDisposition.CONTROL_RETURN_RETAINED.value,
+            failure_code="ODE_RESOURCE_LIMIT",
+        )
+        leaf_id = self.leaves[0].leaf_id
+        decision_stage = self._forged_bf80_decision_stage(interrupted)
+
+        forged_decision = copy.deepcopy(interrupted)
+        decision_entry = forged_decision["promotion_queue"]["entries"][0]
+        forged_decision["promoted_stage_ledger"]["0"][leaf_id] = decision_stage
+        decision_entry["disposition"] = (
+            PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value
+        )
+        decision_entry["retained_promoted_stage_sha256"] = decision_stage[
+            "stage_sha256"
+        ]
+        decision_entry["disposition_receipt_sha256"] = _sha256({
+            "schema": "windows-solver.test-forged-control-decision/1",
+            "retained_promoted_stage_sha256": decision_stage["stage_sha256"],
+        })
+        with self.assertRaisesRegex(
+            ValueError,
+            "does not match registry authority",
+        ):
+            validate_schema11_checkpoint(forged_decision)
+
+        continuation = self._forged_bf80_continuation_stage(decision_stage)
+        forged_proof = copy.deepcopy(interrupted)
+        proof_entry = forged_proof["promotion_queue"]["entries"][0]
+        forged_proof["promoted_stage_ledger"]["0"][leaf_id] = continuation
+        proof_entry["disposition"] = (
+            PromotionQueueDisposition.NUMERICAL_CONTINUATION.value
+        )
+        proof_entry["retained_promoted_stage_sha256"] = continuation[
+            "stage_sha256"
+        ]
+        proof_entry["disposition_receipt_sha256"] = _sha256({
+            "schema": "windows-solver.promoted-numerical-continuation/2",
+            "queue_ordinal": 0,
+            "leaf_id": leaf_id,
+            "retained_promoted_stage_sha256": continuation["stage_sha256"],
+            "source_fingerprint_sha256": proof_entry[
+                "source_fingerprint_sha256"
+            ],
+        })
+        with self.assertRaisesRegex(
+            ValueError,
+            "does not match registry authority",
+        ):
+            validate_schema11_checkpoint(forged_proof)
+
+    def test_resealed_control_stage_accounting_cannot_change_reported_work(self):
+        checkpoints = [
+            self._interrupt_after_control_state(
+                PromotionQueueDisposition.CONTROL_RETURN_RETAINED.value
+            ),
+            self._interrupt_after_control_state(
+                PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value
+            ),
+            self._interrupt_after_control_state(
+                PromotionQueueDisposition.NUMERICAL_CONTINUATION.value
+            ),
+        ]
+        terminal, _calls = self._run(
+            self._checkpoint(), failure40="ODE_RESOURCE_LIMIT"
+        )
+        checkpoints.append(terminal.checkpoint)
+        leaf_id = self.leaves[0].leaf_id
+        mutations = {
+            "sample_count": lambda stage: stage.__setitem__(
+                "sample_count", stage["sample_count"] + 1
+            ),
+            "root_read_count": lambda stage: stage.__setitem__(
+                "root_read_count", stage["root_read_count"] + 1
+            ),
+            "worker_launch_count": lambda stage: stage.__setitem__(
+                "worker_launch_count", stage["worker_launch_count"] + 1
+            ),
+            "receipts": lambda stage: stage["receipts"].append(
+                {"schema": "windows-solver.forged-receipt/1"}
+            ),
+            "negative_limit": lambda stage: stage.__setitem__(
+                "sample_limit", -1
+            ),
+            "inflated_limit": lambda stage: stage.__setitem__(
+                "worker_launch_limit", 999
+            ),
+        }
+        for checkpoint in checkpoints:
+            for label, mutate in mutations.items():
+                with self.subTest(
+                    state=checkpoint["promotion_queue"]["entries"][0][
+                        "disposition"
+                    ],
+                    mutation=label,
+                ):
+                    forged = copy.deepcopy(checkpoint)
+                    stage = forged["promoted_stage_ledger"]["0"][leaf_id]
+                    mutate(stage)
+                    self._reseal_current_promoted_stage(forged)
+                    with self.assertRaisesRegex(
+                        ValueError, "CONTROL stage (accounting|limit)"
+                    ):
+                        validate_schema11_checkpoint(forged)
+
+    def test_forged_continuation_without_control_proof_fails_closed(self):
+        interrupted = self._interrupt_after_control_state(
+            PromotionQueueDisposition.NUMERICAL_CONTINUATION.value
+        )
+        forged = copy.deepcopy(interrupted)
+        leaf_id = self.leaves[0].leaf_id
+        stage = forged["promoted_stage_ledger"]["0"][leaf_id]
+        self.assertEqual(
+            "windows-solver.promoted-control-continuation-stage/1",
+            stage["schema"],
+        )
+        stage.pop("control_proof")
+        stage["stage_sha256"] = _sha256({
+            key: value for key, value in stage.items() if key != "stage_sha256"
+        })
+        entry = forged["promotion_queue"]["entries"][0]
+        entry["retained_promoted_stage_sha256"] = stage["stage_sha256"]
+        entry["disposition_receipt_sha256"] = _sha256({
+            "schema": "windows-solver.promoted-numerical-continuation/2",
+            "queue_ordinal": 0,
+            "leaf_id": leaf_id,
+            "retained_promoted_stage_sha256": stage["stage_sha256"],
+            "source_fingerprint_sha256": entry["source_fingerprint_sha256"],
+        })
+        with self.assertRaisesRegex(ValueError, "continuation proof"):
+            validate_schema11_checkpoint(forged)
+
+    def test_unknown_self_hashed_artifact_schema_fails_closed(self):
+        result, _calls = self._run(self._checkpoint())
+        forged = copy.deepcopy(result.checkpoint)
+        leaf_id = self.leaves[0].leaf_id
+        stage = forged["promoted_stage_ledger"]["0"][leaf_id]
+        artifact = stage["calculation_artifact"]
+        artifact["schema"] = "windows-solver.promoted-exterior-calculatio/3"
+        artifact["calculation_sha256"] = _sha256({
+            key: value
+            for key, value in artifact.items()
+            if key != "calculation_sha256"
+        })
+        stage["stage_sha256"] = _sha256({
+            key: value for key, value in stage.items() if key != "stage_sha256"
+        })
+        forged["promotion_queue"]["entries"][0][
+            "retained_promoted_stage_sha256"
+        ] = stage["stage_sha256"]
+        with self.assertRaisesRegex(ValueError, "schema is unsupported"):
+            validate_schema11_checkpoint(forged)
+
+    def test_invented_self_hashed_root_receipt_is_not_success_evidence(self):
+        """A digest authenticates bytes; it cannot invent a successful root."""
+
+        from windows_solver.campaign_survey import _validated_promoted_partial_work
+
+        leaf = self.leaves[0]
+        dependency = RootDependencyKey.from_leaf(
+            leaf, arithmetic_tier="root-promotion"
+        )
+        invented_authority = {
+            "schema": "windows-solver.invented-root-success/1",
+            "fixed_root": {
+                "real": format(leaf.job.root.omega.real, ".17g"),
+                "imaginary": format(leaf.job.root.omega.imag, ".17g"),
+            },
+            "root_seal_sha256": "b" * 64,
+        }
+        content = {
+            "schema": "windows-solver.promoted-root-evidence-receipt/2",
+            "queue_ordinal": 0,
+            "leaf_id": leaf.leaf_id,
+            "job_id": leaf.job.job_id,
+            "precision_tier": "BF40",
+            "root_seal_sha256": "b" * 64,
+            "branch_identity": leaf.job.root.branch_id,
+            "fixed_root": invented_authority["fixed_root"],
+            "root_dependency_key": dependency.to_mapping(),
+            "root_dependency_key_sha256": dependency.sha256,
+            "root_success_authority": invented_authority,
+            "root_success_authority_sha256": _sha256(invented_authority),
+        }
+        receipt = {**content, "receipt_sha256": _sha256(content)}
+        with self.assertRaisesRegex(ValueError, "authority schema is unsupported"):
+            _validated_promoted_partial_work(
+                {
+                    "schema": "windows-solver.promoted-partial-work/2",
+                    "evidence_receipts": [receipt],
+                    "attempt_records": [],
+                },
+                queue_ordinal=0,
+                leaf_id=leaf.leaf_id,
+                leaf=leaf,
+            )
+
+    def test_root_continuation_requires_authenticated_transition_authority(self):
+        from windows_solver.campaign_survey import _continuation_root_seal
+
+        leaf = self.leaves[0]
+        with self.assertRaisesRegex(
+            ValueError, "lacks mandatory CONTROL proof"
+        ):
+            _continuation_root_seal(
+                {
+                    "receipts": [],
+                    "calculation_chain": [{
+                        "control_decision": {"next_action_kind": "RESPONSE"}
+                    }],
+                },
+                leaf=leaf,
+                entry={
+                    "queue_kind": PromotionQueueKind.ROOT.value,
+                    "queue_ordinal": 0,
+                    "leaf_id": leaf.leaf_id,
+                },
+                fallback_seal=None,
+            )
+
+    def test_root_response_continuation_requires_root_success_evidence(self):
+        from windows_solver.campaign_survey import _continuation_root_seal
+
+        durable: list[dict[str, object]] = []
+
+        def stop_after_continuation(checkpoint):
+            if checkpoint["promotion_queue"]["entries"][0]["disposition"] == (
+                PromotionQueueDisposition.NUMERICAL_CONTINUATION.value
+            ):
+                durable.append(copy.deepcopy(checkpoint))
+                raise KeyboardInterrupt
+            return checkpoint
+
+        with self.assertRaises(KeyboardInterrupt):
+            self._run(
+                self._checkpoint(PromotionQueueKind.ROOT),
+                failure40="EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
+                checkpoint_committed=stop_after_continuation,
+            )
+        checkpoint = durable[0]
+        leaf = self.leaves[0]
+        stage = checkpoint["promoted_stage_ledger"]["0"][leaf.leaf_id]
+        stage["receipts"] = [
+            receipt
+            for receipt in stage["receipts"]
+            if receipt.get("schema")
+            != "windows-solver.promoted-root-evidence-receipt/2"
+        ]
+        with self.assertRaisesRegex(
+            ValueError, "lacks authenticated root success evidence"
+        ):
+            _continuation_root_seal(
+                stage,
+                leaf=leaf,
+                entry=checkpoint["promotion_queue"]["entries"][0],
+                fallback_seal=None,
+            )
+
+    def test_fully_resealed_invented_root_receipt_cannot_authorize_bf80(self):
+        """Rehashing every envelope cannot turn invented root bytes into proof."""
+
+        durable: list[dict[str, object]] = []
+
+        def stop_after_continuation(checkpoint):
+            if checkpoint["promotion_queue"]["entries"][0]["disposition"] == (
+                PromotionQueueDisposition.NUMERICAL_CONTINUATION.value
+            ):
+                durable.append(copy.deepcopy(checkpoint))
+                raise KeyboardInterrupt
+            return checkpoint
+
+        with self.assertRaises(KeyboardInterrupt):
+            self._run(
+                self._checkpoint(PromotionQueueKind.ROOT),
+                failure40="EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
+                checkpoint_committed=stop_after_continuation,
+            )
+        forged = copy.deepcopy(durable[0])
+        leaf = self.leaves[0]
+        stage = forged["promoted_stage_ledger"]["0"][leaf.leaf_id]
+        authentic = next(
+            receipt
+            for receipt in stage["receipts"]
+            if receipt.get("schema")
+            == "windows-solver.promoted-root-evidence-receipt/2"
+        )
+        invented_authority = {
+            "schema": "windows-solver.invented-root-success/1",
+            "leaf_id": leaf.leaf_id,
+            "job_id": leaf.job.job_id,
+            "fixed_root": copy.deepcopy(authentic["fixed_root"]),
+            "root_seal_sha256": authentic["root_seal_sha256"],
+        }
+        invented = copy.deepcopy(authentic)
+        invented["root_success_authority"] = invented_authority
+        invented["root_success_authority_sha256"] = _sha256(invented_authority)
+        invented["receipt_sha256"] = _sha256({
+            key: value
+            for key, value in invented.items()
+            if key != "receipt_sha256"
+        })
+
+        def replace_receipt(receipts):
+            return [
+                copy.deepcopy(invented)
+                if item.get("schema")
+                == "windows-solver.promoted-root-evidence-receipt/2"
+                else copy.deepcopy(item)
+                for item in receipts
+            ]
+
+        def reseal_return(original):
+            retained = copy.deepcopy(original)
+            retained["receipts"] = replace_receipt(retained["receipts"])
+            control_return = retained["control_return"]
+            partial = control_return["partial_work"]
+            partial["evidence_receipts"] = replace_receipt(
+                partial["evidence_receipts"]
+            )
+            control_return["control_return_sha256"] = _sha256({
+                key: value
+                for key, value in control_return.items()
+                if key != "control_return_sha256"
+            })
+            retained["stage_sha256"] = _sha256({
+                key: value
+                for key, value in retained.items()
+                if key != "stage_sha256"
+            })
+            return retained
+
+        original_return, original_decision = stage["calculation_chain"]
+        forged_return = reseal_return(original_return)
+        forged_decision = copy.deepcopy(original_decision)
+        forged_decision["receipts"] = replace_receipt(
+            forged_decision["receipts"]
+        )
+        nested_return = reseal_return(
+            forged_decision["calculation_chain"][-1]
+        )
+        forged_decision["calculation_chain"][-1] = nested_return
+        decision = forged_decision["control_decision"]
+        decision["control_return_sha256"] = nested_return["control_return"][
+            "control_return_sha256"
+        ]
+        decision["control_decision_sha256"] = _sha256({
+            key: value
+            for key, value in decision.items()
+            if key != "control_decision_sha256"
+        })
+        forged_decision["source_calculation_stage_sha256"] = nested_return[
+            "stage_sha256"
+        ]
+        forged_decision["stage_sha256"] = _sha256({
+            key: value
+            for key, value in forged_decision.items()
+            if key != "stage_sha256"
+        })
+
+        stage["receipts"] = replace_receipt(stage["receipts"])
+        stage["calculation_chain"] = [forged_return, forged_decision]
+        stage["source_calculation_stage_sha256"] = forged_decision[
+            "stage_sha256"
+        ]
+        proof = stage["control_proof"]
+        proof.update({
+            "control_return_stage_sha256": forged_return["stage_sha256"],
+            "control_return_sha256": forged_return["control_return"][
+                "control_return_sha256"
+            ],
+            "control_decision_stage_sha256": forged_decision["stage_sha256"],
+            "control_decision_sha256": decision["control_decision_sha256"],
+        })
+        proof["proof_sha256"] = _sha256({
+            key: value for key, value in proof.items() if key != "proof_sha256"
+        })
+        stage["stage_sha256"] = _sha256({
+            key: value for key, value in stage.items() if key != "stage_sha256"
+        })
+        entry = forged["promotion_queue"]["entries"][0]
+        entry["retained_promoted_stage_sha256"] = stage["stage_sha256"]
+        entry["disposition_receipt_sha256"] = _sha256({
+            "schema": "windows-solver.promoted-numerical-continuation/2",
+            "queue_ordinal": 0,
+            "leaf_id": leaf.leaf_id,
+            "retained_promoted_stage_sha256": stage["stage_sha256"],
+            "source_fingerprint_sha256": entry["source_fingerprint_sha256"],
+        })
+
+        backend_calls: list[int] = []
+
+        def backend_factory(_leaf, digits):
+            backend_calls.append(digits)
+            return _Backend(leaf, digits, False, [])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                ValueError, "root success authority schema is unsupported"
+            ):
+                _strict_run(
+                    self.plan,
+                    self.selection,
+                    forged,
+                    checkpoint_path=Path(temporary) / "checkpoint.json",
+                    root_seal_lookup=lambda *_args: None,
+                    root_seal_publish=lambda *_args: self.fail(
+                        "forged continuation must not publish a root"
+                    ),
+                    backend_factory=backend_factory,
+                    primary_root_runner=lambda *_args: self.fail(
+                        "forged continuation must not run a root solve"
+                    ),
+                    horizon_runner=lambda _leaf: self.fail("unexpected horizon"),
+                )
+        self.assertEqual([], backend_calls)
 
     def test_root_queue_allows_one_primary_then_one_fixed_root_batch(self):
         root_calls: list[int] = []
 
         def root_runner(leaf, backend, digits):
             root_calls.append(digits)
-            return PromotedRootSolveResult(
-                AuthenticatedRootSeal(
-                    leaf.job.root.omega, leaf.job.root.branch_id, "b" * 64
-                ),
-                precision_tier=f"BF{digits}",
-            )
+            return _durable_root_result(leaf, digits)
 
         result, batch_calls = self._run(
             self._checkpoint(PromotionQueueKind.ROOT),
@@ -1062,6 +2289,76 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         self.assertEqual(1, entry["root_read_count"])
         self.assertEqual(3, entry["worker_launch_count"])
         self.assertEqual("CALCULATED_AWAITING_ADMISSION", entry["disposition"])
+        retained = result.checkpoint["promoted_stage_ledger"]["0"][
+            self.leaves[0].leaf_id
+        ]
+        root_receipt = next(
+            receipt
+            for receipt in retained["receipts"]
+            if receipt.get("schema")
+            == "windows-solver.promoted-root-evidence-receipt/2"
+        )
+        self.assertEqual(
+            "windows-solver.authenticated-root-evidence/3",
+            root_receipt["root_success_authority"]["schema"],
+        )
+        self.assertEqual(
+            root_receipt["root_dependency_key_sha256"],
+            _sha256(root_receipt["root_dependency_key"]),
+        )
+
+    def test_root_control_continuation_retries_root_at_bf80(self):
+        root_calls: list[int] = []
+
+        def root_runner(leaf, _backend, digits):
+            root_calls.append(digits)
+            if digits == 40:
+                request = JuliaPrecisionRootBackend(
+                    VettedNativeDeterminantKernel.identity,
+                    FakeAdapter(),
+                    40,
+                ).preview_root_request(leaf.job, 0.0j)
+                request_sha256 = _sha256(request)
+                identity = execution_identity_from_request(
+                    request,
+                    request_sha256=request_sha256,
+                )
+                receipt = validate_operation_control_receipt(
+                    build_operation_control_receipt(
+                        origin=JULIA_WORKER_ORIGIN,
+                        failure_code="DETERMINANT_UNCERTAINTY_TOO_LARGE",
+                        stage="root-authentication",
+                        identity=identity,
+                        retryable=True,
+                        retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
+                        diagnostics=valid_control_failure_diagnostics(
+                            "DETERMINANT_UNCERTAINTY_TOO_LARGE",
+                            precision_bits=int(
+                                request["working_precision_bits"]
+                            ),
+                        ),
+                    ),
+                    request=request,
+                    request_sha256=request_sha256,
+                )
+                raise JuliaNumericalControlError(
+                    "BF40 root determinant uncertainty",
+                    "DETERMINANT_UNCERTAINTY_TOO_LARGE",
+                    control_receipt=receipt,
+                )
+            return _durable_root_result(leaf, digits)
+
+        result, batch_calls = self._run(
+            self._checkpoint(PromotionQueueKind.ROOT),
+            root_runner=root_runner,
+        )
+
+        self.assertEqual([40, 80], root_calls)
+        self.assertEqual([80, 80], batch_calls)
+        self.assertEqual(
+            PromotionQueueDisposition.AWAITING_ADMISSION.value,
+            result.checkpoint["promotion_queue"]["entries"][0]["disposition"],
+        )
 
     def test_exact_root_queue_group_uses_one_primary_root_solve(self):
         """One exact background root is shared by every dependent leaf."""
@@ -1070,12 +2367,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
 
         def root_runner(leaf, backend, digits):
             root_calls.append(digits)
-            return PromotedRootSolveResult(
-                AuthenticatedRootSeal(
-                    leaf.job.root.omega, leaf.job.root.branch_id, "c" * 64
-                ),
-                precision_tier=f"BF{digits}",
-            )
+            return _durable_root_result(leaf, digits)
 
         result, batch_calls = self._run(
             self._checkpoint(PromotionQueueKind.ROOT, count=2),
@@ -1175,12 +2467,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
 
         def root_runner(leaf, _backend, digits):
             root_calls.append((leaf.leaf_id, digits))
-            return PromotedRootSolveResult(
-                AuthenticatedRootSeal(
-                    leaf.job.root.omega, leaf.job.root.branch_id, "d" * 64
-                ),
-                precision_tier=f"BF{digits}",
-            )
+            return _durable_root_result(leaf, digits)
 
         class Backend(_Backend):
             def fixed_root_survey_batch(self, job, **kwargs):

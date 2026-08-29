@@ -85,7 +85,7 @@ class Schema11TerminalStatusTests(unittest.TestCase):
                 Path(f"{path}.status.json").read_text(encoding="utf-8")
             )
 
-        self.assertEqual("windows-solver.schema11-progress-status/2", status["schema"])
+        self.assertEqual("windows-solver.schema11-progress-status/3", status["schema"])
         self.assertIsNone(status["current_live_event"])
         self.assertEqual(
             status["last_nonterminal_event"]["context"]["leaf_id"], "leaf-2"

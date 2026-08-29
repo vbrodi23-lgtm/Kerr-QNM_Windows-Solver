@@ -13,7 +13,7 @@ from types import MappingProxyType
 from typing import Protocol
 
 
-PROGRESS_SCHEMA = "windows-solver.progress/1"
+PROGRESS_SCHEMA = "windows-solver.progress/3"
 
 
 class ProgressMode(StrEnum):
@@ -112,6 +112,12 @@ class ProgressEventKind(StrEnum):
     HORIZON_ENDPOINTS_VERIFIED = "horizon_endpoints_verified"
     OUTER_ENDPOINT_SELECTED = "outer_endpoint_selected"
     OUTER_ENDPOINT_PAIR_SELECTED = "outer_endpoint_pair_selected"
+    EXTERIOR_ENDPOINT_RECOVERY_ATTEMPT = (
+        "exterior_endpoint_recovery_attempt"
+    )
+    EXTERIOR_ENDPOINT_RECOVERY_DECIDED = (
+        "exterior_endpoint_recovery_decided"
+    )
     COORDINATE_IDENTITY_CHECKED = "coordinate_identity_checked"
     COORDINATE_INVERSION_STALLED = "coordinate_inversion_stalled"
     DETERMINANT_ERROR_ESTIMATED = "determinant_error_estimated"
@@ -132,6 +138,7 @@ class ProgressEventKind(StrEnum):
     ROOT_READOUT_RESOURCE_INFEASIBLE = "root_readout_resource_infeasible"
     ROOT_READOUT_REUSED = "root_readout_reused"
     ROOT_READOUT_RETAINED = "root_readout_retained"
+    ROOT_READOUT_CACHE_STALE = "root_readout_cache_stale"
     ROOT_READOUT_CACHE_CORRUPT = "root_readout_cache_corrupt"
     REQUEST_STARTED = "request_started"
     REQUEST_VALIDATED = "request_validated"
@@ -191,6 +198,7 @@ _INTEGER_CONTEXT_KEYS = frozenset(
         "root_read_limit",
         "worker_launch_count",
         "worker_launch_limit",
+        "sample_index",
     }
 )
 _FLOAT_CONTEXT_KEYS = frozenset({
@@ -202,7 +210,7 @@ _FLOAT_CONTEXT_KEYS = frozenset({
     "bf120_seconds",
     "total_leaf_seconds",
 })
-_BOOLEAN_CONTEXT_KEYS = frozenset({"fallback_used"})
+_BOOLEAN_CONTEXT_KEYS = frozenset({"fallback_used", "retryable", "terminal"})
 _STRING_CONTEXT_KEYS = frozenset(
     {
         "leaf_id",
@@ -223,8 +231,30 @@ _STRING_CONTEXT_KEYS = frozenset(
         "report_state",
         "system_failure_fingerprint",
         "precision_tier",
+        "operation",
+        "plan",
+        "scope",
+        "sample_role",
+        "execution_identity_sha256",
+        "request_sha256",
+        "control_receipt_sha256",
+        "control_return_sha256",
+        "control_decision_sha256",
+        "transition_id",
+        "outcome_kind",
+        "current_action_kind",
+        "current_tier",
+        "next_tier",
+        "limiting_resource",
+        "selected_intervention",
+        "endpoint_recovery_result",
     }
 )
+_SEQUENCE_CONTEXT_KEYS = frozenset({
+    "endpoint_branches",
+    "attempted_endpoint_orders",
+    "attempted_endpoint_geometries",
+})
 _MAPPING_CONTEXT_KEYS = frozenset(
     {
         "mode",
@@ -262,6 +292,10 @@ def _validate_context_values(values: Mapping[str, object]) -> Mapping[str, objec
             raise ValueError(f"progress context {name} must be a string")
         if name in _MAPPING_CONTEXT_KEYS and not isinstance(value, Mapping):
             raise ValueError(f"progress context {name} must be a mapping")
+        if name in _SEQUENCE_CONTEXT_KEYS and not isinstance(
+            value, (list, tuple)
+        ):
+            raise ValueError(f"progress context {name} must be a sequence")
         if name in _INTEGER_CONTEXT_KEYS and value < 0:
             raise ValueError(f"progress context {name} must be nonnegative")
         if name in _FLOAT_CONTEXT_KEYS and (
@@ -270,11 +304,48 @@ def _validate_context_values(values: Mapping[str, object]) -> Mapping[str, objec
             raise ValueError(
                 f"progress context {name} must be finite and nonnegative"
             )
+    endpoint_branches = values.get("endpoint_branches")
+    if endpoint_branches is not None and any(
+        not isinstance(branch, str) or not branch
+        for branch in endpoint_branches
+    ):
+        raise ValueError("progress endpoint branches are invalid")
+    attempted_orders = values.get("attempted_endpoint_orders")
+    if attempted_orders is not None and any(
+        not isinstance(branch_orders, (list, tuple))
+        or any(
+            isinstance(order, bool) or not isinstance(order, int) or order < 0
+            for order in branch_orders
+        )
+        for branch_orders in attempted_orders
+    ):
+        raise ValueError("progress attempted endpoint orders are invalid")
+    attempted_geometries = values.get("attempted_endpoint_geometries")
+    if attempted_geometries is not None and any(
+        not isinstance(branch_geometries, (list, tuple))
+        or any(
+            not isinstance(geometry, str) or not geometry
+            for geometry in branch_geometries
+        )
+        for branch_geometries in attempted_geometries
+    ):
+        raise ValueError("progress attempted endpoint geometries are invalid")
     enum_values = {
         "execution_profile": {"SURVEY", "CERTIFY", "VALIDATE"},
         "survey_pass": {"binary64", "promoted", "certify", "validate"},
         "evidence_level": {"SCREENED", "CERTIFIED", "VALIDATED"},
         "precision_tier": {"binary64", "BF40", "BF80", "BF120"},
+        "scope": {"REQUEST", "SAMPLE"},
+        "current_action_kind": {"ROOT", "RESPONSE"},
+        "current_tier": {"BF40", "BF80", "BF120"},
+        "next_tier": {"BF40", "BF80", "BF120"},
+        "outcome_kind": {
+            "PROMOTION_PENDING",
+            "UNRESOLVED",
+            "DEFERRED",
+            "REJECTED",
+            "SYSTEM_FAILURE",
+        },
     }
     for name, allowed in enum_values.items():
         if values.get(name) is not None and values[name] not in allowed:
@@ -287,6 +358,33 @@ def _validate_context_values(values: Mapping[str, object]) -> Mapping[str, objec
             valid_fingerprint = False
         if not valid_fingerprint:
             raise ValueError("progress system failure fingerprint is invalid")
+    for name in (
+        "execution_identity_sha256",
+        "request_sha256",
+        "control_receipt_sha256",
+        "control_return_sha256",
+        "control_decision_sha256",
+        "transition_id",
+    ):
+        digest = values.get(name)
+        if digest is None:
+            continue
+        try:
+            valid_digest = len(digest) == 64 and int(digest, 16) >= 0
+        except (TypeError, ValueError):
+            valid_digest = False
+        if not valid_digest:
+            raise ValueError(f"progress context {name} is invalid")
+    if values.get("scope") == "REQUEST" and (
+        values.get("sample_index") is not None
+        or values.get("sample_role") is not None
+    ):
+        raise ValueError("REQUEST progress context cannot select a sample")
+    if values.get("scope") == "SAMPLE" and (
+        values.get("sample_index") is None
+        or values.get("sample_role") is None
+    ):
+        raise ValueError("SAMPLE progress context requires a sample identity")
     return _mapping_snapshot(values)
 
 
@@ -337,6 +435,29 @@ class ProgressContext:
     report_state: str | None = None
     system_failure_fingerprint: str | None = None
     precision_tier: str | None = None
+    operation: str | None = None
+    plan: str | None = None
+    scope: str | None = None
+    sample_index: int | None = None
+    sample_role: str | None = None
+    execution_identity_sha256: str | None = None
+    request_sha256: str | None = None
+    control_receipt_sha256: str | None = None
+    control_return_sha256: str | None = None
+    control_decision_sha256: str | None = None
+    transition_id: str | None = None
+    outcome_kind: str | None = None
+    retryable: bool | None = None
+    terminal: bool | None = None
+    current_action_kind: str | None = None
+    current_tier: str | None = None
+    next_tier: str | None = None
+    endpoint_branches: tuple[str, ...] | None = None
+    attempted_endpoint_orders: tuple[tuple[int, ...], ...] | None = None
+    attempted_endpoint_geometries: tuple[tuple[str, ...], ...] | None = None
+    limiting_resource: str | None = None
+    selected_intervention: str | None = None
+    endpoint_recovery_result: str | None = None
     binary64_seconds: float | None = None
     bf40_seconds: float | None = None
     bf80_seconds: float | None = None
@@ -347,7 +468,7 @@ class ProgressContext:
         values = _validate_context_values(
             {field.name: getattr(self, field.name) for field in fields(self)}
         )
-        for name in _MAPPING_CONTEXT_KEYS:
+        for name in _MAPPING_CONTEXT_KEYS | _SEQUENCE_CONTEXT_KEYS:
             value = values[name]
             object.__setattr__(self, name, value)
 

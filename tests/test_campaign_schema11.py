@@ -281,6 +281,111 @@ class Schema11CheckpointTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "retained promoted stage"):
             validate_schema11_checkpoint(corrupted)
 
+    def test_fixed_root_v2_stage_becomes_forensic_and_reissues_only_exterior(self) -> None:
+        checkpoint = append_promotion(
+            empty_schema11_checkpoint("campaign-1", "selection-1"),
+            leaf_id="leaf-1",
+            queue_kind=PromotionQueueKind.RESPONSE,
+            reason_code="REVIEWED_ERROR_EVIDENCE_PENDING",
+            minimum_requested_tier="BF40",
+            scientific_computation_identity="b" * 64,
+        )
+        stage_content = {
+            "schema": "windows-solver.promoted-calculation-stage/1",
+            "leaf_id": "leaf-1",
+            "queue_ordinal": 0,
+            "route": "EXTERIOR_BF40",
+            "execution_mode": "CALCULATE_ONLY",
+            "admission_state": "AWAITING_ADMISSION",
+            "precision_tiers": ["BF40"],
+            "batch": {
+                "schema": "windows-solver.fixed-root-survey-batch/2",
+                "sample_count": 5,
+            },
+            "receipts": [],
+        }
+        stage = {**stage_content, "stage_sha256": _sha256(stage_content)}
+        checkpoint = retain_promoted_calculation(
+            checkpoint,
+            queue_ordinal=0,
+            promoted_stage=stage,
+            execution_mode="CALCULATE_ONLY",
+            disposition_receipt={"schema": "admission-pending/v1"},
+            promoted_background={"status": "ACQUIRED"},
+            promoted_root={"root_seal_sha256": "d" * 64},
+        )
+        checkpoint = record_survey_disposition(
+            checkpoint,
+            survey_pass=SurveyPass.PROMOTED,
+            leaf_id="leaf-1",
+            disposition=SurveyDisposition.CALCULATED_AWAITING_ADMISSION,
+            reason_code="AWAITING_INDEPENDENT_REVIEW_ADMISSION",
+            **_pass_limits(),
+        )
+
+        migrated = validate_schema11_checkpoint(checkpoint)
+
+        entry = migrated["promotion_queue"]["entries"][0]
+        self.assertEqual("PENDING", entry["disposition"])
+        self.assertEqual("BF40", entry["minimum_requested_tier"])
+        self.assertIsNone(entry["retained_promoted_stage_sha256"])
+        self.assertEqual({}, migrated["promoted_stage_ledger"])
+        self.assertEqual({}, migrated["promoted_background_ledger"])
+        self.assertEqual({}, migrated["survey_pass_ledger"]["promoted"])
+        self.assertEqual(
+            "d" * 64,
+            migrated["promoted_root_ledger"]["0"]["leaf-1"]["payload"][
+                "root_seal_sha256"
+            ],
+        )
+        history = migrated["forensic_fixed_root_v2_history"]["0:leaf-1"]
+        self.assertEqual("FORENSIC_ONLY", history["authority"])
+        self.assertEqual(stage, history["source_stage"])
+
+    def test_legacy_stage_cannot_smuggle_an_unknown_typed_artifact(self) -> None:
+        checkpoint = append_promotion(
+            empty_schema11_checkpoint("campaign-1", "selection-1"),
+            leaf_id="leaf-1",
+            queue_kind=PromotionQueueKind.RESPONSE,
+            reason_code="REVIEWED_ERROR_EVIDENCE_PENDING",
+            minimum_requested_tier="BF40",
+            scientific_computation_identity="b" * 64,
+        )
+        artifact_content = {
+            "schema": "windows-solver.mistyped-control/999",
+        }
+        artifact = {
+            **artifact_content,
+            "calculation_sha256": _sha256(artifact_content),
+        }
+        stage_content = {
+            "schema": "windows-solver.promoted-calculation-stage/1",
+            "leaf_id": "leaf-1",
+            "queue_ordinal": 0,
+            "route": "EXTERIOR_BF40",
+            "execution_mode": "CALCULATE_ONLY",
+            "admission_state": "AWAITING_ADMISSION",
+            "precision_tiers": ["BF40"],
+            "batch": {"sample_count": 18},
+            "receipts": [],
+            "calculation_artifact": artifact,
+        }
+        stage = {**stage_content, "stage_sha256": _sha256(stage_content)}
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "legacy promoted stage cannot carry a typed artifact",
+        ):
+            retain_promoted_calculation(
+                checkpoint,
+                queue_ordinal=0,
+                promoted_stage=stage,
+                execution_mode="CALCULATE_ONLY",
+                disposition_receipt={
+                    "schema": "windows-solver.promoted-admission-pending/1"
+                },
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

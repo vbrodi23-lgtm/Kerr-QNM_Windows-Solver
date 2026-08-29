@@ -108,6 +108,13 @@ if ($Profile -ne "admit" -and ($ReviewReceiptPath.Count -gt 0 -or $HasReviewRece
 if ($NewCampaign -and ($Profile -ne "survey" -or $SurveyPass -notin @("binary64", "full"))) {
     throw "-NewCampaign starts only a binary64 or full survey."
 }
+$PreResolvedCheckpointPath = if ([IO.Path]::IsPathRooted($Checkpoint)) {
+    [IO.Path]::GetFullPath($Checkpoint)
+}
+else {
+    [IO.Path]::GetFullPath((Join-Path $PackageRoot $Checkpoint))
+}
+$PreResolvedBinary64LockPath = "$PreResolvedCheckpointPath.binary64-lock.json"
 $HasCalibrationPath = -not [string]::IsNullOrWhiteSpace($CalibrationReceiptPath)
 $HasCalibrationSha256 = -not [string]::IsNullOrWhiteSpace($CalibrationReceiptSha256)
 if ($HasCalibrationPath -ne $HasCalibrationSha256) {
@@ -116,7 +123,10 @@ if ($HasCalibrationPath -ne $HasCalibrationSha256) {
 $RequiresPromotedCalibration = (
     ($Profile -eq "survey" -and $SurveyPass -in @("promoted", "full")) -or
     $Profile -eq "admit" -or
-    $Profile -eq "resolve-system-failure"
+    (
+        $Profile -eq "resolve-system-failure" -and
+        (Test-Path -LiteralPath $PreResolvedBinary64LockPath -PathType Leaf)
+    )
 )
 if ($RequiresPromotedCalibration -and -not $HasCalibrationPath) {
     $CalibrationReceiptPath = Join-Path $PackageRoot `
@@ -185,12 +195,7 @@ $SelectionPath = if ([IO.Path]::IsPathRooted($Selection)) {
 else {
     [IO.Path]::GetFullPath((Join-Path $PackageRoot $Selection))
 }
-$CheckpointPath = if ([IO.Path]::IsPathRooted($Checkpoint)) {
-    [IO.Path]::GetFullPath($Checkpoint)
-}
-else {
-    [IO.Path]::GetFullPath((Join-Path $PackageRoot $Checkpoint))
-}
+$CheckpointPath = $PreResolvedCheckpointPath
 $Binary64LockPath = "$CheckpointPath.binary64-lock.json"
 if (-not (Test-Path -LiteralPath $SelectionPath -PathType Leaf)) {
     throw "M02 selection is absent: $SelectionPath"
@@ -394,16 +399,18 @@ try {
         if ($RepairCommit -notmatch '^[0-9A-Fa-f]{40,64}$') {
             throw "Repair commit identity is invalid."
         }
-        Ensure-Binary64Lock
         $ResolutionArguments = @(
             "campaign-resolve-system-failure",
             $SelectionPath,
             "--checkpoint", $CheckpointPath,
-            "--binary64-lock", $Binary64LockPath,
             "--failure-receipt-sha256", $FailureReceiptSha256.ToLowerInvariant(),
             "--repair-commit", $RepairCommit.ToLowerInvariant(),
             "--reason", $ResolutionReason
-        ) + $CalibrationArguments
+        )
+        if (Test-Path -LiteralPath $Binary64LockPath -PathType Leaf) {
+            $ResolutionArguments += @("--binary64-lock", $Binary64LockPath)
+            $ResolutionArguments += $CalibrationArguments
+        }
         $ResolutionOutput = Invoke-M02Command -Arguments $ResolutionArguments
         $ResolutionOutput
         return

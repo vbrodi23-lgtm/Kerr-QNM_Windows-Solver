@@ -24,6 +24,8 @@ _ACTIVE_CALCULATION_DISPOSITIONS = frozenset(
     {
         PromotionQueueDisposition.PENDING.value,
         PromotionQueueDisposition.CALCULATED_PENDING_DERIVATION.value,
+        PromotionQueueDisposition.CONTROL_RETURN_RETAINED.value,
+        PromotionQueueDisposition.CONTROL_DECISION_RETAINED.value,
         PromotionQueueDisposition.NUMERICAL_CONTINUATION.value,
     }
 )
@@ -75,6 +77,34 @@ class Schema11EvidenceRow:
 
 
 @dataclass(frozen=True, slots=True)
+class Schema11EndpointRecoveryRow:
+    """One branch/order/geometry decision retained from endpoint recovery."""
+
+    leaf_id: str
+    endpoint_branch: str
+    attempted_order: int
+    attempted_geometry: str
+    limiting_resource: str
+    selected_intervention: str
+    result: str
+    aggregate_limitation: str
+
+
+@dataclass(frozen=True, slots=True)
+class Schema11ControlTransitionRow:
+    """One canonical CONTROL outcome retained for operator reconstruction."""
+
+    leaf_id: str
+    transition_id: str
+    current_tier: str
+    outcome_kind: str
+    reason_code: str
+    next_tier: str | None
+    retryable: bool
+    terminal: bool
+
+
+@dataclass(frozen=True, slots=True)
 class Schema11DashboardSnapshot:
     """Canonical operator projection of one committed schema-11 checkpoint."""
 
@@ -82,6 +112,8 @@ class Schema11DashboardSnapshot:
     binary64_rows: tuple[Schema11DashboardRow, ...]
     promoted_rows: tuple[Schema11DashboardRow, ...]
     evidence_rows: tuple[Schema11EvidenceRow, ...]
+    endpoint_recovery_rows: tuple[Schema11EndpointRecoveryRow, ...]
+    control_transition_rows: tuple[Schema11ControlTransitionRow, ...]
     selected_leaf_count: int
     binary64_processed_count: int
     promoted_processed_count: int
@@ -289,6 +321,8 @@ def project_schema11_dashboard(
         binary64_rows=binary_rows,
         promoted_rows=promoted_rows,
         evidence_rows=evidence_rows,
+        endpoint_recovery_rows=_endpoint_recovery_rows(value, selected_set),
+        control_transition_rows=_control_transition_rows(value, selected_set),
         selected_leaf_count=selected_count,
         binary64_processed_count=len(binary_selected),
         promoted_processed_count=len(promoted_selected),
@@ -308,6 +342,126 @@ def project_schema11_dashboard(
         ),
         report_status=MappingProxyType(dict(report_status)),
     )
+
+
+def _endpoint_recovery_rows(
+    checkpoint: Mapping[str, object], selected: set[str]
+) -> tuple[Schema11EndpointRecoveryRow, ...]:
+    rows: list[Schema11EndpointRecoveryRow] = []
+    stage_ledger = checkpoint.get("promoted_stage_ledger")
+    if not isinstance(stage_ledger, Mapping):
+        return ()
+    for bucket in stage_ledger.values():
+        if not isinstance(bucket, Mapping):
+            continue
+        for leaf_id, stage in bucket.items():
+            if leaf_id not in selected or not isinstance(stage, Mapping):
+                continue
+            stack: list[object] = [stage]
+            while stack:
+                item = stack.pop()
+                if isinstance(item, Mapping):
+                    receipts = item.get("endpoint_receipts")
+                    aggregate = item.get("aggregate_limitation")
+                    if isinstance(receipts, list) and isinstance(aggregate, str):
+                        for receipt in receipts:
+                            if not isinstance(receipt, Mapping):
+                                continue
+                            branch = receipt.get("endpoint_branch")
+                            attempts = receipt.get("attempts")
+                            if not isinstance(branch, str) or not isinstance(attempts, list):
+                                continue
+                            for attempt in attempts:
+                                if not isinstance(attempt, Mapping):
+                                    continue
+                                order = attempt.get("attempted_endpoint_order")
+                                geometry = attempt.get("attempted_geometry")
+                                limitation = attempt.get("candidate_limitation")
+                                intervention = attempt.get("selected_intervention")
+                                result = attempt.get("result")
+                                if (
+                                    type(order) is int
+                                    and all(isinstance(value, str) for value in (
+                                        branch, geometry, limitation,
+                                        intervention, result, aggregate,
+                                    ))
+                                ):
+                                    rows.append(Schema11EndpointRecoveryRow(
+                                        str(leaf_id), branch, order, geometry,
+                                        limitation, intervention, result,
+                                        aggregate,
+                                    ))
+                    stack.extend(item.values())
+                elif isinstance(item, list):
+                    stack.extend(item)
+    # The same receipt may occur in a stage chain more than once. Preserve
+    # causal order while projecting each exact row once.
+    return tuple(dict.fromkeys(rows))
+
+
+def _control_transition_rows(
+    checkpoint: Mapping[str, object], selected: set[str]
+) -> tuple[Schema11ControlTransitionRow, ...]:
+    """Project only authenticated canonical outcome payloads from the ledger."""
+
+    rows: list[Schema11ControlTransitionRow] = []
+    stage_ledger = checkpoint.get("promoted_stage_ledger")
+    if not isinstance(stage_ledger, Mapping):
+        return ()
+    for bucket in stage_ledger.values():
+        if not isinstance(bucket, Mapping):
+            continue
+        for leaf_id, stage in bucket.items():
+            if leaf_id not in selected or not isinstance(stage, Mapping):
+                continue
+            stack: list[object] = [stage]
+            while stack:
+                item = stack.pop()
+                if isinstance(item, Mapping):
+                    transition_id = item.get("transition_id")
+                    transition = item.get("transition")
+                    event = (
+                        transition.get("event")
+                        if isinstance(transition, Mapping)
+                        else None
+                    )
+                    outcome = (
+                        transition.get("outcome")
+                        if isinstance(transition, Mapping)
+                        else None
+                    )
+                    if (
+                        isinstance(transition_id, str)
+                        and isinstance(event, Mapping)
+                        and isinstance(outcome, Mapping)
+                        and isinstance(event.get("current_tier"), str)
+                        and isinstance(outcome.get("kind"), str)
+                        and isinstance(outcome.get("reason_code"), str)
+                        and isinstance(outcome.get("retryable"), bool)
+                        and isinstance(outcome.get("terminal"), bool)
+                        and (
+                            outcome.get("next_tier") is None
+                            or isinstance(outcome.get("next_tier"), str)
+                        )
+                    ):
+                        rows.append(Schema11ControlTransitionRow(
+                            leaf_id=str(leaf_id),
+                            transition_id=transition_id,
+                            current_tier=str(event["current_tier"]),
+                            outcome_kind=str(outcome["kind"]),
+                            reason_code=str(outcome["reason_code"]),
+                            next_tier=(
+                                None
+                                if outcome.get("next_tier") is None
+                                else str(outcome["next_tier"])
+                            ),
+                            retryable=bool(outcome["retryable"]),
+                            terminal=bool(outcome["terminal"]),
+                        ))
+                    stack.extend(item.values())
+                elif isinstance(item, list):
+                    stack.extend(item)
+    return tuple(dict.fromkeys(rows))
 
 
 def _rows_for_ledger(
@@ -561,6 +715,8 @@ def _report_status(value: object) -> dict[str, object]:
 __all__ = [
     "Schema11DashboardRow",
     "Schema11DashboardSnapshot",
+    "Schema11ControlTransitionRow",
+    "Schema11EndpointRecoveryRow",
     "Schema11EvidenceRow",
     "project_schema11_dashboard",
 ]

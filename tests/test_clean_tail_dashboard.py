@@ -329,7 +329,7 @@ class CleanTailDashboardTests(unittest.TestCase):
             )
 
         self.assertEqual("", stream.getvalue())
-        self.assertEqual("windows-solver.schema11-progress-status/2", status["schema"])
+        self.assertEqual("windows-solver.schema11-progress-status/3", status["schema"])
         self.assertEqual("binary64", status["survey_pass"])
 
 if __name__ == "__main__":

@@ -174,6 +174,26 @@ class RootReadoutStoreTests(unittest.TestCase):
 
 
 class JuliaAdapterReadoutReuseTests(unittest.TestCase):
+    def test_v2_store_is_forensic_and_current_adapter_recomputes(self):
+        """A PR74 cache directory cannot become a PR75 response candidate."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = _runtime_receipt(Path(temporary))
+            legacy = runtime / "root-readouts-v2"
+            legacy.mkdir()
+            legacy_entry = legacy / f"{'a' * 64}.json"
+            legacy_entry.write_text("{ stale-pr74-cache", encoding="utf-8")
+            runner = _RecordingRunner()
+            adapter = JuliaResponseAdapter.from_runtime_receipt(
+                runtime_root=runtime, runner=runner
+            )
+
+            adapter.evaluate({"schema_version": 1, "operation": "x"})
+
+            self.assertEqual(len(runner.commands), 1)
+            self.assertTrue(legacy_entry.is_file())
+            self.assertEqual(adapter.readout_cache.root.name, "root-readouts-v3")
+
     def test_completed_readout_is_reused_without_reinvoking_the_worker(self):
         """Catches discarding finished readouts when a promoted stage restarts."""
 

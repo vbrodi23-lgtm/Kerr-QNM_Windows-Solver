@@ -17,6 +17,8 @@ Set(keys(fixture)) == Set((
     "requests",
     "invalid_exterior_cases",
     "empirical_safety_factor_invalid_cases",
+    "exterior_policy_field_cases",
+    "exterior_policy_injection_cases",
     "golden_contracts",
 )) || error("Python request-contract fixture fields are invalid")
 fixture["schema_version"] == 1 ||
@@ -27,6 +29,8 @@ requests = fixture["requests"]
 invalid_exterior_cases = fixture["invalid_exterior_cases"]
 empirical_safety_factor_invalid_cases =
     fixture["empirical_safety_factor_invalid_cases"]
+exterior_policy_field_cases = fixture["exterior_policy_field_cases"]
+exterior_policy_injection_cases = fixture["exterior_policy_injection_cases"]
 golden_contracts = fixture["golden_contracts"]
 
 # Field taxonomy shared by both exterior diagnostic models. COMMON fields
@@ -214,7 +218,7 @@ end
             @test request["diagnostic_model_identity"] == model
             @test request["required_raw_determinant_roles"] == roles
             @test request["required_raw_determinant_count"] === count
-            @test response["schema_version"] === 11
+            @test response["schema_version"] === 12
             @test response["operation"] == "root-readout"
             @test response["diagnostic_model_identity"] == model
             @test response["required_raw_determinant_roles"] == roles
@@ -269,30 +273,26 @@ end
 end
 
 @testset "exterior policy fields fail closed independently" begin
-    exterior = only(filter(requests) do document
-        document["operation"] == "root-readout" &&
-            document["mechanism_id"] == "exterior-light-ring" &&
-            document["precision_digits"] == 80 &&
-            document["refinement_level"] == 0
-    end)
     # COMMON and PROVISIONAL-ONLY fields are required on a provisional
     # exterior policy: deleting any of them must fail closed with the
-    # field named (required() reports the missing key), and forging its
-    # value must also fail closed at flatten or validation. The forge
-    # message for determinant_error_model is intentionally "exterior
-    # request carries an unknown diagnostic model" rather than the raw
-    # field literal, so the field-name assertion is scoped to fields
-    # whose failure path guarantees it.
-    for field in (COMMON_EXTERIOR_FIELDS..., PROVISIONAL_ONLY_EXTERIOR_FIELDS...)
-        missing = deepcopy(exterior)
-        delete!(missing["policy"], field)
-        _, missing_failure = flatten_validation_result(missing)
+    # field named, and forging its value must also fail closed at flatten
+    # or validation. Python owns the request and identity projection, so
+    # every negative document is rebound there after mutation. This lets
+    # the test reach the intended policy gate without weakening the
+    # request-digest gate. The forge message for determinant_error_model
+    # is intentionally "exterior request carries an unknown diagnostic
+    # model" rather than the raw field literal.
+    @test Set(string(case["field"]) for case in exterior_policy_field_cases) ==
+        Set((COMMON_EXTERIOR_FIELDS..., PROVISIONAL_ONLY_EXTERIOR_FIELDS...))
+    for case in exterior_policy_field_cases
+        field = string(case["field"])
+        _, missing_failure =
+            flatten_validation_result(case["missing_document"])
         @test missing_failure !== nothing
         @test occursin(field, missing_failure)
 
-        corrupt = deepcopy(exterior)
-        corrupt["policy"][field] = "forged-$(field)"
-        _, corrupt_failure = flatten_validation_result(corrupt)
+        _, corrupt_failure =
+            flatten_validation_result(case["corrupt_document"])
         @test corrupt_failure !== nothing
         if field != "determinant_error_model"
             @test occursin(field, corrupt_failure)
@@ -302,10 +302,12 @@ end
     # Injecting one keeps the diagnostic model provisional but adds a
     # certificate-shaped field — the raw-determinant contract must reject
     # it explicitly so the two modes remain disjoint at the wire level.
-    for field in EMPIRICAL_ONLY_EXTERIOR_FIELDS
-        injected = deepcopy(exterior)
-        injected["policy"][field] = "forged-$(field)"
-        _, injected_failure = flatten_validation_result(injected)
+    @test Set(
+        string(case["field"]) for case in exterior_policy_injection_cases
+    ) == Set(EMPIRICAL_ONLY_EXTERIOR_FIELDS)
+    for case in exterior_policy_injection_cases
+        field = string(case["field"])
+        _, injected_failure = flatten_validation_result(case["document"])
         @test injected_failure !== nothing
         @test occursin(field, injected_failure)
     end

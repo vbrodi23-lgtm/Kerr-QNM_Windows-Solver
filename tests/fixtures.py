@@ -8,6 +8,8 @@ from collections.abc import Mapping
 from windows_solver.contracts import canonical_json_bytes
 from windows_solver.adaptive_controls import ODEToleranceCalibration, derive_ode_error_budget
 from windows_solver.precision_tiers import PrecisionTier
+from windows_solver.operation_control import execution_identity_from_request
+from windows_solver.response_engine import WORKER_RESPONSE_WIRE_SCHEMA
 
 
 SYNTHETIC_ODE_CALIBRATION = ODEToleranceCalibration(
@@ -598,6 +600,7 @@ def current_promoted_component_payload(
 
 CONTROL_FAILURE_STAGE_FOR_CODE = {
     "COORDINATE_INVERSION_STALLED": "coordinate-inversion",
+    "COORDINATE_IDENTITY_MISMATCH": "coordinate-inversion",
     "NO_VERIFIED_HORIZON_ENDPOINT": "horizon-endpoint-geometry",
     "HORIZON_GEOMETRY_EXHAUSTED": "horizon-endpoint-geometry",
     "HORIZON_MAXIMUM_ORDER_INADEQUATE": "horizon-endpoint-geometry",
@@ -875,6 +878,24 @@ def valid_control_failure_diagnostics(
                 "derivative_error_abs": "3e-8",
                 "accepted": False,
             }],
+        }
+    if failure_code == "COORDINATE_IDENTITY_MISMATCH":
+        return {
+            "contour_label": "synthetic-coordinate-identity",
+            "maximum_absolute_residual": "2e-10",
+            "maximum_relative_residual": "2e-10",
+            "absolute_tolerance": "1e-12",
+            "relative_tolerance": "1e-12",
+            "sample_count": 2,
+            "failure_reason": "residual-exceeds-tolerance",
+        }
+    if failure_code == "ODE_SOLVER_FAILURE":
+        return {
+            "ode_leg": "Xin_inner_to_match",
+            "ode_snapshot": {
+                "ode_retcode": "Unstable",
+                "ode_endpoint_reached": False,
+            },
         }
     raise AssertionError(
         f"missing typed diagnostic fixture for {failure_code}"
@@ -1234,14 +1255,25 @@ def valid_julia_root_response(
             "root_converged": Decimal(correction) <= Decimal(tolerance),
         }
 
+    request_sha256 = request.get("request_sha256")
+    execution_identity = request.get("execution_identity")
+    if not isinstance(request_sha256, str) or not isinstance(
+        execution_identity, Mapping
+    ):
+        request_sha256 = hashlib.sha256(
+            canonical_json_bytes(request)
+        ).hexdigest()
+        execution_identity = execution_identity_from_request(
+            request,
+            request_sha256=request_sha256,
+        ).to_mapping()
     return {
-        "schema_version": 11,
+        "schema_version": WORKER_RESPONSE_WIRE_SCHEMA,
         "status": "ok",
         "adapter": "package-owned-julia-gsn-root-readout",
         "operation": "root-readout",
-        "request_sha256": hashlib.sha256(
-            canonical_json_bytes(request)
-        ).hexdigest(),
+        "request_sha256": request_sha256,
+        "execution_identity": dict(execution_identity),
         "diagnostic_model_identity": diagnostic_model_identity,
         "required_raw_determinant_roles": list(
             request["required_raw_determinant_roles"]

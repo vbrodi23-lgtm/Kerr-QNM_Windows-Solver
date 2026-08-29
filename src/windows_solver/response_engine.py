@@ -248,12 +248,14 @@ HISTORICAL_WORKER_RESPONSE_RECEIPT_SCHEMA = (
 # every successful adaptive horizon endpoint search in the sealed response.
 # Version 10 separated one logical authenticated fixed-root determinant from
 # the raw determinant evaluations required to construct its certificate.
-# Version 11 makes the diagnostic model and exact raw-role contract explicit
-# on both sides of the request/response boundary.
+# Version 11 made the diagnostic model and exact raw-role contract explicit.
+# Version 12 binds the operation and execution identity into every successful
+# root-readout response.  Version 11 is therefore historical and must never be
+# replayed from the work cache as a current response.
 # Error responses remain independently versioned at 1.
 LEGACY_PROMOTED_WORKER_RESPONSE_WIRE_SCHEMA = 10
-WORKER_RESPONSE_WIRE_SCHEMA = 11
-HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS = frozenset({3, 4, 5, 6, 7, 8, 9, 10})
+WORKER_RESPONSE_WIRE_SCHEMA = 12
+HISTORICAL_WORKER_RESPONSE_WIRE_SCHEMAS = frozenset({3, 4, 5, 6, 7, 8, 9, 10, 11})
 _ROOT_AUTHENTICATION_WIRE_SCHEMAS = frozenset({4, 5, 6})
 _HISTORICAL_WORKER_RESPONSE_RECEIPT_FIELDS = frozenset({
     "schema",

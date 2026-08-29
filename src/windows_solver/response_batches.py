@@ -140,8 +140,10 @@ from .julia_response_backend import (
     horizon_geometry_controls,
     promoted_request_preflight_documents,
     promoted_precision_numerical_controls,
+    validate_persisted_operation_control_receipt,
     worker_failure_payload as _julia_worker_failure_payload,
 )
+from .operation_control import ValidatedControlReceipt
 
 # Keep checkpoint authentication independent of campaign-test/backend injection.
 # Execution may replace ``JuliaPrecisionRootBackend`` with a fake at the stage
@@ -939,12 +941,17 @@ class CampaignLeafRecord:
         return record
 
 
-_CONTAINABLE_FAILURE_CODES = frozenset({
+# This module owns the historical campaign-checkpoint/9 precision ladder
+# (BF80 -> BF120).  It is intentionally isolated from the schema-11 promoted
+# CONTROL lifecycle, whose BF40 -> BF80 authority lives exclusively in the
+# operation-discriminated registry.  These tables validate and resume only
+# campaign-checkpoint/9 artifacts; they must never be imported by schema 11.
+_LEGACY_CAMPAIGN9_CONTAINABLE_FAILURE_CODES = frozenset({
     "ODE_RESOURCE_LIMIT",
     "ROOT_READOUT_RESOURCE_INFEASIBLE",
     "WORKER_TIMEOUT",
 }) | NUMERICAL_CONTROL_FAILURE_CODES
-_CONTAINABLE_FAILURE_STATES = {
+_LEGACY_CAMPAIGN9_CONTAINABLE_FAILURE_STATES = {
     "ODE_RESOURCE_LIMIT": "EXECUTION_RESOURCE_LIMITED",
     "ROOT_READOUT_RESOURCE_INFEASIBLE": "EXECUTION_RESOURCE_LIMITED",
     "WORKER_TIMEOUT": "WORKER_TIMEOUT",
@@ -953,16 +960,135 @@ _CONTAINABLE_FAILURE_STATES = {
         for code in NUMERICAL_CONTROL_FAILURE_CODES
     },
 }
-_CONTAINABLE_EXCEPTION_TYPES = (
+_LEGACY_CAMPAIGN9_CONTAINABLE_EXCEPTION_TYPES = (
     JuliaODEResourceLimitError,
     JuliaRootReadoutResourceLimitError,
     JuliaWorkerTimeoutError,
     JuliaNumericalControlError,
 )
-_RETRYABLE_NUMERICAL_CONTROL_FAILURE_CODES = frozenset({
+_LEGACY_CAMPAIGN9_RETRYABLE_NUMERICAL_CONTROL_FAILURE_CODES = frozenset({
     "INSUFFICIENT_ASYMPTOTIC_PRECISION",
     "HORIZON_ARITHMETIC_INADEQUATE",
 })
+_OPERATION_CONTROL_ATTEMPT_SCHEMA = (
+    "windows-solver.campaign-operation-control-attempt/1"
+)
+_OPERATION_CONTROL_ATTEMPT_FIELDS = frozenset({
+    "schema",
+    "worker_failure",
+    "control_receipt",
+    "control_receipt_sha256",
+    "canonical_request",
+    "promotion_decision",
+})
+_WORKER_FAILURE_IDENTITY_FIELDS = frozenset({
+    "worker_exit_code",
+    "worker_timed_out",
+    "worker_stderr_tail",
+    "worker_error_type",
+    "worker_error_message",
+})
+
+
+def _validated_operation_control_attempt_receipt(
+    value: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate the current receipt without mutating its authenticated proof."""
+
+    if (
+        set(value) != _OPERATION_CONTROL_ATTEMPT_FIELDS
+        or value.get("schema") != _OPERATION_CONTROL_ATTEMPT_SCHEMA
+    ):
+        raise ValueError("campaign operation-control attempt fields are invalid")
+    worker_failure = value.get("worker_failure")
+    if (
+        not isinstance(worker_failure, Mapping)
+        or set(worker_failure) != _WORKER_FAILURE_IDENTITY_FIELDS
+    ):
+        raise ValueError("campaign operation-control worker receipt is invalid")
+    probe = JuliaResponseBackendError("operation-control attempt validation")
+    probe.worker_failure = worker_failure  # type: ignore[attr-defined]
+    bounded_worker = _julia_worker_failure_payload(probe)
+    if bounded_worker is None or bounded_worker != dict(worker_failure):
+        raise ValueError("campaign operation-control worker receipt is malformed")
+
+    control_receipt = value.get("control_receipt")
+    canonical_request = value.get("canonical_request")
+    if not isinstance(control_receipt, Mapping) or not isinstance(
+        canonical_request, Mapping
+    ):
+        raise ValueError("campaign operation-control proof is missing")
+    try:
+        validated = validate_persisted_operation_control_receipt(
+            control_receipt,
+            canonical_request,
+        )
+    except (JuliaResponseBackendError, ValueError) as error:
+        raise ValueError("campaign operation-control proof is invalid") from error
+    if value.get("control_receipt_sha256") != validated.sha256:
+        raise ValueError("campaign operation-control receipt digest is invalid")
+    code = validated.failure_code
+    if code not in _LEGACY_CAMPAIGN9_CONTAINABLE_FAILURE_CODES:
+        raise ValueError("campaign operation-control attempt is not containable")
+    timed_out = bounded_worker["worker_timed_out"]
+    if (code == "WORKER_TIMEOUT") is not (timed_out is True):
+        raise ValueError("campaign operation-control timeout identity is invalid")
+    decision = value.get("promotion_decision")
+    if decision is not None and not isinstance(decision, Mapping):
+        raise ValueError("campaign operation-control promotion decision is invalid")
+    # Round-trip through the canonical encoder so mutable or non-JSON aliases
+    # cannot cross the checkpoint boundary.
+    return json.loads(canonical_json_bytes(dict(value)))
+
+
+def _attempt_is_operation_control(receipt: Mapping[str, object]) -> bool:
+    return receipt.get("schema") == _OPERATION_CONTROL_ATTEMPT_SCHEMA
+
+
+def _attempt_failure(receipt: Mapping[str, object]) -> Mapping[str, object]:
+    name = "control_receipt" if _attempt_is_operation_control(receipt) else "failure"
+    failure = receipt.get(name)
+    if not isinstance(failure, Mapping):
+        raise ValueError("campaign execution attempt failure is missing")
+    return failure
+
+
+def _attempt_canonical_request(
+    receipt: Mapping[str, object],
+) -> Mapping[str, object]:
+    if _attempt_is_operation_control(receipt):
+        request = receipt.get("canonical_request")
+    else:
+        request = _attempt_failure(receipt).get("request_binding")
+    if not isinstance(request, Mapping):
+        raise ValueError("campaign execution attempt request binding is missing")
+    return request
+
+
+def _attempt_execution_identity(
+    receipt: Mapping[str, object],
+) -> Mapping[str, object]:
+    if _attempt_is_operation_control(receipt):
+        identity = _attempt_failure(receipt).get("execution_identity")
+        if not isinstance(identity, Mapping):
+            raise ValueError("campaign execution attempt identity is missing")
+        return identity
+    return _attempt_failure(receipt)
+
+
+def _attempt_promotion_decision(receipt: Mapping[str, object]) -> object:
+    if _attempt_is_operation_control(receipt):
+        return receipt.get("promotion_decision")
+    return _attempt_failure(receipt).get("promotion_decision")
+
+
+def _attempt_worker_failure(receipt: Mapping[str, object]) -> Mapping[str, object]:
+    if _attempt_is_operation_control(receipt):
+        worker = receipt.get("worker_failure")
+        if not isinstance(worker, Mapping):
+            raise ValueError("campaign execution attempt worker receipt is missing")
+        return worker
+    return receipt
 
 
 def _validated_attempt_failure_receipt(
@@ -972,6 +1098,8 @@ def _validated_attempt_failure_receipt(
 ) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError("campaign execution attempt receipt is invalid")
+    if value.get("schema") == _OPERATION_CONTROL_ATTEMPT_SCHEMA:
+        return _validated_operation_control_attempt_receipt(value)
     probe = JuliaResponseBackendError("attempt receipt validation")
     probe.worker_failure = value  # type: ignore[attr-defined]
     bounded = _julia_worker_failure_payload(probe)
@@ -982,14 +1110,14 @@ def _validated_attempt_failure_receipt(
         raise ValueError("campaign execution attempt lacks a structured failure")
     code = failure.get("failure_code")
     if (
-        code not in _CONTAINABLE_FAILURE_CODES
+        code not in _LEGACY_CAMPAIGN9_CONTAINABLE_FAILURE_CODES
         or failure.get("failure_class") != "CONTROL"
         or not isinstance(failure.get("retryable"), bool)
     ):
         raise ValueError("campaign execution attempt is not containable")
     if code in NUMERICAL_CONTROL_FAILURE_CODES and (
         failure.get("retryable")
-        is not (code in _RETRYABLE_NUMERICAL_CONTROL_FAILURE_CODES)
+        is not (code in _LEGACY_CAMPAIGN9_RETRYABLE_NUMERICAL_CONTROL_FAILURE_CODES)
         or not _valid_numerical_control_diagnostics(
             failure,
             allow_historical_schema7_policy=(
@@ -1138,26 +1266,26 @@ class CampaignExecutionAttempt:
             raise ValueError("campaign execution attempt ordinal is invalid")
         if self.precision_digits not in {80, 120}:
             raise ValueError("campaign execution attempt precision is invalid")
-        if self.failure_code not in _CONTAINABLE_FAILURE_CODES:
+        if self.failure_code not in _LEGACY_CAMPAIGN9_CONTAINABLE_FAILURE_CODES:
             raise ValueError("campaign execution attempt failure code is invalid")
-        if self.state != _CONTAINABLE_FAILURE_STATES[self.failure_code]:
+        if self.state != _LEGACY_CAMPAIGN9_CONTAINABLE_FAILURE_STATES[self.failure_code]:
             raise ValueError("campaign execution attempt state is invalid")
         receipt = _validated_attempt_failure_receipt(
             self.failure_receipt,
             checkpoint_schema_version=self._checkpoint_schema_version,
         )
-        failure = receipt["failure"]
-        assert isinstance(failure, Mapping)
+        failure = _attempt_failure(receipt)
         if failure["failure_code"] != self.failure_code:
             raise ValueError("campaign execution attempt code does not match receipt")
-        if failure.get("precision_digits") != self.precision_digits:
+        identity = _attempt_execution_identity(receipt)
+        if identity.get("precision_digits") != self.precision_digits:
             raise ValueError(
                 "campaign execution attempt precision does not match receipt"
             )
-        expected_decision = _numerical_failure_promotion_decision(
+        expected_decision = _legacy_campaign9_numerical_failure_promotion_decision(
             failure, self.precision_digits
         )
-        raw_decision = failure.get("promotion_decision")
+        raw_decision = _attempt_promotion_decision(receipt)
         if expected_decision is None:
             if raw_decision is not None:
                 raise ValueError(
@@ -1375,14 +1503,16 @@ def _validate_failed_preflight_attempt_request(
             required_failure_code is not None
             and attempt.failure_code != required_failure_code
         )
-        or attempt.failure_code not in _CONTAINABLE_FAILURE_CODES
-        or attempt.state != _CONTAINABLE_FAILURE_STATES[attempt.failure_code]
+        or attempt.failure_code not in _LEGACY_CAMPAIGN9_CONTAINABLE_FAILURE_CODES
+        or attempt.state
+        != _LEGACY_CAMPAIGN9_CONTAINABLE_FAILURE_STATES[attempt.failure_code]
     ):
         raise ValueError("failed-preflight attempt identity is invalid")
-    failure = attempt.failure_receipt.get("failure")
-    if not isinstance(failure, Mapping):
-        raise ValueError("failed-preflight attempt receipt is missing")
-    refinement_level = failure.get("refinement_level")
+    receipt = attempt.failure_receipt
+    failure = _attempt_failure(receipt)
+    execution_identity = _attempt_execution_identity(receipt)
+    request_binding = _attempt_canonical_request(receipt)
+    refinement_level = execution_identity.get("refinement_level")
     if (
         type(refinement_level) is not int
         or refinement_level not in allowed_refinement_levels
@@ -1396,15 +1526,17 @@ def _validate_failed_preflight_attempt_request(
         "backend_identity_sha256": leaf.job.backend_identity.identity_sha256,
         "refinement_level": refinement_level,
     }
-    if any(failure.get(name) != expected for name, expected in identity.items()):
+    if any(
+        execution_identity.get(name) != expected
+        for name, expected in identity.items()
+    ):
         raise ValueError("failed-preflight request/job identity is invalid")
-    request_sha256 = failure.get("request_sha256")
+    request_sha256 = execution_identity.get("request_sha256")
     if (
         not isinstance(request_sha256, str)
         or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None
     ):
         raise ValueError("failed-preflight request digest is invalid")
-    request_binding = failure.get("request_binding")
     if (
         not isinstance(request_binding, Mapping)
         or _sha256(request_binding) != request_sha256
@@ -1513,7 +1645,11 @@ def _validate_failed_preflight_attempt_request(
     elif predictor_kind is not None:
         raise ValueError("failed-preflight request predictor is invalid")
     resource = request_binding.get("execution_resource")
-    failure_resource = failure.get("execution_resource_policy")
+    failure_resource = (
+        execution_identity.get("execution_resource_policy_identity")
+        if _attempt_is_operation_control(receipt)
+        else failure.get("execution_resource_policy")
+    )
     try:
         validated_resource = _validated_execution_resource_policy(resource)
     except JuliaResponseBackendError as error:
@@ -1583,19 +1719,19 @@ def _validate_failed_preflight_attempt_request(
                 predictor_kind,
             )
         elif empirical_calibration_bound:
-            receipt = load_default_calibration_receipt()
+            calibration_receipt = load_default_calibration_receipt()
             family = (
                 "horizon-scattering/v1"
                 if leaf.mechanism_id == "horizon-admittance"
                 else "exterior-wronskian/v1"
             )
-            profile = receipt.budget_for(family, precision_digits)
+            profile = calibration_receipt.budget_for(family, precision_digits)
             profile_mapping = profile.to_mapping()
             if (
                 request_policy.get(
                     "promoted_control_calibration_receipt_sha256"
                 )
-                != receipt.sha256
+                != calibration_receipt.sha256
                 or request_policy.get("empirical_control_profile_sha256")
                 != _sha256(profile_mapping)
             ):
@@ -1608,7 +1744,7 @@ def _validate_failed_preflight_attempt_request(
                 precision_digits,
                 refinement=refinement_level,
                 empirical_control_profile=profile,
-                calibration_receipt=receipt,
+                calibration_receipt=calibration_receipt,
                 diagnostic_model_identity=diagnostic_model_identity,
             )._request(
                 leaf.job,
@@ -1626,20 +1762,20 @@ def _validate_failed_preflight_attempt_request(
             # the diagnostic identity keeps the policy provisional or
             # horizon-shaped, and the receipt hashes stay off the wire
             # exactly as they did in the historical binding.
-            receipt = load_default_calibration_receipt()
+            calibration_receipt = load_default_calibration_receipt()
             family = (
                 "horizon-scattering/v1"
                 if leaf.mechanism_id == "horizon-admittance"
                 else "exterior-wronskian/v1"
             )
-            profile = receipt.budget_for(family, precision_digits)
+            profile = calibration_receipt.budget_for(family, precision_digits)
             expected_request = _CanonicalRequestJuliaPrecisionRootBackend(
                 leaf.job.backend_identity,
                 object(),
                 precision_digits,
                 refinement=refinement_level,
                 empirical_control_profile=profile,
-                calibration_receipt=receipt,
+                calibration_receipt=calibration_receipt,
                 diagnostic_model_identity=diagnostic_model_identity,
             )._request(
                 leaf.job,
@@ -1652,12 +1788,18 @@ def _validate_failed_preflight_attempt_request(
     expected_request["execution_resource"] = validated_resource
     if dict(request_binding) != expected_request:
         raise ValueError("failed-preflight canonical request contract is invalid")
-    if failure.get("precision_digits") != precision_digits:
+    if execution_identity.get("precision_digits") != precision_digits:
         raise ValueError("failed-preflight request precision is invalid")
     if attempt.failure_code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
         diagnostics = failure.get("diagnostics")
+        retryable_evidence = failure.get("retryable_evidence")
+        retryable = (
+            retryable_evidence.get("retryable")
+            if isinstance(retryable_evidence, Mapping)
+            else failure.get("retryable")
+        )
         if (
-            failure.get("retryable") is not True
+            retryable is not True
             or not isinstance(diagnostics, Mapping)
             or diagnostics.get("asymptotic_preflight_avoided_ode") is not True
             or diagnostics.get("asymptotic_preflight_reason")
@@ -1667,8 +1809,8 @@ def _validate_failed_preflight_attempt_request(
             != _FACTORED_HOMOGENEOUS_ODE_SCOPE_ID
         ):
             raise ValueError("failed-preflight zero-work evidence is invalid")
-    decision = failure.get("promotion_decision")
-    expected_decision = _numerical_failure_promotion_decision(
+    decision = _attempt_promotion_decision(receipt)
+    expected_decision = _legacy_campaign9_numerical_failure_promotion_decision(
         failure, precision_digits
     )
     if expected_decision is None:
@@ -1706,13 +1848,8 @@ def _failed_preflight_primary_root_predictor(
 ) -> complex:
     """Recover the binary64 baseline predictor bound into the failed request."""
 
-    failure = attempt.failure_receipt.get("failure")
-    request = (
-        None if not isinstance(failure, Mapping) else failure.get("request_binding")
-    )
-    raw = None if not isinstance(request, Mapping) else request.get(
-        "primary_predictor"
-    )
+    request = _attempt_canonical_request(attempt.failure_receipt)
+    raw = request.get("primary_predictor")
     if not isinstance(raw, Mapping) or set(raw) != {"real", "imaginary"}:
         raise ValueError(
             "failed-preflight promoted horizon predictor evidence is missing"
@@ -1738,12 +1875,7 @@ def _failed_preflight_exterior_root_predictor(
 ) -> complex:
     """Recover the exact predictor or authenticated request root for exterior."""
 
-    failure = attempt.failure_receipt.get("failure")
-    request = (
-        None if not isinstance(failure, Mapping) else failure.get("request_binding")
-    )
-    if not isinstance(request, Mapping):
-        raise ValueError("failed-preflight exterior request evidence is missing")
+    request = _attempt_canonical_request(attempt.failure_receipt)
     raw = request.get("primary_predictor", request.get("omega"))
     if not isinstance(raw, Mapping) or set(raw) != {"real", "imaginary"}:
         raise ValueError("failed-preflight exterior predictor evidence is missing")
@@ -7610,7 +7742,7 @@ def _validate_failed_preflight_recovery_stage(
         )
         _validate_failed_preflight_predecessor(predecessor, leaf)
         predictor = _failed_preflight_primary_root_predictor(predecessor)
-        request = predecessor.failure_receipt["failure"]["request_binding"]
+        request = _attempt_canonical_request(predecessor.failure_receipt)
         expected_predictor = {
             "real": format(predictor.real, ".17g"),
             "imaginary": format(predictor.imag, ".17g"),
@@ -9782,7 +9914,7 @@ def _execute_endpoint_arithmetic_recovery_with_progress(
     return outcome, time.monotonic() - started
 
 
-def _numerical_failure_promotion_decision(
+def _legacy_campaign9_numerical_failure_promotion_decision(
     failure: Mapping[str, object], digits: int
 ) -> dict[str, object] | None:
     code = failure.get("failure_code")
@@ -9792,7 +9924,9 @@ def _numerical_failure_promotion_decision(
     required: str | None = None
     limited: bool | None = None
     preflight: bool | None = None
-    requested = code in _RETRYABLE_NUMERICAL_CONTROL_FAILURE_CODES
+    requested = (
+        code in _LEGACY_CAMPAIGN9_RETRYABLE_NUMERICAL_CONTROL_FAILURE_CODES
+    )
     if code == "INSUFFICIENT_ASYMPTOTIC_PRECISION":
         diagnostics = failure.get("diagnostics")
         if not isinstance(diagnostics, Mapping):
@@ -9824,17 +9958,38 @@ def _execution_attempt_from_failure(
 ) -> CampaignExecutionAttempt | None:
     """Return a durable control attempt only for exact, well-formed typed failures."""
 
-    if not isinstance(error, _CONTAINABLE_EXCEPTION_TYPES):
+    if not isinstance(error, _LEGACY_CAMPAIGN9_CONTAINABLE_EXCEPTION_TYPES):
         return None
-    receipt = _worker_failure_payload(error)
-    if receipt is None:
+    worker_receipt = _worker_failure_payload(error)
+    if worker_receipt is None:
         return None
+    validated_control = getattr(error, "control_receipt", None)
+    if isinstance(validated_control, ValidatedControlReceipt):
+        canonical_request = validated_control.canonical_request
+        if (
+            canonical_request is None
+            or worker_receipt.get("failure")
+            != validated_control.to_mapping()
+        ):
+            return None
+        receipt: dict[str, object] = {
+            "schema": _OPERATION_CONTROL_ATTEMPT_SCHEMA,
+            "worker_failure": {
+                name: worker_receipt[name]
+                for name in _WORKER_FAILURE_IDENTITY_FIELDS
+            },
+            "control_receipt": validated_control.to_mapping(),
+            "control_receipt_sha256": validated_control.sha256,
+            "canonical_request": dict(canonical_request),
+            "promotion_decision": None,
+        }
+    else:
+        receipt = worker_receipt
     try:
         receipt = _validated_attempt_failure_receipt(receipt)
     except ValueError:
         return None
-    failure = receipt["failure"]
-    assert isinstance(failure, Mapping)
+    failure = _attempt_failure(receipt)
     code = str(failure["failure_code"])
     expected_type: type[BaseException]
     if code == "ODE_RESOURCE_LIMIT":
@@ -9852,26 +10007,38 @@ def _execution_attempt_from_failure(
         and error.failure_code != code
     ):
         return None
-    if code == "WORKER_TIMEOUT" and receipt["worker_timed_out"] is not True:
+    persisted_worker = _attempt_worker_failure(receipt)
+    if (
+        code == "WORKER_TIMEOUT"
+        and persisted_worker["worker_timed_out"] is not True
+    ):
         return None
-    if code != "WORKER_TIMEOUT" and receipt["worker_timed_out"] is not False:
+    if (
+        code != "WORKER_TIMEOUT"
+        and persisted_worker["worker_timed_out"] is not False
+    ):
         return None
     leaf_index = context.get("leaf_index")
     if isinstance(leaf_index, bool) or not isinstance(leaf_index, int):
         return None
-    promotion_decision = _numerical_failure_promotion_decision(failure, digits)
+    promotion_decision = _legacy_campaign9_numerical_failure_promotion_decision(
+        failure, digits
+    )
     if promotion_decision is not None:
         receipt = dict(receipt)
-        enriched_failure = dict(failure)
-        enriched_failure["promotion_decision"] = promotion_decision
-        receipt["failure"] = enriched_failure
+        if _attempt_is_operation_control(receipt):
+            receipt["promotion_decision"] = promotion_decision
+        else:
+            enriched_failure = dict(failure)
+            enriched_failure["promotion_decision"] = promotion_decision
+            receipt["failure"] = enriched_failure
         receipt = _validated_attempt_failure_receipt(receipt)
     attempt = CampaignExecutionAttempt(
         attempt_ordinal=attempt_ordinal,
         leaf_id=leaf.leaf_id,
         leaf_index=leaf_index,
         role=leaf.role,
-        state=_CONTAINABLE_FAILURE_STATES[code],
+        state=_LEGACY_CAMPAIGN9_CONTAINABLE_FAILURE_STATES[code],
         precision_digits=digits,
         failure_code=code,
         failure_receipt=receipt,
@@ -10746,7 +10913,7 @@ def _run_campaign_selection_active(
                             response_predictor,
                         )
                     )
-                except _CONTAINABLE_EXCEPTION_TYPES as recovery_error:
+                except _LEGACY_CAMPAIGN9_CONTAINABLE_EXCEPTION_TYPES as recovery_error:
                     recovery_attempt = _execution_attempt_from_failure(
                         recovery_error,
                         leaf=leaf,
@@ -10833,7 +11000,7 @@ def _run_campaign_selection_active(
                     record.stages,
                     response_predictor,
                 )
-            except _CONTAINABLE_EXCEPTION_TYPES as error:
+            except _LEGACY_CAMPAIGN9_CONTAINABLE_EXCEPTION_TYPES as error:
                 attempt = _execution_attempt_from_failure(
                     error,
                     leaf=leaf,
@@ -10898,7 +11065,7 @@ def _run_campaign_selection_active(
                                 response_predictor,
                             )
                         )
-                except _CONTAINABLE_EXCEPTION_TYPES as recovery_error:
+                except _LEGACY_CAMPAIGN9_CONTAINABLE_EXCEPTION_TYPES as recovery_error:
                     recovery_attempt = _execution_attempt_from_failure(
                         recovery_error,
                         leaf=leaf,
@@ -11425,7 +11592,7 @@ def _run_campaign_selection_active(
                             response_predictor,
                         )
                     )
-            except _CONTAINABLE_EXCEPTION_TYPES as error:
+            except _LEGACY_CAMPAIGN9_CONTAINABLE_EXCEPTION_TYPES as error:
                 attempt = _execution_attempt_from_failure(
                     error,
                     leaf=leaf,

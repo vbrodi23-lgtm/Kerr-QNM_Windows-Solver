@@ -52,7 +52,7 @@ from windows_solver.response_engine import (
     RootReadout,
     VettedNativeDeterminantKernel,
 )
-from windows_solver.progress import activate_progress
+from windows_solver.progress import PROGRESS_SCHEMA, activate_progress
 from windows_solver.progress_output import CampaignProgressReporter
 from windows_solver.root_readout_cache import (
     RootReadoutLookupStatus,
@@ -2982,7 +2982,10 @@ class SolvedLeafCacheTests(unittest.TestCase):
 
             status = root / "status.json"
             status.write_text(
-                '{"schema":"windows-solver.progress/1","kind":"request_failed"}',
+                json.dumps({
+                    "schema": PROGRESS_SCHEMA,
+                    "kind": "request_failed",
+                }),
                 encoding="utf-8",
             )
             diagnostic = import_campaign_checkpoint_to_solved_leaf_store(
