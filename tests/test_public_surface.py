@@ -459,9 +459,10 @@ class PublicSurfaceTests(unittest.TestCase):
 
         # The bootstrap must deploy both resources into the contract-specific
         # worker directory so the worker resolves them via @__DIR__/<filename>,
-        # using hash-verified atomic install rather than a bare unconditional
-        # Copy-Item, and must fail closed rather than silently overwrite an
-        # already-installed resource whose bytes no longer match the contract.
+        # via the same non-destructive, hash-verified atomic installer used to
+        # repair the worker script, and must fail closed rather than silently
+        # overwrite an already-installed resource whose bytes no longer match
+        # the contract.
         deploy_start = bootstrap.index(
             '    $M02WorkerRoot = Join-Path (Join-Path $RuntimeRoot "m02-workers") $M02WorkerId'
         )
@@ -470,12 +471,51 @@ class PublicSurfaceTests(unittest.TestCase):
 
         self.assertIn("foreach ($Resource in $M02WorkerResourceReceipts)", deploy_block)
         self.assertIn("Immutable M02 worker resource is corrupted:", deploy_block)
-        self.assertIn("Copy-Item", deploy_block)
-        self.assertIn("Move-Item", deploy_block)
-        self.assertIn("did not match source hash", deploy_block)
-        self.assertIn("M02 worker authority resource was not staged:", deploy_block)
+        self.assertIn("Install-PersistentContractResource", deploy_block)
         # Resources must land inside the versioned worker dir, not the shared parent.
         self.assertIn(r"$M02WorkerId", deploy_block)
+
+    def test_m02_worker_repair_does_not_delete_sibling_authority_resources(
+        self,
+    ) -> None:
+        """A worker-script repair must not wipe its shared contract directory.
+
+        m02_worker.jl and the two authority JSONs now live in the same
+        immutable $M02WorkerId directory. If the worker script alone is
+        missing or corrupted, repairing it must not delete that directory
+        (which would also delete the authority JSONs an active worker
+        process is concurrently reading via @__DIR__/<filename>), and must
+        not overwrite a resource whose bytes still match the contract.
+        """
+        root = Path(__file__).resolve().parents[1]
+        bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
+            encoding="utf-8"
+        )
+
+        installer_start = bootstrap.index(
+            "function Install-PersistentContractResource"
+        )
+        installer_end = bootstrap.index("\n}", installer_start) + len("\n}")
+        installer_block = bootstrap[installer_start:installer_end]
+        self.assertNotIn("Remove-ManagedDirectory", installer_block)
+        self.assertIn("Copy-Item", installer_block)
+        self.assertIn("Move-Item", installer_block)
+        self.assertIn("Get-Sha256", installer_block)
+        self.assertIn("did not match source hash", installer_block)
+
+        # The worker script install call site must use the non-destructive
+        # installer, not Install-PersistentSourceFile (which removes its
+        # destination's entire parent directory before recreating it).
+        worker_install_start = bootstrap.index(
+            "if (-not (Test-PersistentSourceFile $WorkerSource $PersistentWorkerPath))"
+        )
+        worker_install_end = bootstrap.index("\n    }", worker_install_start)
+        worker_install_block = bootstrap[worker_install_start:worker_install_end]
+        self.assertIn(
+            "Install-PersistentContractResource $WorkerSource $PersistentWorkerPath",
+            worker_install_block,
+        )
+        self.assertNotIn("Install-PersistentSourceFile ", worker_install_block)
 
     def test_m02_worker_authority_files_resolve_via_dir_parent(self) -> None:
         """Staged runtime: dirname(m02_worker.jl)/.. must contain both JSON authorities."""

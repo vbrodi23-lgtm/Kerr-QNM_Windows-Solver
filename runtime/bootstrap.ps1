@@ -626,6 +626,28 @@ function Install-PersistentSourceFile($Source, [string]$Destination, [string]$La
     }
 }
 
+function Install-PersistentContractResource($Source, [string]$Destination, [string]$Label) {
+    # Unlike Install-PersistentSourceFile, this never removes the parent
+    # directory: it is used for members of a shared, immutable,
+    # content-addressed directory (the M02 worker script and its authority
+    # resources), where a sibling file may be actively read by a running
+    # worker and must not disappear while this member is repaired.
+    $ParentDirectory = Split-Path -Parent $Destination
+    New-Item -ItemType Directory -Force -Path $ParentDirectory | Out-Null
+    $TempDestination = Join-Path $ParentDirectory `
+        ".$(Split-Path -Leaf $Destination).$([Guid]::NewGuid().ToString('N')).tmp"
+    Copy-Item -LiteralPath $Source.checkout_path -Destination $TempDestination -Force
+    if ((Get-Sha256 $TempDestination) -ne $Source.sha256) {
+        Remove-Item -LiteralPath $TempDestination -Force
+        throw "$Label copy did not match source hash: $($Source.checkout_path)"
+    }
+    Move-Item -LiteralPath $TempDestination -Destination $Destination -Force
+    if (-not (Test-Path -LiteralPath $Destination -PathType Leaf) `
+        -or (Get-Sha256 $Destination) -ne $Source.sha256) {
+        throw "Persistent $Label copy failed contract validation: $Destination"
+    }
+}
+
 function Test-PersistentSourceFile($Source, [string]$Destination) {
     return (
         (Test-Path -LiteralPath $Destination -PathType Leaf) `
@@ -1353,7 +1375,7 @@ if ($WithM02) {
         else {
             Write-Step "Installing M02 worker source contract $M02WorkerId"
         }
-        Install-PersistentSourceFile $WorkerSource $PersistentWorkerPath "M02 worker source"
+        Install-PersistentContractResource $WorkerSource $PersistentWorkerPath "M02 worker source"
     }
     if (-not (Test-PersistentSourceFile $ProducerSource $PersistentProducerPath)) {
         Write-Step "Installing GSN producer source contract $M02GsnCacheId"
@@ -1361,7 +1383,6 @@ if ($WithM02) {
     }
 
     $M02WorkerRoot = Join-Path (Join-Path $RuntimeRoot "m02-workers") $M02WorkerId
-    New-Item -ItemType Directory -Force -Path $M02WorkerRoot | Out-Null
     foreach ($Resource in $M02WorkerResourceReceipts) {
         $Destination = Join-Path $M02WorkerRoot $Resource.file_name
         if (Test-Path -LiteralPath $Destination -PathType Leaf) {
@@ -1370,17 +1391,7 @@ if ($WithM02) {
             }
             continue
         }
-        $TempDestination = Join-Path $M02WorkerRoot `
-            ".$($Resource.file_name).$([Guid]::NewGuid().ToString('N')).tmp"
-        Copy-Item -LiteralPath $Resource.checkout_path -Destination $TempDestination -Force
-        if ((Get-Sha256 $TempDestination) -ne $Resource.sha256) {
-            Remove-Item -LiteralPath $TempDestination -Force
-            throw "M02 worker authority resource copy did not match source hash: $($Resource.checkout_path)"
-        }
-        Move-Item -LiteralPath $TempDestination -Destination $Destination -Force
-        if (-not (Test-Path -LiteralPath $Destination -PathType Leaf)) {
-            throw "M02 worker authority resource was not staged: $Destination"
-        }
+        Install-PersistentContractResource $Resource $Destination "M02 worker authority resource"
     }
 
     $DependencyRejectionReason = Get-M02EnvironmentRejectionReason $M02DependencySha256
