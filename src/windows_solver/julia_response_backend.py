@@ -34,6 +34,7 @@ from .operation_control import (
     FIXED_ROOT_SURVEY_BATCH_OPERATION,
     JULIA_WORKER_ORIGIN,
     NUMERICAL_CONTROL_FAILURE_CODES,
+    OPERATION_CONTROL_FACT_RECEIPT_SCHEMA,
     OPERATION_CONTROL_RECEIPT_SCHEMA,
     OperationExecutionIdentity,
     PYTHON_SUPERVISOR_ORIGIN,
@@ -1340,7 +1341,10 @@ def _require_worker_resource_identity(
     ) != "CONTROL":
         return
     candidate = structured.get("execution_resource_policy")
-    if structured.get("schema") == "windows-solver.operation-control-receipt/1":
+    if structured.get("schema") in {
+        OPERATION_CONTROL_RECEIPT_SCHEMA,
+        OPERATION_CONTROL_FACT_RECEIPT_SCHEMA,
+    }:
         identity = structured.get("execution_identity")
         if isinstance(identity, Mapping):
             candidate = identity.get("execution_resource_policy_identity")
@@ -1555,7 +1559,10 @@ def _bind_control_failure_to_request(
     structured = bound.get("failure")
     if not isinstance(structured, Mapping) or structured.get("failure_class") != "CONTROL":
         return bound, None
-    if structured.get("schema") != OPERATION_CONTROL_RECEIPT_SCHEMA:
+    if structured.get("schema") not in {
+        OPERATION_CONTROL_RECEIPT_SCHEMA,
+        OPERATION_CONTROL_FACT_RECEIPT_SCHEMA,
+    }:
         if request_document.get("operation") not in {
             "root-readout",
             "fixed-root-determinant-sample",
@@ -1602,7 +1609,10 @@ def _raise_worker_failure(
     structured = details.get("failure")
     if (
         isinstance(structured, Mapping)
-        and structured.get("schema") != "windows-solver.operation-control-receipt/1"
+        and structured.get("schema") not in {
+            OPERATION_CONTROL_RECEIPT_SCHEMA,
+            OPERATION_CONTROL_FACT_RECEIPT_SCHEMA,
+        }
     ):
         enriched = dict(structured)
         context = current_progress_context()
@@ -2426,8 +2436,6 @@ def _valid_numerical_control_diagnostics(
     if code in _FACTORED_FAILURE_STAGES:
         return _valid_factored_diagnostics(code, stage, diagnostics)
     if code in _HORIZON_RECOVERY_FAILURES:
-        if failure.get("retryable") is not _HORIZON_RECOVERY_FAILURES[code][2]:
-            return False
         if request_binding is None:
             raw_request = failure.get("request_binding")
             request_binding = raw_request if isinstance(raw_request, Mapping) else None
