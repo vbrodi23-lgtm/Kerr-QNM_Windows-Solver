@@ -3394,9 +3394,10 @@ function translate_numerical_control_failure(
                 "maximum_recurrence_digits_lost" =>
                     string(assessment.maximum_recurrence_digits_lost),
             ))
-            # Generic asymptotic insufficiency is diagnostic-only.  Typed
-            # arithmetic outcomes alone can resolve to a promotion.
-            retryable = false
+            # Higher precision is a producer capability for this condition.
+            # Python's canonical transition remains the sole owner of whether
+            # the current campaign context may exercise that capability.
+            retryable = true
         end
         stage = if failure_code == "NO_VERIFIED_HORIZON_ENDPOINT"
             "horizon-endpoint-geometry"

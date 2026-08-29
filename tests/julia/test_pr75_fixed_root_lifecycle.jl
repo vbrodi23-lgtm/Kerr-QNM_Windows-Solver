@@ -212,7 +212,7 @@ function compatibility_control_details()
     return Dict{String,Any}(
         "failure_code" => "INSUFFICIENT_ASYMPTOTIC_PRECISION",
         "stage" => "asymptotic-preflight",
-        "retryable" => false,
+        "retryable" => true,
         "diagnostics" => Dict{String,Any}(
             "reason" => "INSUFFICIENT_ASYMPTOTIC_PRECISION",
             "precision_bits" => 298,

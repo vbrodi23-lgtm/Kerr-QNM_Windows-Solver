@@ -240,7 +240,7 @@ class OperationControlTests(unittest.TestCase):
                     failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
                     stage="asymptotic-preflight",
                     identity=identity,
-                    retryable=False,
+                    retryable=True,
                     retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
                     diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
                 )
@@ -331,7 +331,7 @@ class OperationControlTests(unittest.TestCase):
             failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
             stage="asymptotic-preflight",
             identity=fixed_identity,
-            retryable=False,
+            retryable=True,
             retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
             diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
         )
@@ -363,7 +363,7 @@ class OperationControlTests(unittest.TestCase):
             failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
             stage="asymptotic-preflight",
             identity=identity,
-            retryable=False,
+            retryable=True,
             retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
             diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
         )
@@ -388,7 +388,7 @@ class OperationControlTests(unittest.TestCase):
             failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
             stage="asymptotic-preflight",
             identity=identity,
-            retryable=False,
+            retryable=True,
             retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
             diagnostics={},
         )
@@ -411,7 +411,7 @@ class OperationControlTests(unittest.TestCase):
             failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
             stage="asymptotic-preflight",
             identity=identity,
-            retryable=False,
+            retryable=True,
             retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
             diagnostics=diagnostics,
         )
@@ -713,6 +713,11 @@ class OperationControlTests(unittest.TestCase):
                     and item.current_action_kind == "RESPONSE"
                 )
                 validated = _validated_for_transition(transition)
+                self.assertIs(
+                    True,
+                    validated.mapping["retryable_evidence"]["retryable"],
+                )
+                self.assertFalse(transition.retryable)
                 self.assertEqual(
                     transition,
                     promoted_control_transition(
@@ -749,7 +754,7 @@ class OperationControlTests(unittest.TestCase):
                 failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
                 stage="asymptotic-preflight",
                 identity=identity,
-                retryable=False,
+                retryable=True,
                 retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
                 diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
             ),

@@ -1671,6 +1671,7 @@ class JuliaNumericalControlFailureTests(unittest.TestCase):
                 "DETERMINANT_UNCERTAINTY_TOO_LARGE",
                 "FINITE_DIFFERENCE_NOISE_LIMIT",
                 "HORIZON_ARITHMETIC_INADEQUATE",
+                "INSUFFICIENT_ASYMPTOTIC_PRECISION",
             },
             "stage": control_failure_stage(code),
             "diagnostics": (

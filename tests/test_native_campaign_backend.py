@@ -333,7 +333,7 @@ class NativeCampaignBackendTests(unittest.TestCase):
             failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
             stage="asymptotic-preflight",
             identity=identity,
-            retryable=False,
+            retryable=True,
             retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
             diagnostics=legacy_failure["diagnostics"],
         )
