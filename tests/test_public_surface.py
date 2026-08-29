@@ -1941,7 +1941,6 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             # the identifier tokens keeps the guard tight without
             # renaming symbols that document the forensic boundary.
             "_stale_horizon_v2_receipt",
-            "legacy_v2_horizon_response_disk",
             "forensic_v2_scientific_computation_identity_sha256",
             "_forensic_v2_root_seed",
             "_V2_HORIZON_OPERATION",

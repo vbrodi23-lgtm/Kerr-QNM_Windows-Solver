@@ -125,15 +125,44 @@ def exterior_response_disk(
     )
 
 
-def legacy_v2_horizon_response_disk(
-    *, horizon_frequency: ComplexDisk, determinant_derivative: ComplexDisk
-) -> ComplexDisk:
-    """Evaluate the forensic legacy quotient without a horizon numerator.
+NORMALISED_HORIZON_CHART_DETERMINANT_NORMALISATION = (
+    "cinc-over-cref-minus-reflectivity/v1"
+)
 
-    This is deliberately not the current production response.  Kept only so
-    historical legacy evidence remains readable as forensic material, it must
-    not be used to construct a current horizon record.
+
+def normalised_horizon_chart_response_disk(
+    *,
+    horizon_frequency: ComplexDisk,
+    determinant_derivative: ComplexDisk,
+    determinant_normalisation: str,
+) -> ComplexDisk:
+    """Return ``1 / (2 i p_H D-hat_omega)`` for the normalised horizon chart.
+
+    The Julia worker's promoted horizon determinant is evaluated as
+    ``D-hat = Cinc/Cref - R`` (``cinc-over-cref-minus-reflectivity/v1``), for
+    which ``d D-hat/dR = -1`` at the unperturbed point.  That makes the
+    response a genuine unit-numerator quotient under this specific chart --
+    not a simplification or a stand-in for a missing numerator.
+
+    This is NOT a general horizon response formula.  Under the raw-Wronskian
+    chart (``D = W[Xin + R Xout, Xup]``), ``dD/dR = D_H`` is not 1, and
+    dropping that numerator would silently discard the horizon carrier ratio.
+    Use ``horizon_response_disk`` for that chart instead.
+
+    ``determinant_normalisation`` must be supplied by the caller and is
+    checked against the one identity this formula is valid for, so a future
+    caller cannot feed a raw-Wronskian derivative into the unit-numerator
+    quotient by mistake.
     """
+    if (
+        determinant_normalisation
+        != NORMALISED_HORIZON_CHART_DETERMINANT_NORMALISATION
+    ):
+        raise ValueError(
+            "normalised_horizon_chart_response_disk requires determinant "
+            f"normalisation {NORMALISED_HORIZON_CHART_DETERMINANT_NORMALISATION!r}; "
+            f"got {determinant_normalisation!r}"
+        )
     if horizon_frequency.contains_zero:
         raise ZeroContainingDiskError("horizon_frequency")
     if determinant_derivative.contains_zero:
@@ -167,11 +196,14 @@ def horizon_response_disk(
     horizon_frequency: ComplexDisk,
     determinant_derivative: ComplexDisk,
 ) -> ComplexDisk:
-    """Return the approved current disk ``-D_H / (2 i p_H D_0,omega)``.
+    """Return ``-D_H / (2 i p_H D_0,omega)`` for the raw-Wronskian chart.
 
     The product is formed as one complex-ball denominator and the numerator is
-    explicit.  This prevents a legacy unit-numerator quotient from being
-    attached to current uncertainty evidence.
+    explicit.  Use this for the raw-Wronskian determinant
+    (``D = W[Xin + R Xout, Xup]``); its derivative with respect to ``R`` is
+    ``D_H``, not 1, so the numerator must stay explicit here.  For the
+    normalised ``Cinc/Cref - R`` chart, where the derivative genuinely is a
+    unit numerator, use ``normalised_horizon_chart_response_disk`` instead.
     """
 
     if horizon_numerator.contains_zero and horizon_numerator.radius == 0.0:

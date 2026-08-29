@@ -15,6 +15,8 @@ from windows_solver.response_engine import (
     ComponentResult,
     DecimalComplex,
     DerivativeAuthenticationEvidence,
+    EXTERIOR_DETERMINANT_NORMALISATION,
+    HORIZON_DETERMINANT_NORMALISATION,
     PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY,
     _validate_promoted_horizon_checkpoint_evidence_for_job,
     run_promoted_horizon_component,
@@ -23,7 +25,7 @@ from windows_solver.response_uncertainty import (
     ComplexDisk,
     ZeroContainingDiskError,
     exterior_response_disk,
-    legacy_v2_horizon_response_disk,
+    normalised_horizon_chart_response_disk,
 )
 
 
@@ -80,9 +82,10 @@ class PromotedHorizonUncertaintyTests(unittest.TestCase):
             coordinate_derivative=ComplexDisk(2.0 + 3.0j, 1.0e-5),
             frequency_derivative=ComplexDisk(10.0 - 2.0j, 2.0e-5),
         )
-        horizon = legacy_v2_horizon_response_disk(
+        horizon = normalised_horizon_chart_response_disk(
             horizon_frequency=ComplexDisk(0.1 - 0.02j, 2.0e-11),
             determinant_derivative=ComplexDisk(500.0 - 400.0j, 3.0e-7),
+            determinant_normalisation=HORIZON_DETERMINANT_NORMALISATION,
         )
         self.assertEqual(exterior.centre, -((2.0 + 3.0j) / (10.0 - 2.0j)))
         self.assertGreater(exterior.radius, 0.0)
@@ -90,11 +93,29 @@ class PromotedHorizonUncertaintyTests(unittest.TestCase):
 
     def test_zero_containing_denominators_have_typed_failures(self) -> None:
         with self.assertRaises(ZeroContainingDiskError) as caught:
-            legacy_v2_horizon_response_disk(
+            normalised_horizon_chart_response_disk(
                 horizon_frequency=ComplexDisk(1.0e-12 + 0.0j, 2.0e-12),
                 determinant_derivative=ComplexDisk(1.0 + 0.0j, 1.0e-6),
+                determinant_normalisation=HORIZON_DETERMINANT_NORMALISATION,
             )
         self.assertEqual(caught.exception.disk_name, "horizon_frequency")
+
+    def test_normalised_horizon_chart_rejects_the_wrong_determinant_chart(
+        self,
+    ) -> None:
+        """The unit-numerator formula is only valid under the normalised
+        Cinc/Cref - R chart; a caller bound to the raw-Wronskian chart (or
+        any other normalisation) must be rejected rather than silently
+        dropping the horizon numerator D_H.
+        """
+        with self.assertRaisesRegex(
+            ValueError, "requires determinant normalisation"
+        ):
+            normalised_horizon_chart_response_disk(
+                horizon_frequency=ComplexDisk(0.1 - 0.02j, 2.0e-11),
+                determinant_derivative=ComplexDisk(500.0 - 400.0j, 3.0e-7),
+                determinant_normalisation=EXTERIOR_DETERMINANT_NORMALISATION,
+            )
 
     def test_promoted_horizon_v2_serializes_a_bounded_positive_radius(self) -> None:
         leaf = _primary_horizon_leaf()
@@ -207,9 +228,10 @@ class PromotedHorizonUncertaintyTests(unittest.TestCase):
             ),
             derivative_mapping["radius"],
         )
-        response = legacy_v2_horizon_response_disk(
+        response = normalised_horizon_chart_response_disk(
             horizon_frequency=frequency,
             determinant_derivative=derivative,
+            determinant_normalisation=HORIZON_DETERMINANT_NORMALISATION,
         )
         evidence["horizon_frequency_disk"] = frequency.to_mapping()
         evidence["response_disk"] = response.to_mapping()
