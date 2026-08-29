@@ -8,12 +8,14 @@ from windows_solver.campaign_failures import (
     FailureDisposition,
     FailureReport,
     classify_failure,
+    decision_from_control_transition,
     require_system_failures_resolved_for_binary64_resume,
     reviewed_screening_promotion_queue,
     resolve_layer1_system_failure_for_resume,
     run_guarded_pass,
 )
 from windows_solver.campaign_policy import PromotionQueueKind, empty_schema11_checkpoint
+from windows_solver.operation_control import PROMOTED_CONTROL_TRANSITIONS
 
 
 def _report(code: str, *, cause_type: str = "NumericalControlError") -> FailureReport:
@@ -126,6 +128,21 @@ class CampaignFailureTests(unittest.TestCase):
 
         self.assertIs(FailureDisposition.SYSTEM_FAILURE, decision.disposition)
         self.assertIsNone(decision.queue_kind)
+
+    def test_reporting_consumes_canonical_control_transition(self) -> None:
+        transition = next(
+            item
+            for item in PROMOTED_CONTROL_TRANSITIONS.values()
+            if item.failure_code == "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE"
+            and item.current_tier == "BF40"
+        )
+        decision = decision_from_control_transition(
+            _report(transition.failure_code), transition
+        )
+
+        self.assertIs(FailureDisposition.PROMOTION_PENDING, decision.disposition)
+        self.assertEqual("RESPONSE", decision.queue_kind)
+        self.assertEqual("BF80", decision.next_precision_tier)
 
     def test_unknown_code_and_untyped_inner_cause_are_system_failures(self) -> None:
         unknown = classify_failure(_report("NEW_UNKNOWN_CODE"))
