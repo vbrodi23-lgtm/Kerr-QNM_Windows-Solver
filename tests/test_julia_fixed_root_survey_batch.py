@@ -15,6 +15,8 @@ from windows_solver.fixed_root_reliability import (
     load_fixed_root_reliability_projection_authority,
 )
 from windows_solver.julia_response_backend import (
+    ENDPOINT_ARITHMETIC_LIMITED,
+    ENDPOINT_SERIES_ORDER_LIMITED,
     FIXED_ROOT_SURVEY_BATCH_OPERATION,
     FIXED_ROOT_SURVEY_BATCH_SCHEMA,
     FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA,
@@ -22,6 +24,7 @@ from windows_solver.julia_response_backend import (
     JuliaFixedRootSurveyBatch,
     JuliaPrecisionRootBackend,
     JuliaResponseBackendError,
+    _validated_exterior_endpoint_recovery_evidence,
     _worker_request_document,
 )
 from windows_solver.operation_control import execution_identity_from_request
@@ -231,6 +234,106 @@ def _backend(
 
 
 class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
+    def test_mixed_arithmetic_and_order_blockers_cannot_claim_arithmetic(self):
+        job = _job()
+        request = _backend(_BatchAdapter()).preview_fixed_root_survey_request(
+            job,
+            fixed_root=job.root.omega,
+            root_seal_sha256="0" * 64,
+            branch_identity=job.root.branch_id,
+            plan=FixedRootSurveyPlan.FULL_NINE,
+        )
+        policy = request["fixed_root_endpoint_recovery_policy"]
+        required = "16.698970004336018804786261105275506973231810118538"
+        horizon_geometry = policy["horizon_geometry_schedule"][0]
+        base_order = policy["endpoint_order_schedule"][0]
+        arithmetic_attempt = {
+            "endpoint_branch": "horizon-ingoing",
+            "attempted_endpoint_order": base_order,
+            "attempted_geometry": horizon_geometry,
+            "maximum_last_term_ratio": "0.1",
+            "maximum_truncation_digits_lost": "2",
+            "maximum_recurrence_digits_lost": "1",
+            "maximum_series_evaluation_digits_lost": "1",
+            "predicted_reliable_digits": "10",
+            "required_reliable_digits": required,
+            "candidate_limitation": ENDPOINT_ARITHMETIC_LIMITED,
+            "selected_intervention": (
+                "PROMOTE_ARITHMETIC_TIER_IF_AGGREGATE_ALLOWS"
+            ),
+            "result": "ARITHMETIC_INADEQUATE",
+        }
+        horizon = {
+            "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
+            "endpoint_branch": "horizon-ingoing",
+            "recovery_policy_identity": policy["identity"],
+            "recovery_policy_sha256": policy["policy_sha256"],
+            "base_endpoint_order": policy["base_endpoint_order"],
+            "generated_maximum_order": policy["generated_maximum_order"],
+            "attempted_endpoint_orders": [base_order],
+            "terminal_endpoint_order": base_order,
+            "candidate_geometry_schedule": policy["horizon_geometry_schedule"],
+            "terminal_geometry": horizon_geometry,
+            "maximum_last_term_ratio": "0.1",
+            "maximum_truncation_digits_lost": "2",
+            "maximum_recurrence_digits_lost": "1",
+            "maximum_series_evaluation_digits_lost": "1",
+            "predicted_reliable_digits": "10",
+            "required_reliable_digits": required,
+            "candidate_limitation": ENDPOINT_ARITHMETIC_LIMITED,
+            "aggregate_limitation": ENDPOINT_ARITHMETIC_LIMITED,
+            "factored_homogeneous_rhs_evaluations": 0,
+            "attempts": [arithmetic_attempt],
+        }
+        infinity_attempts = []
+        for index, order in enumerate(policy["endpoint_order_schedule"]):
+            terminal = index == len(policy["endpoint_order_schedule"]) - 1
+            infinity_attempts.append({
+                "endpoint_branch": "infinity-outgoing",
+                "attempted_endpoint_order": order,
+                "attempted_geometry": policy["infinity_geometry_schedule"][0],
+                "maximum_last_term_ratio": "0.1",
+                "maximum_truncation_digits_lost": "5",
+                "maximum_recurrence_digits_lost": "1",
+                "maximum_series_evaluation_digits_lost": "1",
+                "predicted_reliable_digits": "10",
+                "required_reliable_digits": required,
+                "candidate_limitation": ENDPOINT_SERIES_ORDER_LIMITED,
+                "selected_intervention": (
+                    "NONE" if terminal else "INCREASE_ENDPOINT_ORDER"
+                ),
+                "result": "ORDER_EXHAUSTED" if terminal else "RETRY",
+            })
+        infinity = {
+            "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
+            "endpoint_branch": "infinity-outgoing",
+            "recovery_policy_identity": policy["identity"],
+            "recovery_policy_sha256": policy["policy_sha256"],
+            "base_endpoint_order": policy["base_endpoint_order"],
+            "generated_maximum_order": policy["generated_maximum_order"],
+            "attempted_endpoint_orders": policy["endpoint_order_schedule"],
+            "terminal_endpoint_order": policy["endpoint_order_schedule"][-1],
+            "candidate_geometry_schedule": policy["infinity_geometry_schedule"],
+            "terminal_geometry": policy["infinity_geometry_schedule"][0],
+            "maximum_last_term_ratio": "0.1",
+            "maximum_truncation_digits_lost": "5",
+            "maximum_recurrence_digits_lost": "1",
+            "maximum_series_evaluation_digits_lost": "1",
+            "predicted_reliable_digits": "10",
+            "required_reliable_digits": required,
+            "candidate_limitation": ENDPOINT_SERIES_ORDER_LIMITED,
+            "aggregate_limitation": ENDPOINT_ARITHMETIC_LIMITED,
+            "factored_homogeneous_rhs_evaluations": 0,
+            "attempts": infinity_attempts,
+        }
+
+        with self.assertRaisesRegex(ValueError, "aggregate limitation"):
+            _validated_exterior_endpoint_recovery_evidence(
+                [horizon, infinity],
+                policy,
+                expected_aggregate=ENDPOINT_ARITHMETIC_LIMITED,
+            )
+
     def test_committed_reliability_authority_is_canonical_and_contract_bound(self):
         root = Path(__file__).resolve().parents[1]
         authority_path = root / (

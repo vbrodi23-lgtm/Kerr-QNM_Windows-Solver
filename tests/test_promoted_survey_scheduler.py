@@ -1709,10 +1709,12 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 )
                 self.assertEqual([40], calls)
                 self.assertEqual(1, result.unresolved_count)
-        self.assertEqual("AWAITING_ADMISSION", result.checkpoint[
-            "promotion_queue"
-        ]["entries"][0]["disposition"])
-        self.assertNotIn("BF120", str(result.checkpoint))
+                self.assertEqual("UNRESOLVED", result.checkpoint[
+                    "promotion_queue"
+                ]["entries"][0]["disposition"])
+                self.assertNotIn("BF80", str(result.checkpoint[
+                    "survey_pass_ledger"
+                ]["promoted"][self.leaves[0].leaf_id]["precision_tiers"]))
 
     def test_interrupt_after_control_return_resumes_through_durable_decision(self):
         interrupted = self._interrupt_after_control_state(
