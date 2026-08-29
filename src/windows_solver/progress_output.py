@@ -1734,7 +1734,7 @@ class Schema11ProgressReporter:
             active_leaf = dict(self._current_live_event.get("context", {}))
             active_leaf["event_kind"] = self._current_live_event.get("kind")
         status = {
-            "schema": "windows-solver.schema11-progress-status/2",
+            "schema": "windows-solver.schema11-progress-status/3",
             "checkpoint_path": str(self.checkpoint),
             "profile": self.profile,
             "survey_pass": self.pass_name,
@@ -1750,6 +1750,32 @@ class Schema11ProgressReporter:
             "rejected_count": snapshot.rejected_count,
             "system_failure_count": snapshot.system_failure_count,
             "evidence_counts": dict(snapshot.evidence_counts),
+            "endpoint_recovery_rows": [
+                {
+                    "leaf_id": row.leaf_id,
+                    "endpoint_branch": row.endpoint_branch,
+                    "attempted_order": row.attempted_order,
+                    "attempted_geometry": row.attempted_geometry,
+                    "limiting_resource": row.limiting_resource,
+                    "selected_intervention": row.selected_intervention,
+                    "result": row.result,
+                    "aggregate_limitation": row.aggregate_limitation,
+                }
+                for row in snapshot.endpoint_recovery_rows
+            ],
+            "control_transition_rows": [
+                {
+                    "leaf_id": row.leaf_id,
+                    "transition_id": row.transition_id,
+                    "current_tier": row.current_tier,
+                    "outcome_kind": row.outcome_kind,
+                    "reason_code": row.reason_code,
+                    "next_tier": row.next_tier,
+                    "retryable": row.retryable,
+                    "terminal": row.terminal,
+                }
+                for row in snapshot.control_transition_rows
+            ],
             "settled_leaf_ids": list(snapshot.settled_leaf_ids),
             "printed_leaf_ids": [
                 row.leaf_id
