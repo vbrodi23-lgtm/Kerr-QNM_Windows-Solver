@@ -394,7 +394,9 @@ class AppendOnlyRendererTests(unittest.TestCase):
         status = json.loads(self.checkpoint_path.with_name(
             self.checkpoint_path.name + ".status.json"
         ).read_text(encoding="utf-8"))
-        self.assertEqual("windows-solver.schema11-progress-status/2", status["schema"])
+        self.assertEqual("windows-solver.schema11-progress-status/3", status["schema"])
+        self.assertEqual([], status["endpoint_recovery_rows"])
+        self.assertEqual([], status["control_transition_rows"])
         self.assertEqual(["leaf-001", "leaf-002", "leaf-003"], status["settled_leaf_ids"])
         self.assertIn("printed_leaf_ids", status)
 
