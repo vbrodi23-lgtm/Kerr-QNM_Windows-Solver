@@ -12,7 +12,7 @@ from windows_solver.operation_control import (
     ControlOutcomeKind,
     JULIA_WORKER_ORIGIN,
     NUMERICAL_CONTROL_FAILURE_CODES,
-    OPERATION_CONTROL_RECEIPT_SCHEMA,
+    OPERATION_CONTROL_FACT_RECEIPT_SCHEMA,
     PROMOTED_CONTROL_TRANSITIONS,
     PromotedControlTransition,
     PYTHON_SUPERVISOR_ORIGIN,
@@ -369,7 +369,10 @@ class OperationControlTests(unittest.TestCase):
             request_sha256=identity.request_sha256,
         )
         self.assertIsInstance(validated, ValidatedControlReceipt)
-        self.assertEqual(OPERATION_CONTROL_RECEIPT_SCHEMA, validated.mapping["schema"])
+        self.assertEqual(
+            OPERATION_CONTROL_FACT_RECEIPT_SCHEMA,
+            validated.mapping["schema"],
+        )
 
         tampered = copy.deepcopy(receipt)
         tampered["failure_code"] = "FACTORED_ODE_FAILURE"
@@ -449,7 +452,7 @@ class OperationControlTests(unittest.TestCase):
             validated.mapping["diagnostics"]["reason"],  # type: ignore[index]
         )
 
-    def test_retryability_is_derived_from_failure_code(self) -> None:
+    def test_fixed_root_fact_receipt_cannot_encode_retryability(self) -> None:
         request, identity = _identity(
             FIXED_ROOT_SURVEY_BATCH_OPERATION, SAMPLE_SCOPE, tier="BF40"
         )
@@ -463,17 +466,32 @@ class OperationControlTests(unittest.TestCase):
             diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
         )
 
+        self.assertNotIn("retryable_evidence", receipt)
         validated = validate_operation_control_receipt(
             receipt,
             request=request,
             request_sha256=identity.request_sha256,
         )
-        with self.assertRaisesRegex(ValueError, "retryability contradicts"):
-            promoted_control_transition(
-                validated,
-                current_tier="BF40",
-                current_action_kind="RESPONSE",
-            )
+        transition = promoted_control_transition(
+            validated,
+            current_tier="BF40",
+            current_action_kind="RESPONSE",
+        )
+        self.assertTrue(transition.terminal)
+        self.assertFalse(transition.retryable)
+
+        forged = copy.deepcopy(receipt)
+        forged["retryable_evidence"] = {
+            "retryable": True,
+            "basis": "forged/v1",
+        }
+        forged["receipt_sha256"] = canonical_sha256({
+            key: value
+            for key, value in forged.items()
+            if key != "receipt_sha256"
+        })
+        with self.assertRaisesRegex(ValueError, "fields are invalid"):
+            validate_operation_control_receipt(forged)
 
     def test_fixed_root_promotion_predicate_has_one_valid_boolean_case(self) -> None:
         promoted = 0
@@ -502,7 +520,6 @@ class OperationControlTests(unittest.TestCase):
                 current_tier="BF40" if promotable else "BF80",
                 current_action_kind="RESPONSE",
                 authorized_target_tier="BF80" if higher else "BF40",
-                registered_promotion_queue=None,
                 validator="matrix/v1",
                 exception_type="JuliaNumericalControlError",
             )
