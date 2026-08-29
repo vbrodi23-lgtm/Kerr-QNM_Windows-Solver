@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from enum import Enum
 import hashlib
 from types import MappingProxyType
-from typing import Callable, ClassVar, Mapping
+from typing import Callable, Mapping
 
 from .contracts import canonical_json_bytes
 
@@ -636,6 +636,10 @@ def build_operation_control_receipt(
     return {**content, "receipt_sha256": canonical_sha256(content)}
 
 
+_CONTROL_OUTCOME_TOKEN = object()
+_PROMOTED_TRANSITION_TOKEN = object()
+
+
 class ControlOutcomeKind(str, Enum):
     """Closed promoted-campaign outcomes owned by this module."""
 
@@ -656,8 +660,6 @@ class ControlOutcome:
     next_tier: str | None
     next_action_kind: str | None
 
-    _TOKEN: ClassVar[object] = object()
-
     def __init__(
         self,
         *,
@@ -668,7 +670,7 @@ class ControlOutcome:
         next_action_kind: str | None,
         _token: object,
     ) -> None:
-        if _token is not self._TOKEN:
+        if _token is not _CONTROL_OUTCOME_TOKEN:
             raise TypeError("ControlOutcome is minted only by operation_control")
         promotion = kind is ControlOutcomeKind.PROMOTION_PENDING
         continuation = (queue_kind, next_tier, next_action_kind)
@@ -681,25 +683,6 @@ class ControlOutcome:
         object.__setattr__(self, "queue_kind", queue_kind)
         object.__setattr__(self, "next_tier", next_tier)
         object.__setattr__(self, "next_action_kind", next_action_kind)
-
-    @classmethod
-    def _mint(
-        cls,
-        *,
-        kind: ControlOutcomeKind,
-        reason_code: str,
-        queue_kind: str | None = None,
-        next_tier: str | None = None,
-        next_action_kind: str | None = None,
-    ) -> "ControlOutcome":
-        return cls(
-            kind=kind,
-            reason_code=reason_code,
-            queue_kind=queue_kind,
-            next_tier=next_tier,
-            next_action_kind=next_action_kind,
-            _token=cls._TOKEN,
-        )
 
     @property
     def retryable(self) -> bool:
@@ -766,8 +749,6 @@ class PromotedControlTransition:
     exception_type: str
     outcome: ControlOutcome
 
-    _TOKEN: ClassVar[object] = object()
-
     def __init__(
         self,
         *,
@@ -784,7 +765,7 @@ class PromotedControlTransition:
         outcome: ControlOutcome,
         _token: object,
     ) -> None:
-        if _token is not self._TOKEN:
+        if _token is not _PROMOTED_TRANSITION_TOKEN:
             raise TypeError(
                 "PromotedControlTransition is minted only by its registry"
             )
@@ -850,32 +831,49 @@ class PromotedControlTransition:
             and stage in registered_stages
         )
         if fixed_root_promotion or non_fixed_promotion:
-            outcome = ControlOutcome._mint(
+            outcome = ControlOutcome(
                 kind=ControlOutcomeKind.PROMOTION_PENDING,
                 reason_code=failure_code,
                 queue_kind=current_action_kind,
                 next_tier="BF80",
                 next_action_kind=current_action_kind,
+                _token=_CONTROL_OUTCOME_TOKEN,
             )
         elif failure_code in _EXPLICIT_FATAL_CODES:
-            outcome = ControlOutcome._mint(
+            outcome = ControlOutcome(
                 kind=ControlOutcomeKind.SYSTEM_FAILURE,
                 reason_code=failure_code,
+                queue_kind=None,
+                next_tier=None,
+                next_action_kind=None,
+                _token=_CONTROL_OUTCOME_TOKEN,
             )
         elif failure_code in _DEFERRED_CODES:
-            outcome = ControlOutcome._mint(
+            outcome = ControlOutcome(
                 kind=ControlOutcomeKind.DEFERRED,
                 reason_code=failure_code,
+                queue_kind=None,
+                next_tier=None,
+                next_action_kind=None,
+                _token=_CONTROL_OUTCOME_TOKEN,
             )
         elif failure_code in _REJECTED_CODES:
-            outcome = ControlOutcome._mint(
+            outcome = ControlOutcome(
                 kind=ControlOutcomeKind.REJECTED,
                 reason_code=failure_code,
+                queue_kind=None,
+                next_tier=None,
+                next_action_kind=None,
+                _token=_CONTROL_OUTCOME_TOKEN,
             )
         else:
-            outcome = ControlOutcome._mint(
+            outcome = ControlOutcome(
                 kind=ControlOutcomeKind.UNRESOLVED,
                 reason_code=failure_code,
+                queue_kind=None,
+                next_tier=None,
+                next_action_kind=None,
+                _token=_CONTROL_OUTCOME_TOKEN,
             )
         return cls(
             origin=origin,
@@ -889,7 +887,7 @@ class PromotedControlTransition:
             validator=validator,
             exception_type=exception_type,
             outcome=outcome,
-            _token=cls._TOKEN,
+            _token=_PROMOTED_TRANSITION_TOKEN,
         )
 
     @property
