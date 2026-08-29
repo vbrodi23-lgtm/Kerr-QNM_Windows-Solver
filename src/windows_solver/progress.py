@@ -243,8 +243,16 @@ _STRING_CONTEXT_KEYS = frozenset(
         "current_action_kind",
         "current_tier",
         "next_tier",
+        "limiting_resource",
+        "selected_intervention",
+        "endpoint_recovery_result",
     }
 )
+_SEQUENCE_CONTEXT_KEYS = frozenset({
+    "endpoint_branches",
+    "attempted_endpoint_orders",
+    "attempted_endpoint_geometries",
+})
 _MAPPING_CONTEXT_KEYS = frozenset(
     {
         "mode",
@@ -282,6 +290,10 @@ def _validate_context_values(values: Mapping[str, object]) -> Mapping[str, objec
             raise ValueError(f"progress context {name} must be a string")
         if name in _MAPPING_CONTEXT_KEYS and not isinstance(value, Mapping):
             raise ValueError(f"progress context {name} must be a mapping")
+        if name in _SEQUENCE_CONTEXT_KEYS and not isinstance(
+            value, (list, tuple)
+        ):
+            raise ValueError(f"progress context {name} must be a sequence")
         if name in _INTEGER_CONTEXT_KEYS and value < 0:
             raise ValueError(f"progress context {name} must be nonnegative")
         if name in _FLOAT_CONTEXT_KEYS and (
@@ -290,6 +302,32 @@ def _validate_context_values(values: Mapping[str, object]) -> Mapping[str, objec
             raise ValueError(
                 f"progress context {name} must be finite and nonnegative"
             )
+    endpoint_branches = values.get("endpoint_branches")
+    if endpoint_branches is not None and any(
+        not isinstance(branch, str) or not branch
+        for branch in endpoint_branches
+    ):
+        raise ValueError("progress endpoint branches are invalid")
+    attempted_orders = values.get("attempted_endpoint_orders")
+    if attempted_orders is not None and any(
+        not isinstance(branch_orders, (list, tuple))
+        or any(
+            isinstance(order, bool) or not isinstance(order, int) or order < 0
+            for order in branch_orders
+        )
+        for branch_orders in attempted_orders
+    ):
+        raise ValueError("progress attempted endpoint orders are invalid")
+    attempted_geometries = values.get("attempted_endpoint_geometries")
+    if attempted_geometries is not None and any(
+        not isinstance(branch_geometries, (list, tuple))
+        or any(
+            not isinstance(geometry, str) or not geometry
+            for geometry in branch_geometries
+        )
+        for branch_geometries in attempted_geometries
+    ):
+        raise ValueError("progress attempted endpoint geometries are invalid")
     enum_values = {
         "execution_profile": {"SURVEY", "CERTIFY", "VALIDATE"},
         "survey_pass": {"binary64", "promoted", "certify", "validate"},
@@ -400,6 +438,12 @@ class ProgressContext:
     current_action_kind: str | None = None
     current_tier: str | None = None
     next_tier: str | None = None
+    endpoint_branches: tuple[str, ...] | None = None
+    attempted_endpoint_orders: tuple[tuple[int, ...], ...] | None = None
+    attempted_endpoint_geometries: tuple[tuple[str, ...], ...] | None = None
+    limiting_resource: str | None = None
+    selected_intervention: str | None = None
+    endpoint_recovery_result: str | None = None
     binary64_seconds: float | None = None
     bf40_seconds: float | None = None
     bf80_seconds: float | None = None
@@ -410,7 +454,7 @@ class ProgressContext:
         values = _validate_context_values(
             {field.name: getattr(self, field.name) for field in fields(self)}
         )
-        for name in _MAPPING_CONTEXT_KEYS:
+        for name in _MAPPING_CONTEXT_KEYS | _SEQUENCE_CONTEXT_KEYS:
             value = values[name]
             object.__setattr__(self, name, value)
 
