@@ -89,7 +89,7 @@ without replaying retained upstream or successful horizon work.
 - Modify: `tests/test_promoted_request_preflight.py`
 
 **Interfaces:**
-- Produces strict `/3` flattening/validation, REQUEST-to-SAMPLE identity projection, package-owned single-endpoint causal recovery, `operation-control-receipt/1`, fixed-root success `/3`, conditioning `/3`, and operation-aware progress `/3` data.
+- Produces strict `/3` flattening/validation, REQUEST-to-SAMPLE identity projection, package-owned single-endpoint causal recovery, fact-only `operation-control-fact-receipt/2`, fixed-root success `/3`, conditioning `/3`, and operation-aware progress `/3` data.
 - Consumes Tasks 1-2 wire contracts.
 
 - [ ] Add static/Python red checks for the known `required_reliable_digits()` contradiction, root-only `control_failure_context()`, display-text role coupling, and `/1` constants.
@@ -132,7 +132,7 @@ without replaying retained upstream or successful horizon work.
 - Modify: `tests/test_task3c_conditioning_surfaces.py`
 
 **Interfaces:**
-- Produces raw control return `/4`, classified decision `/2`, receipt/request-bound fingerprint, queue-kind enforcement, full continuation proof, resume revalidation, accurate partial-route accounting, progress `/3`, and material structural-event/2 identifiers.
+- Produces raw control return `/4`, canonical transition decision `/3`, transition ID/payload persistence, receipt/request-bound fingerprint, queue-kind enforcement, continuation proof `/2`, resume revalidation, accurate partial-route accounting, progress `/3`, and material structural-event/2 identifiers.
 - Consumes Task 4 validated success/control results and Task 1 transition registry.
 
 - [ ] Write failing scheduler tests proving validate-return-classify-decision-continuation order, durable interruption points, no fabricated calculation digest, queue-kind enforcement, malformed diagnostics fail-closed, root/fixed-root operation separation, and BF40 arithmetic-only insufficiency to RESPONSE/BF80.
