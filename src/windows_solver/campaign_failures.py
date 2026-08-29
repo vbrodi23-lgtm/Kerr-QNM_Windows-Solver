@@ -13,6 +13,7 @@ from typing import Callable, Mapping, Sequence
 
 from .campaign_policy import validate_schema11_checkpoint
 from .contracts import canonical_json_bytes
+from .operation_control import PromotedControlTransition
 from .progress import ProgressEventKind, emit_progress, progress_scope
 from .structural_diagnostics import StructuralDiagnosticSession
 
@@ -26,6 +27,13 @@ class FailureDisposition(str, Enum):
 
 
 _REVIEWED_SCREENING_PROMOTION_REASONS = MappingProxyType({
+    # These are non-receipt Binary64 screening outcomes.  A Julia CONTROL
+    # receipt carrying the same diagnostic code is rejected above and must be
+    # resolved by operation_control instead.
+    "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE": "RESPONSE",
+    "HORIZON_ARITHMETIC_INADEQUATE": "RESPONSE",
+    "FINITE_DIFFERENCE_NOISE_LIMIT": "RESPONSE",
+    "DETERMINANT_UNCERTAINTY_TOO_LARGE": "ROOT",
     "ROOT_UNCERTAINTY_EVIDENCE_UNAVAILABLE": "ROOT",
     "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE": "RESPONSE",
     "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE": "RESPONSE",
@@ -756,6 +764,28 @@ def classify_failure(report: FailureReport) -> FailureDecision:
     )
 
 
+def decision_from_control_transition(
+    report: FailureReport,
+    transition: PromotedControlTransition,
+) -> FailureDecision:
+    """Project one authenticated transition into failure-reporting form."""
+
+    if (
+        not isinstance(transition, PromotedControlTransition)
+        or report.failure_code != transition.failure_code
+        or report.diagnostics.get("complete") is not True
+    ):
+        raise ValueError("CONTROL failure report contradicts transition authority")
+    return FailureDecision(
+        disposition=FailureDisposition(transition.disposition),
+        failure_code=transition.failure_code,
+        fingerprint_sha256=report.fingerprint_sha256,
+        queue_kind=transition.queue_kind,
+        next_precision_tier=transition.next_tier,
+        next_action_kind=transition.next_action_kind,
+    )
+
+
 def reviewed_screening_promotion_queue(reason_code: str) -> str | None:
     """Return a queue only for a reviewed, non-worker screening reason."""
 
@@ -842,6 +872,25 @@ class ProductionFailureMonitor:
         """
 
         decision = classify_failure(report)
+        return self._retain_leaf_decision(leaf_id, report, decision)
+
+    def observe_control_transition(
+        self,
+        leaf_id: str,
+        report: FailureReport,
+        transition: PromotedControlTransition,
+    ) -> FailureDecision:
+        """Render a canonical CONTROL transition without reclassifying its code."""
+
+        decision = decision_from_control_transition(report, transition)
+        return self._retain_leaf_decision(leaf_id, report, decision)
+
+    def _retain_leaf_decision(
+        self,
+        leaf_id: str,
+        report: FailureReport,
+        decision: FailureDecision,
+    ) -> FailureDecision:
         if decision.disposition is FailureDisposition.SYSTEM_FAILURE:
             return decision
         seen = self._leaves_by_fingerprint.setdefault(
@@ -884,10 +933,15 @@ class ProductionFailureMonitor:
         leaf_id: str,
         report: FailureReport,
         persist_checkpoint: Callable[[dict[str, object]], None],
+        transition: PromotedControlTransition | None = None,
     ) -> None:
         """Fail closed immediately for one actual system classification."""
 
-        decision = classify_failure(report)
+        decision = (
+            classify_failure(report)
+            if transition is None
+            else decision_from_control_transition(report, transition)
+        )
         if decision.disposition is not FailureDisposition.SYSTEM_FAILURE:
             raise ValueError("only a classified system failure may abort a pass")
         if self._diagnostic_session is not None:
