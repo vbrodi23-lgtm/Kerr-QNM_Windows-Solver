@@ -62,14 +62,14 @@ const FIXED_ROOT_POLICY_CONTROL_FIELDS = (
 const FIXED_ROOT_RELIABILITY_TARGET_CONTROL_FIELD =
     "root_correction_tolerance"
 const FIXED_ROOT_RELIABILITY_PROJECTION_AUTHORITY_PATH = normpath(joinpath(
-    @__DIR__, "..", "fixed_root_reliability_projection_authority_v1.json"
+    @__DIR__, "fixed_root_reliability_projection_authority_v1.json"
 ))
 const PROMOTED_CONTROL_CALIBRATION_RECEIPT_SCHEMA =
     "windows-solver.promoted-control-empirical-calibration-receipt/1"
 const PROMOTED_CONTROL_CALIBRATION_IDENTITY =
     "promoted-control-empirical-calibration/v1"
 const PROMOTED_CONTROL_CALIBRATION_RECEIPT_PATH = normpath(joinpath(
-    @__DIR__, "..", "promoted_control_empirical_calibration_v1.json"
+    @__DIR__, "promoted_control_empirical_calibration_v1.json"
 ))
 const OPERATION_EXECUTION_COMMON_FIELDS = Set((
     "schema",

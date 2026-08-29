@@ -1221,9 +1221,15 @@ if ($WithM02) {
     $M02DependencySha256 = Get-ObjectSha256 $M02DependencyContract
     $M02DependencyId = "m02-deps-" + $M02DependencySha256.Substring(0, 24)
 
+    $FixedRootAuthorityPath = Join-Path (Join-Path $PackageRoot "src\windows_solver\data") `
+        "fixed_root_reliability_projection_authority_v1.json"
+    $PromotedCalibrationPath = Join-Path (Join-Path $PackageRoot "src\windows_solver\data") `
+        "promoted_control_empirical_calibration_v1.json"
     $M02WorkerContract = [ordered]@{
         schema_version = 1
         worker_sha256 = $WorkerSource.sha256
+        fixed_root_authority_sha256 = Get-Sha256 $FixedRootAuthorityPath
+        promoted_calibration_sha256 = Get-Sha256 $PromotedCalibrationPath
     }
     $M02WorkerSha256 = Get-ObjectSha256 $M02WorkerContract
     $M02WorkerId = "m02-worker-" + $M02WorkerSha256.Substring(0, 24)
@@ -1325,7 +1331,7 @@ if ($WithM02) {
         Install-PersistentSourceFile $ProducerSource $PersistentProducerPath "GSN producer source"
     }
 
-    $M02WorkerRoot = Join-Path $RuntimeRoot "m02-workers"
+    $M02WorkerRoot = Join-Path (Join-Path $RuntimeRoot "m02-workers") $M02WorkerId
     $WorkerResources = @(
         "fixed_root_reliability_projection_authority_v1.json",
         "promoted_control_empirical_calibration_v1.json"

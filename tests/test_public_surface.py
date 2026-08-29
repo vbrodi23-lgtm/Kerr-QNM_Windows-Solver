@@ -414,10 +414,20 @@ class PublicSurfaceTests(unittest.TestCase):
             "promoted_control_empirical_calibration_v1.json must exist in package data",
         )
 
-        # The bootstrap must deploy both JSON files to the m02-workers parent
-        # directory so the worker resolves them via @__DIR__/../<filename>.json.
+        # Authority file hashes must be bound into the worker contract so that a
+        # content change (without a filename rename) selects a new $M02WorkerId
+        # and stages the resources at an immutable contract-specific path.
+        contract_start = bootstrap.index("    $M02WorkerContract = [ordered]@{")
+        contract_end = bootstrap.index("\n    $M02WorkerSha256", contract_start)
+        contract_block = bootstrap[contract_start:contract_end]
+        self.assertIn("fixed_root_authority_sha256", contract_block)
+        self.assertIn("promoted_calibration_sha256", contract_block)
+        self.assertIn("Get-Sha256", contract_block)
+
+        # The bootstrap must deploy both JSON files into the contract-specific
+        # worker directory so the worker resolves them via @__DIR__/<filename>.
         deploy_start = bootstrap.index(
-            '    $M02WorkerRoot = Join-Path $RuntimeRoot "m02-workers"'
+            '    $M02WorkerRoot = Join-Path (Join-Path $RuntimeRoot "m02-workers") $M02WorkerId'
         )
         deploy_end = bootstrap.index("\n    $DependencyRejectionReason", deploy_start)
         deploy_block = bootstrap[deploy_start:deploy_end]
@@ -430,9 +440,9 @@ class PublicSurfaceTests(unittest.TestCase):
         )
         self.assertIn(r"src\windows_solver\data", deploy_block)
         self.assertIn("Copy-Item", deploy_block)
-        # Post-copy presence check must guard each resource.
         self.assertIn("M02 worker authority resource was not staged:", deploy_block)
-        self.assertNotIn(r"m02-workers\$M02WorkerId", deploy_block)
+        # Resources must land inside the versioned worker dir, not the shared parent.
+        self.assertIn(r"$M02WorkerId", deploy_block)
 
     def test_m02_worker_authority_files_resolve_via_dir_parent(self) -> None:
         """Staged runtime: dirname(m02_worker.jl)/.. must contain both JSON authorities."""
@@ -450,21 +460,21 @@ class PublicSurfaceTests(unittest.TestCase):
             worker_path = worker_dir / "m02_worker.jl"
             worker_path.write_bytes(b"")
 
-            # Simulate what bootstrap does: copy authority resources to the
-            # m02-workers parent, one level above the versioned worker directory.
+            # Simulate what bootstrap does: copy authority resources into the
+            # same contract-specific directory as the worker script, so the
+            # worker resolves them via @__DIR__/<filename> (not @__DIR__/..).
             for resource_name in worker_resources:
                 shutil.copy2(
                     data_root / resource_name,
-                    m02_worker_root / resource_name,
+                    worker_dir / resource_name,
                 )
 
-            # @__DIR__ in the Julia worker resolves to worker_dir; @__DIR__/..
-            # must therefore contain each authority resource.
-            authority_dir = worker_path.parent.parent
+            # @__DIR__ in the Julia worker resolves to worker_dir; each
+            # authority resource must therefore be present at that same level.
             for resource_name in worker_resources:
                 self.assertTrue(
-                    (authority_dir / resource_name).is_file(),
-                    f"dirname(m02_worker.jl)/../{resource_name} must exist after staging",
+                    (worker_path.parent / resource_name).is_file(),
+                    f"dirname(m02_worker.jl)/{resource_name} must exist after staging",
                 )
 
     def test_m02_bootstrap_configures_utf8_console_before_julia(self) -> None:
