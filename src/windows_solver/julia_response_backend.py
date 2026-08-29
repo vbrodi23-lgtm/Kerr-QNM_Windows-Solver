@@ -417,7 +417,9 @@ class JuliaNumericalControlError(JuliaResponseBackendError):
         *,
         control_receipt: ValidatedControlReceipt | None = None,
     ) -> None:
-        if failure_code not in NUMERICAL_CONTROL_FAILURE_CODES:
+        if failure_code not in (
+            NUMERICAL_CONTROL_FAILURE_CODES | EXTERIOR_ENDPOINT_CONTROL_CODES
+        ):
             raise ValueError("numerical-control failure code is not recognized")
         super().__init__(message)
         self.failure_code = failure_code
