@@ -10,7 +10,7 @@ and the four amendments accepted before implementation began.
 
 Complete the fixed-root-survey-batch migration as one authenticated lifecycle:
 
-1. Python constructs a version-2 fixed-root request.
+1. Python constructs a version-3 fixed-root request.
 2. Julia validates the request and derives request- or sample-scoped execution
    identity.
 3. Julia returns either an authenticated success or a typed control receipt.
@@ -88,10 +88,14 @@ response construction.
 
 ## Typed Control Lifecycle
 
-Julia and Python supervisor outcomes use
-`windows-solver.operation-control-receipt/1`. A receipt carries origin, class,
-code, stage, scope, operation execution identity, retryable evidence,
-diagnostics, canonical request binding, and its own canonical digest. Only the
+The fixed-root `/3` worker emits
+`windows-solver.operation-control-fact-receipt/2`. It carries authenticated
+origin, class, code, stage, scope, operation execution identity, numerical
+diagnostics, canonical request binding, and its own canonical digest. It does
+not carry campaign retryability, terminality, promotion authority, queue kind,
+or a target tier. Compatibility ingress may still decode
+`windows-solver.operation-control-receipt/1`; its derived retryability field is
+validated at that boundary and cannot become fixed-root authority. Only the
 validator can produce a `ValidatedControlReceipt`.
 
 Every CONTROL outcome reachable through the promoted ROOT/RESPONSE lifecycle,
@@ -99,12 +103,21 @@ including shared control paths consumed by those operations, has an explicit
 entry in one transition registry. Unrelated solver operations remain outside
 PR75 unless the shared implementation makes their migration necessary.
 
-Registry keys include origin, operation, code, stage, scope, tier, and current
-action. Registry values declare validator, Python exception, containability,
-disposition, queue kind, next tier/action, persistence requirements, or an
-explicit fatal result. The registry includes the audited vocabulary and the
-shared `COORDINATE_IDENTITY_MISMATCH`, `ODE_SOLVER_FAILURE`, and
-`WORKER_TIMEOUT` paths. Timeout is not treated as precision evidence.
+`PromotedControlTransition` is the sole owner of the state change. It consumes
+the authenticated facts and constructs one immutable closed `ControlOutcome`.
+Retryability, terminality, promotion authority, disposition, queue kind, next
+tier/action, and persistence requirements are read-only projections of that
+outcome. Callers cannot construct or persist those values independently.
+
+The fixed-root promotion constructor encodes the complete predicate:
+`SURVEY AND fixed-root-deep-v1 AND promotion-proof-code AND promotable-tier AND
+strictly-higher-target-tier`. A false conjunct makes `PROMOTION_PENDING`
+unconstructable. The exhaustive 32-case matrix admits exactly the one all-true
+configuration. Registry identity includes origin, operation, control profile,
+code, stage, scope, tier, and current action. The registry includes the audited
+vocabulary and the shared `COORDINATE_IDENTITY_MISMATCH`,
+`ODE_SOLVER_FAILURE`, and `WORKER_TIMEOUT` paths. Timeout is not precision
+evidence.
 
 For fixed-root exterior work, `INSUFFICIENT_ASYMPTOTIC_PRECISION` is not a
 promotion code. The distinct `horizon-ingoing` and `infinity-outgoing` branches
@@ -120,8 +133,9 @@ The order is mandatory:
 
 1. validate the control receipt;
 2. durably commit `windows-solver.promoted-exterior-control-return/4`;
-3. classify with a pure registry lookup;
-4. durably commit `windows-solver.promoted-exterior-control-decision/2`;
+3. resolve the one canonical transition through `operation_control`;
+4. durably commit `windows-solver.promoted-exterior-control-decision/3` with
+   the transition ID and canonical event/outcome payload;
 5. create the numerical continuation.
 
 Receipt, return, and decision hashes exclude only their own digest fields. A
@@ -129,8 +143,10 @@ control continuation is not a calculation and must not use a fabricated
 `calculation_sha256`.
 
 Resume revalidates canonical request binding, receipt digest and diagnostics,
-operation identity, effective policy, classification, queue kind, next tier,
-and failure fingerprint before launching BF80.
+operation identity, effective policy, transition ID and payload, and failure
+fingerprint before launching BF80. Compatibility booleans are accepted only
+when they exactly equal the canonical outcome projection. Recovery never
+reclassifies a historical raw receipt under current semantics.
 
 If the five-sample background succeeds and the four-sample component batch
 fails, the checkpoint and route accounting retain all five samples, the
@@ -143,7 +159,8 @@ Material `windows-solver.structural-event/2` records carry, where applicable:
 - operation, execution identity SHA-256, request SHA-256, plan, and scope;
 - sample index and role for SAMPLE scope only;
 - control receipt, raw return, and decision SHA-256 values;
-- current action kind, current tier, and next tier.
+- transition ID, canonical outcome kind, current action kind, current tier,
+  derived retryability/terminality, and next tier;
 - endpoint branch, attempted order and geometry, limiting resource, selected
   intervention, and result.
 
