@@ -1325,18 +1325,21 @@ if ($WithM02) {
         Install-PersistentSourceFile $ProducerSource $PersistentProducerPath "GSN producer source"
     }
 
-    $WorkerJsonRoot = Join-Path $RuntimeRoot "m02-workers"
-    New-Item -ItemType Directory -Force -Path $WorkerJsonRoot | Out-Null
-    foreach ($workerDataFile in @(
+    $M02WorkerRoot = Join-Path $RuntimeRoot "m02-workers"
+    $WorkerResources = @(
         "fixed_root_reliability_projection_authority_v1.json",
         "promoted_control_empirical_calibration_v1.json"
-    )) {
-        $workerDataSrc = Join-Path (Join-Path $PackageRoot "src\windows_solver\data") $workerDataFile
-        $workerDataDst = Join-Path $WorkerJsonRoot $workerDataFile
-        if (-not (Test-Path -LiteralPath $workerDataSrc -PathType Leaf)) {
-            throw "Required worker data file is absent: $workerDataSrc"
+    )
+    foreach ($ResourceName in $WorkerResources) {
+        $Source = Join-Path $PackageRoot "src\windows_solver\data\$ResourceName"
+        $Destination = Join-Path $M02WorkerRoot $ResourceName
+        if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+            throw "M02 worker authority resource is absent: $Source"
         }
-        Copy-Item -LiteralPath $workerDataSrc -Destination $workerDataDst -Force
+        Copy-Item -LiteralPath $Source -Destination $Destination -Force
+        if (-not (Test-Path -LiteralPath $Destination -PathType Leaf)) {
+            throw "M02 worker authority resource was not staged: $Destination"
+        }
     }
 
     $DependencyRejectionReason = Get-M02EnvironmentRejectionReason $M02DependencySha256
