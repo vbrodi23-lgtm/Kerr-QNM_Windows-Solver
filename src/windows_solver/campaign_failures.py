@@ -13,11 +13,6 @@ from typing import Callable, Mapping, Sequence
 
 from .campaign_policy import validate_schema11_checkpoint
 from .contracts import canonical_json_bytes
-from .operation_control import (
-    ValidatedControlReceipt,
-    promotion_failure_codes,
-)
-from .promoted_control_authority import classify_control_receipt_material
 from .progress import ProgressEventKind, emit_progress, progress_scope
 from .structural_diagnostics import StructuralDiagnosticSession
 
@@ -30,9 +25,12 @@ class FailureDisposition(str, Enum):
     SYSTEM_FAILURE = "SYSTEM_FAILURE"
 
 
-_REVIEWED_SCREENING_PROMOTION_REASONS = MappingProxyType(
-    dict(promotion_failure_codes())
-)
+_REVIEWED_SCREENING_PROMOTION_REASONS = MappingProxyType({
+    "ROOT_UNCERTAINTY_EVIDENCE_UNAVAILABLE": "ROOT",
+    "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE": "RESPONSE",
+    "BLOCKED_BY_REVIEWED_ERROR_EVIDENCE": "RESPONSE",
+    "ROOT_SEAL_UNAVAILABLE": "ROOT",
+})
 
 _LEAF_LOCAL_DISPOSITIONS = {
     # The generic package condition remains readable for legacy/internal
@@ -763,54 +761,6 @@ def reviewed_screening_promotion_queue(reason_code: str) -> str | None:
     """Return a queue only for a reviewed, non-worker screening reason."""
 
     return _REVIEWED_SCREENING_PROMOTION_REASONS.get(reason_code)
-
-
-def classify_validated_control_receipt(
-    receipt: ValidatedControlReceipt,
-    *,
-    current_tier: str,
-    current_action_kind: str,
-) -> tuple[FailureReport, FailureDecision]:
-    """Classify an authenticated promoted outcome by exact registry lookup."""
-
-    material = classify_control_receipt_material(
-        receipt,
-        current_tier=current_tier,
-        current_action_kind=current_action_kind,
-    )
-    transition = material.transition
-    identity = receipt.identity
-    effective_policy_sha256 = material.effective_policy_identity
-    report = FailureReport(
-        failure_code=receipt.failure_code,
-        failure_class="CONTROL",
-        stage=receipt.stage,
-        worker_operation=identity.operation,
-        request_schema=str(identity.mapping["request_schema"]),
-        backend_identity=str(identity.mapping["backend_identity_sha256"]),
-        policy_identity=effective_policy_sha256,
-        precision_tier=current_tier,
-        cause_type=transition.exception_type,
-        diagnostics=copy.deepcopy(dict(receipt.mapping["diagnostics"])),
-        request_sha256=identity.request_sha256,
-        control_receipt_sha256=receipt.sha256,
-        execution_identity_sha256=identity.sha256,
-        effective_policy_identity=effective_policy_sha256,
-    )
-    if (
-        report.fingerprint_material != dict(material.fingerprint_material)
-        or report.fingerprint_sha256 != material.fingerprint_sha256
-    ):
-        raise ValueError("promoted CONTROL fingerprint authority diverged")
-    return report, FailureDecision(
-        disposition=FailureDisposition(transition.disposition),
-        failure_code=receipt.failure_code,
-        fingerprint_sha256=material.fingerprint_sha256,
-        queue_kind=transition.queue_kind,
-        next_precision_tier=transition.next_tier,
-        next_action_kind=transition.next_action_kind,
-        control_receipt_sha256=receipt.sha256,
-    )
 
 
 def _system_failure_receipt(
