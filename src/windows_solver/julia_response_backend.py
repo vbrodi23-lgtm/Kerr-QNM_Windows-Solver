@@ -40,6 +40,7 @@ from .operation_control import (
     PYTHON_SUPERVISOR_ORIGIN,
     REQUEST_SCOPE,
     SAMPLE_SCOPE,
+    SUPERVISOR_RETRYABILITY_BASIS,
     ValidatedControlReceipt,
     build_operation_control_receipt,
     execution_identity_from_request,
@@ -2558,7 +2559,7 @@ def _timeout_worker_failure_details(
         stage="worker-supervision",
         identity=identity,
         retryable=True,
-        retryable_basis="bounded-worker-wall-clock-resource-exhausted/v1",
+        retryable_basis=SUPERVISOR_RETRYABILITY_BASIS,
         diagnostics=diagnostics,
     )
     return output

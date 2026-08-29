@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace
 
 from windows_solver.campaign_failures import CampaignSystemFailure
@@ -42,11 +43,13 @@ from windows_solver.julia_response_backend import (
     JuliaFixedRootSurveySample,
     JuliaNumericalControlError,
     JuliaODEResourceLimitError,
+    JuliaPrecisionRootBackend,
     PreparedFixedRootSurveyRequest,
     _execution_resource_policy,
     fixed_root_survey_request_contract,
 )
 from windows_solver.operation_control import (
+    JULIA_PRODUCER_RETRYABILITY_BASIS,
     JULIA_WORKER_ORIGIN,
     OPERATION_EXECUTION_IDENTITY_SCHEMA,
     OperationExecutionIdentity,
@@ -66,6 +69,7 @@ from windows_solver.promoted_control_calibration import PromotedExecutionMode
 from windows_solver.promoted_control_authority import (
     authenticate_persisted_control_decision,
     authenticate_persisted_control_return,
+    resolve_persisted_control_return,
 )
 from windows_solver.structural_diagnostics import StructuralDiagnosticSession
 from windows_solver.response_batches import (
@@ -86,6 +90,10 @@ from windows_solver.response_engine import (
     build_exterior_background_reuse_key,
     build_exterior_provisional_stage,
     canonical_background_from_binary64_batch,
+)
+from tests.test_julia_response_backend import (
+    FakeAdapter,
+    valid_control_failure_diagnostics,
 )
 
 
@@ -942,13 +950,14 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             checkpoint["promoted_stage_ledger"]["0"][leaf_id]
         )
         control_return = return_stage["control_return"]
-        authority = authenticate_persisted_control_return(
+        return_authority = authenticate_persisted_control_return(
             control_return,
             expected_schema=str(control_return["schema"]),
             expected_leaf_id=leaf_id,
             expected_current_action_kind="RESPONSE",
             expected_queue_ordinal=0,
         )
+        authority = resolve_persisted_control_return(return_authority)
         decision = authority.normalized_decision(
             schema=PROMOTED_CONTROL_DECISION_SCHEMA,
             current_tier="BF40",
@@ -1765,16 +1774,21 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         decision_stage = interrupted["promoted_stage_ledger"]["0"][leaf_id]
         return_stage = decision_stage["calculation_chain"][-1]
         decision = decision_stage["control_decision"]
-        authority = authenticate_persisted_control_decision(
-            return_stage["control_return"],
-            decision,
-            expected_return_schema=return_stage["control_return"]["schema"],
-            expected_decision_schema=PROMOTED_CONTROL_DECISION_SCHEMA,
-            expected_leaf_id=leaf_id,
-            expected_current_action_kind="RESPONSE",
-            expected_queue_ordinal=0,
-        )
-        transition = authority.classification.transition
+        with patch(
+            "windows_solver.promoted_control_authority."
+            "classify_control_receipt_material",
+            side_effect=AssertionError("durable replay reclassified raw receipt"),
+        ):
+            authority = authenticate_persisted_control_decision(
+                return_stage["control_return"],
+                decision,
+                expected_return_schema=return_stage["control_return"]["schema"],
+                expected_decision_schema=PROMOTED_CONTROL_DECISION_SCHEMA,
+                expected_leaf_id=leaf_id,
+                expected_current_action_kind="RESPONSE",
+                expected_queue_ordinal=0,
+            )
+        transition = authority.transition
         self.assertEqual(transition.transition_id, decision["transition_id"])
         self.assertEqual(transition.to_mapping(), decision["transition"])
         self.assertEqual(
@@ -2037,12 +2051,12 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                 leaf=leaf,
             )
 
-    def test_root_response_continuation_requires_root_success_evidence(self):
+    def test_root_continuation_requires_authenticated_transition_authority(self):
         from windows_solver.campaign_survey import _continuation_root_seal
 
         leaf = self.leaves[0]
         with self.assertRaisesRegex(
-            ValueError, "lacks authenticated root success evidence"
+            ValueError, "lacks mandatory CONTROL proof"
         ):
             _continuation_root_seal(
                 {
@@ -2057,6 +2071,44 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                     "queue_ordinal": 0,
                     "leaf_id": leaf.leaf_id,
                 },
+                fallback_seal=None,
+            )
+
+    def test_root_response_continuation_requires_root_success_evidence(self):
+        from windows_solver.campaign_survey import _continuation_root_seal
+
+        durable: list[dict[str, object]] = []
+
+        def stop_after_continuation(checkpoint):
+            if checkpoint["promotion_queue"]["entries"][0]["disposition"] == (
+                PromotionQueueDisposition.NUMERICAL_CONTINUATION.value
+            ):
+                durable.append(copy.deepcopy(checkpoint))
+                raise KeyboardInterrupt
+            return checkpoint
+
+        with self.assertRaises(KeyboardInterrupt):
+            self._run(
+                self._checkpoint(PromotionQueueKind.ROOT),
+                failure40="EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
+                checkpoint_committed=stop_after_continuation,
+            )
+        checkpoint = durable[0]
+        leaf = self.leaves[0]
+        stage = checkpoint["promoted_stage_ledger"]["0"][leaf.leaf_id]
+        stage["receipts"] = [
+            receipt
+            for receipt in stage["receipts"]
+            if receipt.get("schema")
+            != "windows-solver.promoted-root-evidence-receipt/2"
+        ]
+        with self.assertRaisesRegex(
+            ValueError, "lacks authenticated root success evidence"
+        ):
+            _continuation_root_seal(
+                stage,
+                leaf=leaf,
+                entry=checkpoint["promotion_queue"]["entries"][0],
                 fallback_seal=None,
             )
 
@@ -2253,6 +2305,59 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         self.assertEqual(
             root_receipt["root_dependency_key_sha256"],
             _sha256(root_receipt["root_dependency_key"]),
+        )
+
+    def test_root_control_continuation_retries_root_at_bf80(self):
+        root_calls: list[int] = []
+
+        def root_runner(leaf, _backend, digits):
+            root_calls.append(digits)
+            if digits == 40:
+                request = JuliaPrecisionRootBackend(
+                    VettedNativeDeterminantKernel.identity,
+                    FakeAdapter(),
+                    40,
+                ).preview_root_request(leaf.job, 0.0j)
+                request_sha256 = _sha256(request)
+                identity = execution_identity_from_request(
+                    request,
+                    request_sha256=request_sha256,
+                )
+                receipt = validate_operation_control_receipt(
+                    build_operation_control_receipt(
+                        origin=JULIA_WORKER_ORIGIN,
+                        failure_code="DETERMINANT_UNCERTAINTY_TOO_LARGE",
+                        stage="root-authentication",
+                        identity=identity,
+                        retryable=True,
+                        retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
+                        diagnostics=valid_control_failure_diagnostics(
+                            "DETERMINANT_UNCERTAINTY_TOO_LARGE",
+                            precision_bits=int(
+                                request["working_precision_bits"]
+                            ),
+                        ),
+                    ),
+                    request=request,
+                    request_sha256=request_sha256,
+                )
+                raise JuliaNumericalControlError(
+                    "BF40 root determinant uncertainty",
+                    "DETERMINANT_UNCERTAINTY_TOO_LARGE",
+                    control_receipt=receipt,
+                )
+            return _durable_root_result(leaf, digits)
+
+        result, batch_calls = self._run(
+            self._checkpoint(PromotionQueueKind.ROOT),
+            root_runner=root_runner,
+        )
+
+        self.assertEqual([40, 80], root_calls)
+        self.assertEqual([80, 80], batch_calls)
+        self.assertEqual(
+            PromotionQueueDisposition.AWAITING_ADMISSION.value,
+            result.checkpoint["promotion_queue"]["entries"][0]["disposition"],
         )
 
     def test_exact_root_queue_group_uses_one_primary_root_solve(self):

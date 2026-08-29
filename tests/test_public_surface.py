@@ -1490,6 +1490,8 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "canonical-exterior-background-wronskian/v1",
             "background-equivalence/v1",
             "exterior-fixed-root-survey-raw/v1",
+            "fixed-root-deep-v1",
+            "producer-retryability-capability/v1",
             "zero-coupling-profile-elision/v1",
             "real-axis-wronskian-at-readout/v1",
             "relative-1e-5-times-one-plus-abs-omega/v1",

@@ -10,9 +10,11 @@ from windows_solver.operation_control import (
     FIXED_ROOT_DEEP_CONTROL_PROFILE,
     FIXED_ROOT_SURVEY_BATCH_OPERATION,
     ControlOutcomeKind,
+    JULIA_PRODUCER_RETRYABILITY_BASIS,
     JULIA_WORKER_ORIGIN,
     NUMERICAL_CONTROL_FAILURE_CODES,
     OPERATION_CONTROL_FACT_RECEIPT_SCHEMA,
+    OPERATION_CONTROL_RECEIPT_SCHEMA,
     PROMOTED_CONTROL_TRANSITIONS,
     PromotedControlTransition,
     PYTHON_SUPERVISOR_ORIGIN,
@@ -22,10 +24,10 @@ from windows_solver.operation_control import (
     ValidatedControlReceipt,
     build_operation_control_receipt,
     canonical_sha256,
-    expected_operation_control_retryability,
     execution_identity_from_request,
     operation_execution_identity,
     promoted_control_transition,
+    producer_retryability_capability,
     validate_operation_control_receipt,
 )
 
@@ -136,18 +138,20 @@ def _validated_for_transition(transition):
         transition.scope,
         tier=transition.current_tier,
     )
+    retryable, basis = producer_retryability_capability(
+        origin=transition.origin,
+        operation=transition.operation,
+        failure_code=transition.failure_code,
+        stage=transition.stage,
+        scope=transition.scope,
+    )
     receipt = build_operation_control_receipt(
         origin=transition.origin,
         failure_code=transition.failure_code,
         stage=transition.stage,
         identity=identity,
-        retryable=expected_operation_control_retryability(
-            transition.failure_code,
-            operation=transition.operation,
-            current_tier=transition.current_tier,
-            current_action_kind=transition.current_action_kind,
-        ),
-        retryable_basis="registry-test/v1",
+        retryable=retryable,
+        retryable_basis=basis,
         diagnostics={"reason": transition.failure_code},
     )
     return validate_operation_control_receipt(
@@ -237,7 +241,7 @@ class OperationControlTests(unittest.TestCase):
                     stage="asymptotic-preflight",
                     identity=identity,
                     retryable=False,
-                    retryable_basis="fixed-sample-contract/v1",
+                    retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
                     diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
                 )
                 receipt["execution_identity"] = forged
@@ -328,7 +332,7 @@ class OperationControlTests(unittest.TestCase):
             stage="asymptotic-preflight",
             identity=fixed_identity,
             retryable=False,
-            retryable_basis="precision-insufficiency/v1",
+            retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
             diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
         )
         root_request = _root_request()
@@ -360,7 +364,7 @@ class OperationControlTests(unittest.TestCase):
             stage="asymptotic-preflight",
             identity=identity,
             retryable=False,
-            retryable_basis="precision-insufficiency/v1",
+            retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
             diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
         )
         validated = validate_operation_control_receipt(
@@ -385,7 +389,7 @@ class OperationControlTests(unittest.TestCase):
             stage="asymptotic-preflight",
             identity=identity,
             retryable=False,
-            retryable_basis="precision-insufficiency/v1",
+            retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
             diagnostics={},
         )
         with self.assertRaises(ValueError):
@@ -408,7 +412,7 @@ class OperationControlTests(unittest.TestCase):
             stage="asymptotic-preflight",
             identity=identity,
             retryable=False,
-            retryable_basis="precision-insufficiency/v1",
+            retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
             diagnostics=diagnostics,
         )
         validated = validate_operation_control_receipt(
@@ -462,7 +466,7 @@ class OperationControlTests(unittest.TestCase):
             stage="asymptotic-preflight",
             identity=identity,
             retryable=True,
-            retryable_basis="caller-declared non-retryable/v1",
+            retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
             diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
         )
 
@@ -492,6 +496,83 @@ class OperationControlTests(unittest.TestCase):
         })
         with self.assertRaisesRegex(ValueError, "fields are invalid"):
             validate_operation_control_receipt(forged)
+
+        compatibility = copy.deepcopy(receipt)
+        compatibility["schema"] = (
+            "windows-solver.operation-control-receipt/1"
+        )
+        compatibility["retryable_evidence"] = {
+            "retryable": False,
+            "basis": JULIA_PRODUCER_RETRYABILITY_BASIS,
+        }
+        compatibility["receipt_sha256"] = canonical_sha256({
+            key: value
+            for key, value in compatibility.items()
+            if key != "receipt_sha256"
+        })
+        with self.assertRaisesRegex(ValueError, "requires.*fact receipt"):
+            validate_operation_control_receipt(compatibility)
+
+    def test_producer_retryability_can_end_in_terminal_campaign_outcome(self) -> None:
+        transition = next(
+            item
+            for item in PROMOTED_CONTROL_TRANSITIONS.values()
+            if item.operation == FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION
+            and item.failure_code == "HORIZON_ARITHMETIC_INADEQUATE"
+            and item.current_tier == "BF80"
+            and item.current_action_kind == "RESPONSE"
+        )
+        receipt = _validated_for_transition(transition)
+
+        self.assertIs(
+            True,
+            receipt.mapping["retryable_evidence"]["retryable"],
+        )
+        self.assertFalse(transition.retryable)
+        self.assertTrue(transition.terminal)
+        self.assertEqual(
+            transition,
+            promoted_control_transition(
+                receipt,
+                current_tier="BF80",
+                current_action_kind="RESPONSE",
+            ),
+        )
+
+    def test_producer_retryability_evidence_is_not_campaign_derived(self) -> None:
+        outcomes = []
+        for tier in ("BF40", "BF80"):
+            transition = next(
+                item
+                for item in PROMOTED_CONTROL_TRANSITIONS.values()
+                if item.operation == FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION
+                and item.failure_code == "HORIZON_ARITHMETIC_INADEQUATE"
+                and item.current_tier == tier
+                and item.current_action_kind == "RESPONSE"
+            )
+            receipt = _validated_for_transition(transition)
+            outcomes.append((
+                receipt.mapping["retryable_evidence"]["retryable"],
+                transition.retryable,
+            ))
+
+        self.assertEqual([(True, True), (True, False)], outcomes)
+
+    def test_campaign_retryability_implication_matrix(self) -> None:
+        producer_true_campaign_false = 0
+        for producer, higher_tier, registered_proof, correct_profile in product(
+            (False, True), repeat=4
+        ):
+            campaign = (
+                producer
+                and higher_tier
+                and registered_proof
+                and correct_profile
+            )
+            self.assertFalse(campaign and not producer)
+            producer_true_campaign_false += int(producer and not campaign)
+
+        self.assertEqual(7, producer_true_campaign_false)
 
     def test_fixed_root_promotion_predicate_has_one_valid_boolean_case(self) -> None:
         promoted = 0
@@ -562,6 +643,14 @@ class OperationControlTests(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertEqual(key, transition.key)
                 validated = _validated_for_transition(transition)
+                retryability = validated.mapping.get("retryable_evidence")
+                if (
+                    transition.retryable
+                    and validated.mapping["schema"]
+                    == OPERATION_CONTROL_RECEIPT_SCHEMA
+                ):
+                    self.assertIsInstance(retryability, Mapping)
+                    self.assertIs(True, retryability["retryable"])
                 self.assertEqual(
                     transition,
                     promoted_control_transition(
@@ -647,7 +736,7 @@ class OperationControlTests(unittest.TestCase):
                     stage="unknown-stage",
                     identity=identity,
                     retryable=True,
-                    retryable_basis="worker-requested-retry/v1",
+                    retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
                     diagnostics={"reason": "UNKNOWN_CONTROL_OUTCOME"},
                 ),
                 request=request,
@@ -661,7 +750,7 @@ class OperationControlTests(unittest.TestCase):
                 stage="asymptotic-preflight",
                 identity=identity,
                 retryable=False,
-                retryable_basis="worker-requested-retry/v1",
+                retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
                 diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
             ),
             request=request,
@@ -702,7 +791,7 @@ class OperationControlTests(unittest.TestCase):
                     stage="finite-difference",
                     identity=identity,
                     retryable=True,
-                    retryable_basis="forged fixed-root derivative outcome/v1",
+                    retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
                     diagnostics={"reason": "FINITE_DIFFERENCE_NOISE_LIMIT"},
                 ),
                 request=request,

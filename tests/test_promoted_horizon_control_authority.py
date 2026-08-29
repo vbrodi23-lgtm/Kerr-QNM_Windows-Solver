@@ -29,6 +29,7 @@ from windows_solver.campaign_runtime import (
 )
 from windows_solver.campaign_survey import PromotedPassOutcome
 from windows_solver.julia_response_backend import (
+    JuliaPrecisionRootBackend,
     JuliaNumericalControlError,
     JuliaODEResourceLimitError,
     JuliaResponseBackendError,
@@ -36,6 +37,7 @@ from windows_solver.julia_response_backend import (
 )
 from windows_solver.operation_control import (
     FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION,
+    JULIA_PRODUCER_RETRYABILITY_BASIS,
     JULIA_WORKER_ORIGIN,
     build_operation_control_receipt,
     canonical_sha256,
@@ -50,6 +52,10 @@ from windows_solver.response_batches import (
 )
 from windows_solver.response_engine import NumericalPolicy, VettedNativeDeterminantKernel
 from tests.test_horizon_record_construction import _binary64_horizon_outcome
+from tests.test_julia_response_backend import (
+    FakeAdapter,
+    valid_control_failure_diagnostics,
+)
 from tests.test_promoted_survey_scheduler import _strict_run
 
 
@@ -92,8 +98,8 @@ def _control_error() -> JuliaNumericalControlError:
         failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
         stage="asymptotic-preflight",
         identity=identity,
-        retryable=True,
-        retryable_basis="precision-insufficiency/v1",
+        retryable=False,
+        retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
         diagnostics={
             "reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
             "precision_bits": request["working_precision_bits"],
@@ -201,29 +207,16 @@ def _horizon_checkpoint_fixture():
 
 
 def _horizon_control_outcome(leaf, entry) -> PromotedPassOutcome:
-    request = {
-        "schema_version": 1,
-        "operation": FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION,
-        "leaf_id": leaf.job.leaf_id,
-        "job_id": leaf.job.job_id,
-        "backend_identity_sha256": leaf.job.backend_identity.identity_sha256,
-        "precision_digits": 80,
-        "working_precision_bits": 298,
-        "semantic_precision_tier": "bigfloat-80",
-        "role": "primary-root",
-        "job_policy_sha256": leaf.job.policy.identity_sha256,
-        "refinement_level": 0,
-        "fixed_omega": {
-            "real": format(leaf.job.root.omega.real, ".17g"),
-            "imaginary": format(leaf.job.root.omega.imag, ".17g"),
-        },
-        "readout_role": "coordinate-real-plus-h",
-        "policy": {
-            "root_gate": "strict/v1",
-            "branch_convention": "gsn-complex-rho/v1",
-        },
-        "execution_resource": _resource(),
-    }
+    request = JuliaPrecisionRootBackend(
+        VettedNativeDeterminantKernel.identity,
+        FakeAdapter(),
+        80,
+    ).preview_fixed_root_request(
+        leaf.job,
+        leaf.job.root.omega,
+        0.0j,
+        "coordinate-real-plus-h",
+    )
     request_sha256 = canonical_sha256(request)
     identity = execution_identity_from_request(
         request,
@@ -232,25 +225,15 @@ def _horizon_control_outcome(leaf, entry) -> PromotedPassOutcome:
     receipt = validate_operation_control_receipt(
         build_operation_control_receipt(
             origin=JULIA_WORKER_ORIGIN,
-            failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
-            stage="asymptotic-preflight",
+            failure_code="HORIZON_ARITHMETIC_INADEQUATE",
+            stage="horizon-endpoint-geometry",
             identity=identity,
             retryable=True,
-            retryable_basis="horizon lifecycle fixture/v1",
-            diagnostics={
-                "reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION",
-                "precision_bits": request["working_precision_bits"],
-                "factored_homogeneous_rhs_evaluations": 0,
-                "avoided_ode_scope": "factored-homogeneous-gsn/v1",
-                "predicted_reliable_digits": "10",
-                "required_reliable_digits": "20",
-                "asymptotic_preflight_avoided_ode": True,
-                "asymptotic_preflight_reason": (
-                    "INSUFFICIENT_ASYMPTOTIC_PRECISION"
-                ),
-                "maximum_series_digits_lost": "30",
-                "maximum_recurrence_digits_lost": "5",
-            },
+            retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
+            diagnostics=valid_control_failure_diagnostics(
+                "HORIZON_ARITHMETIC_INADEQUATE",
+                precision_bits=int(request["working_precision_bits"]),
+            ),
         ),
         request=request,
         request_sha256=request_sha256,

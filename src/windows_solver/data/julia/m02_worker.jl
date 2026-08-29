@@ -41,6 +41,8 @@ const OPERATION_CONTROL_RECEIPT_SCHEMA =
     "windows-solver.operation-control-receipt/1"
 const OPERATION_CONTROL_FACT_RECEIPT_SCHEMA =
     "windows-solver.operation-control-fact-receipt/2"
+const PRODUCER_RETRYABILITY_CAPABILITY_BASIS =
+    "producer-retryability-capability/v1"
 const CANONICAL_REQUEST_BINDING_SCHEMA =
     "windows-solver.canonical-request-binding/1"
 const FIXED_ROOT_RELIABILITY_PROJECTION_SCHEMA =
@@ -832,7 +834,7 @@ function operation_control_receipt(request, details)
     if !fact_only
         content["retryable_evidence"] = Dict(
             "retryable" => retryable,
-            "basis" => "legacy compatibility projection/v1",
+            "basis" => PRODUCER_RETRYABILITY_CAPABILITY_BASIS,
         )
     end
     content["receipt_sha256"] = canonical_sha256(content)
@@ -6423,6 +6425,7 @@ function finite_difference_noise_limit(
             "maximum_step" => string(maximum_step),
             "attempts" => attempts,
         );
+        retryable=true,
         stage="finite-difference",
     )
 end
@@ -6908,6 +6911,7 @@ function solve_once(
                 "root_authentication" =>
                     root_authentication_text(root_authentication),
             );
+            retryable=true,
             stage="root-authentication",
         ))
     end

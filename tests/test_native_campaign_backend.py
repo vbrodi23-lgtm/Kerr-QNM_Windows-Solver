@@ -18,6 +18,7 @@ from windows_solver.julia_response_backend import (
     JuliaPrecisionRootBackend,
 )
 from windows_solver.operation_control import (
+    JULIA_PRODUCER_RETRYABILITY_BASIS,
     JULIA_WORKER_ORIGIN,
     build_operation_control_receipt,
     execution_identity_from_request,
@@ -332,8 +333,8 @@ class NativeCampaignBackendTests(unittest.TestCase):
             failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
             stage="asymptotic-preflight",
             identity=identity,
-            retryable=True,
-            retryable_basis="worker-declared bounded control continuation/v1",
+            retryable=False,
+            retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
             diagnostics=legacy_failure["diagnostics"],
         )
         control = validate_operation_control_receipt(

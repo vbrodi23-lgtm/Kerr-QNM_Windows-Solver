@@ -2,10 +2,10 @@
 
 Checkpoint hashes prove that retained bytes have not changed; they do not
 prove that a retained decision is the registry result for its worker receipt.
-This module closes that distinction below campaign policy.  It authenticates
-the exact canonical request and code-specific diagnostics, resolves the exact
-operation transition, and derives the only decision/fingerprint material that
-may be persisted.
+This module closes that distinction below campaign policy.  Raw-return
+authentication owns the exact request, producer diagnostics and work account.
+Decision authentication separately owns the immutable canonical transition
+and its derived fingerprint material.
 
 The persisted-receipt import is deliberately local.  The Julia adapter owns
 the code-specific diagnostic validators, while this module owns no adapter or
@@ -27,6 +27,7 @@ from .operation_control import (
     FIXED_ROOT_SURVEY_BATCH_OPERATION,
     ROOT_READOUT_OPERATION,
     ValidatedControlReceipt,
+    authenticate_promoted_control_transition,
     canonical_sha256,
     execution_identity_from_request,
     promoted_control_transition,
@@ -691,6 +692,14 @@ class ControlClassificationMaterial:
     ) -> dict[str, object]:
         """Return the canonical decision projection for one retained return."""
 
+        if (
+            current_tier != self.transition.current_tier
+            or current_action_kind != self.transition.current_action_kind
+        ):
+            raise ValueError(
+                "persisted CONTROL decision action contradicts its transition"
+            )
+
         return {
             "schema": schema,
             "control_return_sha256": control_return_sha256,
@@ -712,12 +721,47 @@ class ControlClassificationMaterial:
 
 
 @dataclass(frozen=True, slots=True)
-class PersistedControlAuthority:
-    """Authenticated return plus its unique registry classification."""
+class PersistedControlReturnAuthority:
+    """Authenticated producer return with no campaign disposition."""
 
     control_return_sha256: str
-    classification: ControlClassificationMaterial
+    receipt: ValidatedControlReceipt
+    effective_policy_identity: str
+    current_tier: str
+    current_action_kind: str
     work_accounting: ControlWorkAccounting
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedControlDecisionAuthority:
+    """Authenticated return plus its immutable campaign transition."""
+
+    return_authority: PersistedControlReturnAuthority
+    classification: ControlClassificationMaterial
+
+    @property
+    def control_return_sha256(self) -> str:
+        return self.return_authority.control_return_sha256
+
+    @property
+    def receipt(self) -> ValidatedControlReceipt:
+        return self.return_authority.receipt
+
+    @property
+    def current_tier(self) -> str:
+        return self.return_authority.current_tier
+
+    @property
+    def current_action_kind(self) -> str:
+        return self.return_authority.current_action_kind
+
+    @property
+    def work_accounting(self) -> ControlWorkAccounting:
+        return self.return_authority.work_accounting
+
+    @property
+    def transition(self) -> PromotedControlTransition:
+        return self.classification.transition
 
     def normalized_decision(
         self,
@@ -744,16 +788,13 @@ def classify_control_receipt_material(
     current_tier: str,
     current_action_kind: str,
 ) -> ControlClassificationMaterial:
-    """Revalidate and resolve one receipt through the exact transition registry."""
+    """Authenticate and resolve one live producer receipt exactly once."""
 
     canonical_request = receipt.canonical_request
     if canonical_request is None:
         raise ValueError(
             "promoted CONTROL classification requires its canonical request"
         )
-    # A generic structural receipt is not transition authority.  Re-enter the
-    # adapter-owned persisted validator so code-specific diagnostics and the
-    # exact producer retryability contract are both checked at classification.
     from .julia_response_backend import (  # local by dependency design
         validate_persisted_operation_control_receipt,
     )
@@ -762,7 +803,6 @@ def classify_control_receipt_material(
         receipt.to_mapping(),
         canonical_request,
     )
-
     transition = promoted_control_transition(
         receipt,
         current_tier=current_tier,
@@ -773,6 +813,15 @@ def classify_control_receipt_material(
             "promoted CONTROL registry does not authorize the mandatory "
             "return-and-decision checkpoint chain"
         )
+    return _classification_material_from_transition(receipt, transition)
+
+
+def _classification_material_from_transition(
+    receipt: ValidatedControlReceipt,
+    transition: PromotedControlTransition,
+) -> ControlClassificationMaterial:
+    """Project immutable decision material from authenticated authorities."""
+
     identity = receipt.identity
     effective_policy_identity = _effective_policy_sha256(receipt)
     fingerprint_material: dict[str, object] = {
@@ -784,7 +833,7 @@ def classify_control_receipt_material(
         "request_schema": str(identity.mapping["request_schema"]),
         "backend_identity": str(identity.mapping["backend_identity_sha256"]),
         "policy_identity": effective_policy_identity,
-        "precision_tier": current_tier,
+        "precision_tier": transition.current_tier,
         "cause_type": transition.exception_type,
         "request_sha256": identity.request_sha256,
         "control_receipt_sha256": receipt.sha256,
@@ -802,6 +851,31 @@ def classify_control_receipt_material(
     )
 
 
+def resolve_persisted_control_return(
+    authority: PersistedControlReturnAuthority,
+) -> PersistedControlDecisionAuthority:
+    """Perform the first and only campaign classification of a raw return."""
+
+    transition = promoted_control_transition(
+        authority.receipt,
+        current_tier=authority.current_tier,
+        current_action_kind=authority.current_action_kind,
+    )
+    if not transition.persist_return or not transition.persist_decision:
+        raise ValueError(
+            "promoted CONTROL registry does not authorize the mandatory "
+            "return-and-decision checkpoint chain"
+        )
+    classification = _classification_material_from_transition(
+        authority.receipt,
+        transition,
+    )
+    return PersistedControlDecisionAuthority(
+        return_authority=authority,
+        classification=classification,
+    )
+
+
 def authenticate_persisted_control_return(
     control_return: Mapping[str, object],
     *,
@@ -809,8 +883,8 @@ def authenticate_persisted_control_return(
     expected_leaf_id: str,
     expected_current_action_kind: str,
     expected_queue_ordinal: int | None = None,
-) -> PersistedControlAuthority:
-    """Authenticate and classify one checkpointed raw CONTROL return."""
+) -> PersistedControlReturnAuthority:
+    """Authenticate one checkpointed producer return without classifying it."""
 
     required_fields = {
         "schema",
@@ -873,14 +947,12 @@ def authenticate_persisted_control_return(
         or control_return.get("control_receipt_sha256") != receipt.sha256
     ):
         raise ValueError("persisted CONTROL return identity is invalid")
-    classification = classify_control_receipt_material(
-        receipt,
+    return PersistedControlReturnAuthority(
+        control_return_sha256=return_sha256,
+        receipt=receipt,
+        effective_policy_identity=effective_policy_identity,
         current_tier=str(current_tier),
         current_action_kind=str(current_action_kind),
-    )
-    return PersistedControlAuthority(
-        control_return_sha256=return_sha256,
-        classification=classification,
         work_accounting=_derive_control_work_accounting(
             control_return,
             receipt,
@@ -899,10 +971,10 @@ def authenticate_persisted_control_decision(
     expected_leaf_id: str,
     expected_current_action_kind: str,
     expected_queue_ordinal: int | None = None,
-) -> PersistedControlAuthority:
-    """Require a retained decision to equal the unique registry projection."""
+) -> PersistedControlDecisionAuthority:
+    """Authenticate a retained immutable decision without reclassification."""
 
-    authority = authenticate_persisted_control_return(
+    return_authority = authenticate_persisted_control_return(
         control_return,
         expected_schema=expected_return_schema,
         expected_leaf_id=expected_leaf_id,
@@ -919,12 +991,42 @@ def authenticate_persisted_control_decision(
         control_decision,
         "control_decision_sha256",
     )
-    current_tier = str(control_return["current_tier"])
-    current_action_kind = str(control_return["current_action_kind"])
+    transition = authenticate_promoted_control_transition(
+        control_decision.get("transition"),
+        transition_id=control_decision.get("transition_id"),
+    )
+    receipt = return_authority.receipt
+    identity = receipt.identity
+    control_profile = (
+        str(identity.mapping["control_profile"])
+        if "control_profile" in identity.mapping
+        else None
+    )
+    if (
+        transition.origin != receipt.origin
+        or transition.operation != identity.operation
+        or transition.control_profile != control_profile
+        or transition.failure_code != receipt.failure_code
+        or transition.stage != receipt.stage
+        or transition.scope != identity.scope
+        or transition.current_tier != return_authority.current_tier
+        or transition.current_action_kind
+        != return_authority.current_action_kind
+    ):
+        raise ValueError(
+            "persisted CONTROL decision is not bound to its producer return"
+        )
+    authority = PersistedControlDecisionAuthority(
+        return_authority=return_authority,
+        classification=_classification_material_from_transition(
+            receipt,
+            transition,
+        ),
+    )
     expected = authority.normalized_decision(
         schema=expected_decision_schema,
-        current_tier=current_tier,
-        current_action_kind=current_action_kind,
+        current_tier=return_authority.current_tier,
+        current_action_kind=return_authority.current_action_kind,
     )
     if dict(control_decision) != expected:
         raise ValueError(
@@ -935,7 +1037,9 @@ def authenticate_persisted_control_decision(
 
 def validate_persisted_control_stage_accounting(
     stage: Mapping[str, object],
-    authority: PersistedControlAuthority,
+    authority: (
+        PersistedControlReturnAuthority | PersistedControlDecisionAuthority
+    ),
 ) -> None:
     """Require stage/reporting counters to equal authenticated raw evidence."""
 
@@ -952,7 +1056,7 @@ def validate_persisted_control_stage_accounting(
         "worker_launch_limit": (counts["worker_launch_count"], 5),
     }
     tiers = stage.get("precision_tiers")
-    current_tier = authority.classification.transition.current_tier
+    current_tier = authority.current_tier
     if (
         not isinstance(receipts, list)
         or not all(isinstance(item, Mapping) for item in receipts)
@@ -978,9 +1082,11 @@ def validate_persisted_control_stage_accounting(
 __all__ = [
     "ControlClassificationMaterial",
     "ControlWorkAccounting",
-    "PersistedControlAuthority",
+    "PersistedControlDecisionAuthority",
+    "PersistedControlReturnAuthority",
     "authenticate_persisted_control_decision",
     "authenticate_persisted_control_return",
     "classify_control_receipt_material",
+    "resolve_persisted_control_return",
     "validate_persisted_control_stage_accounting",
 ]

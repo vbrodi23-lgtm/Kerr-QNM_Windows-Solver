@@ -30,6 +30,12 @@ ROOT_READOUT_OPERATION = "root-readout"
 FIXED_ROOT_SURVEY_BATCH_OPERATION = "fixed-root-survey-batch"
 FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION = "fixed-root-determinant-sample"
 FIXED_ROOT_DEEP_CONTROL_PROFILE = "fixed-root-deep-v1"
+JULIA_PRODUCER_RETRYABILITY_BASIS = (
+    "producer-retryability-capability/v1"
+)
+SUPERVISOR_RETRYABILITY_BASIS = (
+    "bounded-worker-wall-clock-resource-exhausted/v1"
+)
 PROMOTED_CONTROL_TRANSITION_SCHEMA = (
     "windows-solver.promoted-control-transition/2"
 )
@@ -539,7 +545,18 @@ def validate_operation_control_receipt(
     identity = OperationExecutionIdentity(receipt["execution_identity"])
     if receipt.get("scope") != identity.scope:
         raise ValueError("operation control receipt scope is inconsistent")
+    fixed_root_fact_contract = (
+        identity.operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
+        and identity.mapping.get("request_schema")
+        == "windows-solver.fixed-root-survey-batch/3"
+        and identity.mapping.get("control_profile")
+        == FIXED_ROOT_DEEP_CONTROL_PROFILE
+    )
     if receipt_schema == OPERATION_CONTROL_RECEIPT_SCHEMA:
+        if fixed_root_fact_contract:
+            raise ValueError(
+                "fixed-root `/3` requires an operation control fact receipt"
+            )
         retryable = receipt.get("retryable_evidence")
         if (
             not isinstance(retryable, Mapping)
@@ -548,13 +565,7 @@ def validate_operation_control_receipt(
             or not _is_nonempty_text(retryable.get("basis"))
         ):
             raise ValueError("operation control retryability evidence is invalid")
-    elif (
-        identity.operation != FIXED_ROOT_SURVEY_BATCH_OPERATION
-        or identity.mapping.get("request_schema")
-        != "windows-solver.fixed-root-survey-batch/3"
-        or identity.mapping.get("control_profile")
-        != FIXED_ROOT_DEEP_CONTROL_PROFILE
-    ):
+    elif not fixed_root_fact_contract:
         raise ValueError("operation control fact receipt is not fixed-root `/3`")
     diagnostics = receipt.get("diagnostics")
     if not isinstance(diagnostics, Mapping) or not diagnostics:
@@ -628,7 +639,7 @@ def build_operation_control_receipt(
         if not isinstance(retryable, bool) or not _is_nonempty_text(
             retryable_basis
         ):
-            raise ValueError("compatibility retryability projection is absent")
+            raise ValueError("compatibility producer retryability evidence is absent")
         content["retryable_evidence"] = {
             "retryable": retryable,
             "basis": retryable_basis,
@@ -1066,6 +1077,53 @@ _CONTROL_STAGE_BY_OPERATION: Mapping[
     ),
 })
 
+_JULIA_PRODUCER_RETRYABLE_CODES = frozenset({
+    "COORDINATE_INVERSION_STALLED",
+    "DETERMINANT_UNCERTAINTY_TOO_LARGE",
+    "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
+    "FINITE_DIFFERENCE_NOISE_LIMIT",
+    "HORIZON_ARITHMETIC_INADEQUATE",
+    "ODE_RESOURCE_LIMIT",
+    "ROOT_READOUT_RESOURCE_INFEASIBLE",
+})
+
+
+def producer_retryability_capability(
+    *,
+    origin: str,
+    operation: str,
+    failure_code: str,
+    stage: str,
+    scope: str,
+) -> tuple[bool, str]:
+    """Return the producer-owned retry capability for one registered event.
+
+    This contract deliberately excludes campaign tier, profile and target-tier
+    state.  Those facts belong exclusively to ``PromotedControlTransition``.
+    """
+
+    operation_stages = _CONTROL_STAGE_BY_OPERATION.get(operation)
+    if (
+        operation_stages is None
+        or stage not in operation_stages.get(failure_code, ())
+    ):
+        raise ValueError("operation control emission is not registered")
+    timeout = failure_code == "WORKER_TIMEOUT"
+    expected_origin = PYTHON_SUPERVISOR_ORIGIN if timeout else JULIA_WORKER_ORIGIN
+    expected_scope = (
+        SAMPLE_SCOPE
+        if operation == FIXED_ROOT_SURVEY_BATCH_OPERATION and not timeout
+        else REQUEST_SCOPE
+    )
+    if origin != expected_origin or scope != expected_scope:
+        raise ValueError("operation control emission identity is incompatible")
+    if origin == PYTHON_SUPERVISOR_ORIGIN:
+        return True, SUPERVISOR_RETRYABILITY_BASIS
+    return (
+        failure_code in _JULIA_PRODUCER_RETRYABLE_CODES,
+        JULIA_PRODUCER_RETRYABILITY_BASIS,
+    )
+
 def _validate_registered_control_emission(
     receipt: Mapping[str, object],
     identity: OperationExecutionIdentity,
@@ -1087,9 +1145,22 @@ def _validate_registered_control_emission(
     )
     if receipt.get("origin") != expected_origin or identity.scope != expected_scope:
         raise ValueError("operation control emission identity is incompatible")
-    # Compatibility retryability is intentionally not interpreted here.  It
-    # is checked against the exact transition only after tier and scheduler
-    # action are authenticated by ``promoted_control_transition``.
+    retryable_evidence = receipt.get("retryable_evidence")
+    if isinstance(retryable_evidence, Mapping):
+        expected_retryable, expected_basis = producer_retryability_capability(
+            origin=str(receipt["origin"]),
+            operation=identity.operation,
+            failure_code=code,
+            stage=stage,
+            scope=identity.scope,
+        )
+        if (
+            retryable_evidence.get("retryable") is not expected_retryable
+            or retryable_evidence.get("basis") != expected_basis
+        ):
+            raise ValueError(
+                "operation control producer retryability evidence is invalid"
+            )
 
 
 _NON_FIXED_CONTROL_PROMOTION_CODES: Mapping[str, str] = MappingProxyType({
@@ -1261,38 +1332,70 @@ def promoted_control_transition(
     retryable = receipt.mapping.get("retryable_evidence")
     if (
         isinstance(retryable, Mapping)
-        and retryable.get("retryable") is not transition.retryable
+        and transition.retryable
+        and retryable.get("retryable") is not True
     ):
         raise ValueError(
-            "operation control retryability contradicts its canonical transition"
+            "campaign continuation lacks producer retryability authority"
         )
     return transition
 
 
-def expected_operation_control_retryability(
-    failure_code: str,
+def authenticate_promoted_control_transition(
+    value: object,
     *,
-    operation: str,
-    current_tier: str | None = None,
-    current_action_kind: str | None = None,
-) -> bool:
-    """Compatibility projection derived from canonical transitions only."""
+    transition_id: object,
+) -> PromotedControlTransition:
+    """Authenticate one persisted transition against its versioned registry."""
 
-    candidates = {
-        transition.retryable
-        for transition in PROMOTED_CONTROL_TRANSITIONS.values()
-        if transition.failure_code == failure_code
-        and transition.operation == operation
-        and (
-            current_tier is None or transition.current_tier == current_tier
-        )
-        and (
-            current_action_kind is None
-            or transition.current_action_kind == current_action_kind
-        )
+    event_fields = {
+        "origin",
+        "operation",
+        "control_profile",
+        "failure_code",
+        "stage",
+        "scope",
+        "current_tier",
+        "current_action_kind",
+        "validator",
+        "exception_type",
     }
-    if len(candidates) != 1:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"schema", "event", "outcome"}
+        or value.get("schema") != PROMOTED_CONTROL_TRANSITION_SCHEMA
+        or not isinstance(value.get("event"), Mapping)
+        or set(value["event"]) != event_fields
+        or not isinstance(value.get("outcome"), Mapping)
+        or not _is_sha256(transition_id)
+    ):
+        raise ValueError("persisted CONTROL transition envelope is invalid")
+    if canonical_sha256(dict(value)) != transition_id:
         raise ValueError(
-            "operation control retryability requires one exact transition"
+            "persisted CONTROL transition does not match registry authority"
         )
-    return candidates.pop()
+    event = value["event"]
+    key = (
+        event["origin"],
+        event["operation"],
+        event["control_profile"],
+        event["failure_code"],
+        event["stage"],
+        event["scope"],
+        event["current_tier"],
+        event["current_action_kind"],
+    )
+    try:
+        transition = PROMOTED_CONTROL_TRANSITIONS[key]
+    except (KeyError, TypeError) as error:
+        raise ValueError(
+            "persisted CONTROL transition lacks registry authority"
+        ) from error
+    if (
+        transition.transition_id != transition_id
+        or transition.to_mapping() != dict(value)
+    ):
+        raise ValueError(
+            "persisted CONTROL transition does not match registry authority"
+        )
+    return transition

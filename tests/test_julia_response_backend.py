@@ -33,6 +33,7 @@ from windows_solver.julia_response_backend import (
     _valid_numerical_control_diagnostics,
 )
 from windows_solver.operation_control import (
+    JULIA_PRODUCER_RETRYABILITY_BASIS,
     JULIA_WORKER_ORIGIN,
     build_operation_control_receipt,
     operation_execution_identity,
@@ -120,10 +121,12 @@ def _worker_control_receipt(
         stage=control_failure_stage(failure_code),
         identity=identity,
         retryable=failure_code in {
-            "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            "COORDINATE_INVERSION_STALLED",
+            "DETERMINANT_UNCERTAINTY_TOO_LARGE",
+            "FINITE_DIFFERENCE_NOISE_LIMIT",
             "HORIZON_ARITHMETIC_INADEQUATE",
         },
-        retryable_basis="worker-control test fixture/v1",
+        retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
         diagnostics=valid_control_failure_diagnostics(
             failure_code,
             precision_bits=int(request["working_precision_bits"]),

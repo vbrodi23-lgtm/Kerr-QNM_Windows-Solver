@@ -482,8 +482,11 @@ class CampaignReportTests(unittest.TestCase):
         self.assertFalse(reporter._should_render_dashboard(event(
             ProgressEventKind.SUBOPERATION_STARTED, 1.20
         )))
-        self.assertTrue(reporter._should_render_dashboard(event(
+        self.assertFalse(reporter._should_render_dashboard(event(
             ProgressEventKind.DETERMINANT_COMPLETED, 1.30
+        )))
+        self.assertFalse(reporter._should_render_dashboard(event(
+            ProgressEventKind.SUBOPERATION_COMPLETED, 1.305
         )))
         self.assertTrue(reporter._should_render_dashboard(event(
             ProgressEventKind.WORKER_HEARTBEAT, 1.31

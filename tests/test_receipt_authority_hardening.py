@@ -10,6 +10,7 @@ from windows_solver.julia_response_backend import (
     _execution_resource_policy,
 )
 from windows_solver.operation_control import (
+    JULIA_PRODUCER_RETRYABILITY_BASIS,
     JULIA_WORKER_ORIGIN,
     build_operation_control_receipt,
     canonical_sha256,
@@ -39,7 +40,7 @@ def _generic_insufficiency_receipt():
         stage="asymptotic-preflight",
         identity=identity,
         retryable=False,
-        retryable_basis="generic condition has no continuation authority/v1",
+        retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
         diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
     )
     return validate_operation_control_receipt(

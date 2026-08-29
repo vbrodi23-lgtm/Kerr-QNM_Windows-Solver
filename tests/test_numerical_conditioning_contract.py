@@ -21,6 +21,7 @@ from windows_solver.julia_response_backend import (
     JuliaResponseBackendError,
 )
 from windows_solver.operation_control import (
+    JULIA_PRODUCER_RETRYABILITY_BASIS,
     JULIA_WORKER_ORIGIN,
     build_operation_control_receipt,
     execution_identity_from_request,
@@ -1666,7 +1667,9 @@ class JuliaNumericalControlFailureTests(unittest.TestCase):
             "failure_code": code,
             "failure_class": "CONTROL",
             "retryable": code in {
-                "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                "COORDINATE_INVERSION_STALLED",
+                "DETERMINANT_UNCERTAINTY_TOO_LARGE",
+                "FINITE_DIFFERENCE_NOISE_LIMIT",
                 "HORIZON_ARITHMETIC_INADEQUATE",
             },
             "stage": control_failure_stage(code),
@@ -1748,7 +1751,7 @@ class JuliaNumericalControlFailureTests(unittest.TestCase):
                     stage=legacy_failure["stage"],
                     identity=identity,
                     retryable=legacy_failure["retryable"],
-                    retryable_basis="typed numerical-control fixture/v1",
+                    retryable_basis=JULIA_PRODUCER_RETRYABILITY_BASIS,
                     diagnostics=legacy_failure["diagnostics"],
                 )
                 control_receipt = validate_operation_control_receipt(

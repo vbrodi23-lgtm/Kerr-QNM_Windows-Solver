@@ -658,7 +658,7 @@ def _validate_promoted_stage_payload(
             ),
             expected_queue_ordinal=int(stage["queue_ordinal"]),
         )
-        transition = authority.classification.transition
+        transition = authority.transition
         if (
             stage.get("numerical_disposition") != transition.disposition
             or stage.get("reason_code") != transition.failure_code

@@ -117,9 +117,11 @@ from .reviewed_determinant_error_issuance import (
 )
 from .promoted_control_calibration import PromotedExecutionMode
 from .promoted_control_authority import (
-    PersistedControlAuthority,
+    PersistedControlDecisionAuthority,
+    PersistedControlReturnAuthority,
     authenticate_persisted_control_decision,
     authenticate_persisted_control_return,
+    resolve_persisted_control_return,
 )
 from .background_evidence_store import CanonicalBackgroundEvidenceStore
 from .julia_response_backend import (
@@ -2298,7 +2300,7 @@ def _validated_promoted_expected_action(
 def _bind_promoted_control_receipt_to_expected_action(
     receipt: ValidatedControlReceipt,
     expected_action: Mapping[str, object],
-) -> PersistedControlAuthority:
+) -> None:
     """Require a CONTROL receipt to prove the scheduler's exact active phase."""
 
     expected = _validated_promoted_expected_action(expected_action)
@@ -3017,6 +3019,22 @@ def _validated_promoted_partial_work(
     }
 
 
+def _persisted_control_action_for_route(
+    control_return: Mapping[str, object],
+    *,
+    route: str,
+) -> str:
+    operation = control_return.get("operation")
+    if operation in {
+        "fixed-root-survey-batch",
+        "fixed-root-determinant-sample",
+    }:
+        return "RESPONSE"
+    if operation == "root-readout":
+        return "RESPONSE" if route == "HORIZON_BF80" else "ROOT"
+    raise ValueError("promoted CONTROL return action cannot be derived")
+
+
 def _revalidate_promoted_control_proof(
     control_return: Mapping[str, object],
     control_decision: Mapping[str, object],
@@ -3025,7 +3043,7 @@ def _revalidate_promoted_control_proof(
     leaf_id: str,
     route: str = "EXTERIOR_BF40",
     leaf: object | None = None,
-) -> None:
+) -> PersistedControlDecisionAuthority:
     """Delegate retained transition authentication to its owning boundary."""
 
     return_schema, decision_schema = _promoted_control_schemas_for_route(route)
@@ -3036,7 +3054,10 @@ def _revalidate_promoted_control_proof(
         expected_return_schema=return_schema,
         expected_decision_schema=decision_schema,
         expected_leaf_id=leaf_id,
-        expected_current_action_kind="RESPONSE",
+        expected_current_action_kind=_persisted_control_action_for_route(
+            control_return,
+            route=route,
+        ),
         expected_queue_ordinal=(
             queue_ordinal if route != "HORIZON_BF80" else None
         ),
@@ -3049,7 +3070,7 @@ def _authenticated_horizon_control_stage(
     *,
     leaf_id: str,
 ) -> tuple[
-    PersistedControlAuthority,
+    PersistedControlReturnAuthority,
     list[Mapping[str, object]],
     tuple[int, int, int],
 ]:
@@ -3091,7 +3112,7 @@ def _authenticated_horizon_control_stage(
         expected_leaf_id=leaf_id,
         expected_current_action_kind="RESPONSE",
     )
-    identity = authority.classification.receipt.identity
+    identity = authority.receipt.identity
     expected_root_reads = 1 if identity.operation == "root-readout" else 0
     receipts = retained_stage.get("receipts")
     tiers = retained_stage.get("precision_tiers")
@@ -3373,14 +3394,18 @@ def reduce_promoted_exterior_from_checkpoint(
             != validated_receipt.sha256
         ):
             raise ValueError("promoted exterior control attempt lineage is invalid")
-        authority = authenticate_persisted_control_return(
+        return_authority = authenticate_persisted_control_return(
             artifact,
             expected_schema=_PROMOTED_CONTROL_RETURN_SCHEMA,
             expected_leaf_id=str(entry["leaf_id"]),
-            expected_current_action_kind="RESPONSE",
+            expected_current_action_kind=_persisted_control_action_for_route(
+                artifact,
+                route="EXTERIOR_BF40",
+            ),
             expected_queue_ordinal=queue_ordinal,
         )
-        transition = authority.classification.transition
+        authority = resolve_persisted_control_return(return_authority)
+        transition = authority.transition
         decision_artifact = authority.normalized_decision(
             schema=_PROMOTED_CONTROL_DECISION_SCHEMA,
             current_tier=str(artifact["current_tier"]),
@@ -3566,7 +3591,7 @@ def reduce_promoted_control_decision_from_checkpoint(
             or partial_work["evidence_receipts"] != receipts
         ):
             raise ValueError("durable promoted CONTROL accounting is invalid")
-    transition = authority.classification.transition
+    transition = authority.transition
     failure_disposition = FailureDisposition(transition.disposition)
     survey_disposition = {
         FailureDisposition.PROMOTION_PENDING: SurveyDisposition.UNRESOLVED,
@@ -3630,18 +3655,19 @@ def reduce_promoted_horizon_from_checkpoint(
 
     retained_artifact = _raw_stage_artifact(retained_stage)
     if retained_artifact.get("schema") == PROMOTED_HORIZON_CONTROL_RETURN_SCHEMA:
-        authority, receipts, counters = _authenticated_horizon_control_stage(
+        return_authority, receipts, counters = _authenticated_horizon_control_stage(
             retained_artifact,
             retained_stage,
             leaf_id=str(_entry["leaf_id"]),
         )
+        authority = resolve_persisted_control_return(return_authority)
         decision_artifact = authority.normalized_decision(
             schema=PROMOTED_HORIZON_CONTROL_DECISION_SCHEMA,
             current_tier="BF80",
             current_action_kind="RESPONSE",
         )
         disposition = FailureDisposition(
-            authority.classification.transition.disposition
+            authority.transition.disposition
         )
         survey_disposition = {
             FailureDisposition.PROMOTION_PENDING: SurveyDisposition.UNRESOLVED,
@@ -3652,7 +3678,7 @@ def reduce_promoted_horizon_from_checkpoint(
         }[disposition]
         return PromotedPassOutcome(
             disposition=survey_disposition,
-            reason_code=authority.classification.receipt.failure_code,
+            reason_code=authority.receipt.failure_code,
             precision_tiers=("BF80",),
             operation_identity="promoted-horizon-control-decision/v1",
             source_record_sha256=(
@@ -3674,7 +3700,7 @@ def reduce_promoted_horizon_from_checkpoint(
                 copy.deepcopy(dict(item)) for item in receipts
             ),
             calculation_artifact=decision_artifact,
-            control_transition=authority.classification.transition,
+            control_transition=authority.transition,
             source_calculation_stage_sha256=str(retained_stage["stage_sha256"]),
             calculation_chain=_raw_stage_chain(retained_stage),
             tier_timing=tuple(
@@ -4036,17 +4062,101 @@ def _load_promoted_background_cache(
     return cache
 
 
+def _authenticated_continuation_control_authority(
+    continuation_stage: Mapping[str, object],
+    *,
+    entry: Mapping[str, object],
+    leaf: object,
+) -> PersistedControlDecisionAuthority:
+    """Authenticate the retained decision before execution interprets it."""
+
+    chain = continuation_stage.get("calculation_chain")
+    decision_stage = chain[-1] if isinstance(chain, list) and chain else None
+    decision = (
+        decision_stage.get("control_decision")
+        if isinstance(decision_stage, Mapping)
+        else None
+    )
+    decision_chain = (
+        decision_stage.get("calculation_chain")
+        if isinstance(decision_stage, Mapping)
+        else None
+    )
+    return_stage = (
+        decision_chain[-1]
+        if isinstance(decision_chain, list) and decision_chain
+        else None
+    )
+    control_return = (
+        return_stage.get("control_return")
+        if isinstance(return_stage, Mapping)
+        else None
+    )
+    proof = continuation_stage.get("control_proof")
+    if (
+        continuation_stage.get("schema")
+        != PROMOTED_CONTROL_CONTINUATION_STAGE_SCHEMA
+        or not isinstance(decision_stage, Mapping)
+        or decision_stage.get("schema")
+        != PROMOTED_CONTROL_DECISION_STAGE_SCHEMA
+        or not isinstance(decision, Mapping)
+        or decision.get("schema") != PROMOTED_CONTROL_DECISION_SCHEMA
+        or not isinstance(return_stage, Mapping)
+        or return_stage.get("schema") != PROMOTED_CONTROL_RETURN_STAGE_SCHEMA
+        or not isinstance(control_return, Mapping)
+        or control_return.get("schema") != PROMOTED_CONTROL_RETURN_SCHEMA
+        or not isinstance(proof, Mapping)
+        or proof.get("schema")
+        != PROMOTED_CONTROL_CONTINUATION_PROOF_SCHEMA
+        or proof.get("control_return_stage_sha256")
+        != return_stage.get("stage_sha256")
+        or proof.get("control_return_sha256")
+        != control_return.get("control_return_sha256")
+        or proof.get("control_decision_stage_sha256")
+        != decision_stage.get("stage_sha256")
+        or proof.get("control_decision_sha256")
+        != decision.get("control_decision_sha256")
+        or proof.get("transition_id") != decision.get("transition_id")
+    ):
+        raise ValueError("promoted continuation lacks mandatory CONTROL proof")
+    authority = _revalidate_promoted_control_proof(
+        control_return,
+        decision,
+        queue_ordinal=int(entry["queue_ordinal"]),
+        leaf_id=str(entry["leaf_id"]),
+        leaf=leaf,
+    )
+    transition = authority.transition
+    if (
+        transition.outcome_kind is not ControlOutcomeKind.PROMOTION_PENDING
+        or proof.get("current_tier") != transition.current_tier
+        or proof.get("current_action_kind")
+        != transition.current_action_kind
+        or proof.get("next_tier") != transition.next_tier
+        or proof.get("next_action_kind") != transition.next_action_kind
+    ):
+        raise ValueError("promoted continuation decision authority is invalid")
+    return authority
+
+
 def _continuation_root_seal(
     continuation_stage: Mapping[str, object] | None,
     *,
     leaf: object,
     entry: Mapping[str, object],
     fallback_seal: AuthenticatedRootSeal | None,
+    decision_authority: PersistedControlDecisionAuthority | None = None,
 ) -> AuthenticatedRootSeal | None:
     """Recover the exact BF40 root seal retained before a BF80 continuation."""
 
     if continuation_stage is None:
         return None
+    if decision_authority is None:
+        decision_authority = _authenticated_continuation_control_authority(
+            continuation_stage,
+            entry=entry,
+            leaf=leaf,
+        )
     receipts = continuation_stage.get("receipts")
     if not isinstance(receipts, list):
         raise ValueError("promoted continuation receipts are invalid")
@@ -4057,19 +4167,7 @@ def _continuation_root_seal(
         if isinstance(decision_stage, Mapping)
         else None
     )
-    transition = (
-        decision.get("transition") if isinstance(decision, Mapping) else None
-    )
-    resolved_outcome = (
-        transition.get("outcome")
-        if isinstance(transition, Mapping)
-        else None
-    )
-    next_action_kind = (
-        resolved_outcome.get("next_action_kind")
-        if isinstance(resolved_outcome, Mapping)
-        else None
-    )
+    current_action_kind = decision_authority.transition.current_action_kind
     decision_chain = (
         decision_stage.get("calculation_chain")
         if isinstance(decision_stage, Mapping)
@@ -4090,11 +4188,21 @@ def _continuation_root_seal(
         if isinstance(control_return, Mapping)
         else None
     )
-    retained_root_required = (
-        entry.get("queue_kind") == PromotionQueueKind.ROOT.value
-        and isinstance(decision, Mapping)
-        and next_action_kind == "RESPONSE"
-    )
+    queue_kind = entry.get("queue_kind")
+    if queue_kind == PromotionQueueKind.ROOT.value:
+        if current_action_kind == "ROOT":
+            retained_root_required = False
+        elif current_action_kind == "RESPONSE":
+            retained_root_required = True
+        else:  # pragma: no cover - closed transition enum
+            raise ValueError("promoted ROOT continuation action is invalid")
+    elif (
+        queue_kind == PromotionQueueKind.RESPONSE.value
+        and current_action_kind == "RESPONSE"
+    ):
+        retained_root_required = False
+    else:
+        raise ValueError("promoted continuation action is incompatible")
     restored: AuthenticatedRootSeal | None = None
     for receipt in receipts:
         if (
@@ -4149,8 +4257,7 @@ def _continuation_root_seal(
             )
         restored = fallback_seal
     if (
-        isinstance(decision, Mapping)
-        and next_action_kind == "RESPONSE"
+        current_action_kind == "RESPONSE"
         and restored is not None
     ):
         if not isinstance(expected_action, Mapping):
@@ -4205,11 +4312,21 @@ def _run_promoted_exterior_queue_entry(
         )
     queue_kind = PromotionQueueKind(entry["queue_kind"])
     seal = root_seal_lookup(leaf, entry)
+    continuation_authority = (
+        None
+        if continuation_stage is None
+        else _authenticated_continuation_control_authority(
+            continuation_stage,
+            entry=entry,
+            leaf=leaf,
+        )
+    )
     retained_root_seal = _continuation_root_seal(
         continuation_stage,
         leaf=leaf,
         entry=entry,
         fallback_seal=seal,
+        decision_authority=continuation_authority,
     )
     if retained_root_seal is not None:
         if seal is not None and seal != retained_root_seal:
@@ -4323,13 +4440,8 @@ def _run_promoted_exterior_queue_entry(
             != retained_decision.get("control_decision_sha256")
         ):
             raise ValueError("promoted continuation lacks mandatory CONTROL proof")
-        continuation_authority = _revalidate_promoted_control_proof(
-            raw_control_return,
-            retained_decision,
-            queue_ordinal=int(entry["queue_ordinal"]),
-            leaf_id=str(entry["leaf_id"]),
-            leaf=leaf,
-        )
+        if continuation_authority is None:  # pragma: no cover - structural guard
+            raise ValueError("promoted continuation authority is absent")
         partial_work = _validated_promoted_partial_work(
             raw_control_return["partial_work"],
             queue_ordinal=int(entry["queue_ordinal"]),
@@ -4356,7 +4468,7 @@ def _run_promoted_exterior_queue_entry(
                 precision_tiers=("BF40",),
                 calculation_artifact=retained_decision,
                 control_transition=(
-                    continuation_authority.classification.transition
+                    continuation_authority.transition
                 ),
             )
         ):
