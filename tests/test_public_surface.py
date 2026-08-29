@@ -414,6 +414,40 @@ class PublicSurfaceTests(unittest.TestCase):
             "promoted_control_empirical_calibration_v1.json must exist in package data",
         )
 
+        # The two authority resources must be declared in the runtime policy
+        # (outside the Julia scientific_sources root, since they live in
+        # src/windows_solver/data rather than .../data/julia), not hardcoded
+        # as bare filenames scattered through bootstrap.ps1.
+        policy = json.loads(
+            (root / "runtime" / "runtime_policy.json").read_text(encoding="utf-8")
+        )
+        worker_resources = {
+            resource["id"]: resource["path"]
+            for resource in policy["m02_worker_resources"]
+        }
+        self.assertEqual(
+            worker_resources,
+            {
+                "fixed-root-reliability-projection-authority": (
+                    "src/windows_solver/data/"
+                    "fixed_root_reliability_projection_authority_v1.json"
+                ),
+                "promoted-control-empirical-calibration": (
+                    "src/windows_solver/data/"
+                    "promoted_control_empirical_calibration_v1.json"
+                ),
+            },
+        )
+
+        # The receipt-building helper must scope resources to the packaged
+        # data root and hash each one.
+        receipts_start = bootstrap.index("function Get-M02WorkerResourceReceipts")
+        receipts_end = bootstrap.index("\n}", receipts_start) + len("\n}")
+        receipts_block = bootstrap[receipts_start:receipts_end]
+        self.assertIn("Policy.m02_worker_resources", receipts_block)
+        self.assertIn("outside the packaged data root", receipts_block)
+        self.assertIn("Get-Sha256", receipts_block)
+
         # Authority file hashes must be bound into the worker contract so that a
         # content change (without a filename rename) selects a new $M02WorkerId
         # and stages the resources at an immutable contract-specific path.
@@ -422,24 +456,23 @@ class PublicSurfaceTests(unittest.TestCase):
         contract_block = bootstrap[contract_start:contract_end]
         self.assertIn("fixed_root_authority_sha256", contract_block)
         self.assertIn("promoted_calibration_sha256", contract_block)
-        self.assertIn("Get-Sha256", contract_block)
 
-        # The bootstrap must deploy both JSON files into the contract-specific
-        # worker directory so the worker resolves them via @__DIR__/<filename>.
+        # The bootstrap must deploy both resources into the contract-specific
+        # worker directory so the worker resolves them via @__DIR__/<filename>,
+        # using hash-verified atomic install rather than a bare unconditional
+        # Copy-Item, and must fail closed rather than silently overwrite an
+        # already-installed resource whose bytes no longer match the contract.
         deploy_start = bootstrap.index(
             '    $M02WorkerRoot = Join-Path (Join-Path $RuntimeRoot "m02-workers") $M02WorkerId'
         )
         deploy_end = bootstrap.index("\n    $DependencyRejectionReason", deploy_start)
         deploy_block = bootstrap[deploy_start:deploy_end]
 
-        self.assertIn(
-            '"fixed_root_reliability_projection_authority_v1.json"', deploy_block
-        )
-        self.assertIn(
-            '"promoted_control_empirical_calibration_v1.json"', deploy_block
-        )
-        self.assertIn(r"src\windows_solver\data", deploy_block)
+        self.assertIn("foreach ($Resource in $M02WorkerResourceReceipts)", deploy_block)
+        self.assertIn("Immutable M02 worker resource is corrupted:", deploy_block)
         self.assertIn("Copy-Item", deploy_block)
+        self.assertIn("Move-Item", deploy_block)
+        self.assertIn("did not match source hash", deploy_block)
         self.assertIn("M02 worker authority resource was not staged:", deploy_block)
         # Resources must land inside the versioned worker dir, not the shared parent.
         self.assertIn(r"$M02WorkerId", deploy_block)

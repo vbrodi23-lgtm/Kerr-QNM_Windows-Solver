@@ -116,6 +116,16 @@
       "path": "src/windows_solver/data/julia/m02_project/Manifest.seed.toml"
     }
   ],
+  "m02_worker_resources": [
+    {
+      "id": "fixed-root-reliability-projection-authority",
+      "path": "src/windows_solver/data/fixed_root_reliability_projection_authority_v1.json"
+    },
+    {
+      "id": "promoted-control-empirical-calibration",
+      "path": "src/windows_solver/data/promoted_control_empirical_calibration_v1.json"
+    }
+  ],
   "numerical_kernel": {
     "required_by": "native response kernel (numpy) and the packaged test suite (numpy, scipy)",
     "not_required_by": "plan, run, verify, inspect, export, campaign-plan, campaign-merge, campaign-smoke",

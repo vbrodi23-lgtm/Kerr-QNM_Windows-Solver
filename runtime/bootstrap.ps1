@@ -361,6 +361,36 @@ function Get-SourceReceipt([string]$Id) {
     return $matches[0]
 }
 
+function Get-M02WorkerResourceReceipts {
+    $receipts = @()
+    $dataRoot = [IO.Path]::GetFullPath((Join-Path $PackageRoot "src\windows_solver\data")).TrimEnd([char[]]@(92, 47))
+    foreach ($Resource in $Policy.m02_worker_resources) {
+        $SourcePath = Join-Path $PackageRoot $Resource.path
+        if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+            throw "Required M02 worker resource is absent: $SourcePath"
+        }
+        $resolvedSourcePath = [IO.Path]::GetFullPath($SourcePath)
+        if (-not $resolvedSourcePath.StartsWith($dataRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "M02 worker resource is outside the packaged data root: $resolvedSourcePath"
+        }
+        $receipts += [ordered]@{
+            id = [string]$Resource.id
+            checkout_path = $resolvedSourcePath
+            file_name = Split-Path -Leaf $resolvedSourcePath
+            sha256 = Get-Sha256 $resolvedSourcePath
+        }
+    }
+    return @($receipts)
+}
+
+function Get-M02WorkerResourceReceipt([string]$Id) {
+    $matches = @($M02WorkerResourceReceipts | Where-Object { $_.id -eq $Id })
+    if ($matches.Count -ne 1) {
+        throw "M02 worker resource policy must contain exactly one resource with ID ${Id}."
+    }
+    return $matches[0]
+}
+
 function Get-TreeSha256([string]$Root) {
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
         throw "Required source directory is absent: $Root"
@@ -1221,15 +1251,14 @@ if ($WithM02) {
     $M02DependencySha256 = Get-ObjectSha256 $M02DependencyContract
     $M02DependencyId = "m02-deps-" + $M02DependencySha256.Substring(0, 24)
 
-    $FixedRootAuthorityPath = Join-Path (Join-Path $PackageRoot "src\windows_solver\data") `
-        "fixed_root_reliability_projection_authority_v1.json"
-    $PromotedCalibrationPath = Join-Path (Join-Path $PackageRoot "src\windows_solver\data") `
-        "promoted_control_empirical_calibration_v1.json"
+    $M02WorkerResourceReceipts = Get-M02WorkerResourceReceipts
+    $FixedRootAuthorityResource = Get-M02WorkerResourceReceipt "fixed-root-reliability-projection-authority"
+    $PromotedCalibrationResource = Get-M02WorkerResourceReceipt "promoted-control-empirical-calibration"
     $M02WorkerContract = [ordered]@{
         schema_version = 1
         worker_sha256 = $WorkerSource.sha256
-        fixed_root_authority_sha256 = Get-Sha256 $FixedRootAuthorityPath
-        promoted_calibration_sha256 = Get-Sha256 $PromotedCalibrationPath
+        fixed_root_authority_sha256 = $FixedRootAuthorityResource.sha256
+        promoted_calibration_sha256 = $PromotedCalibrationResource.sha256
     }
     $M02WorkerSha256 = Get-ObjectSha256 $M02WorkerContract
     $M02WorkerId = "m02-worker-" + $M02WorkerSha256.Substring(0, 24)
@@ -1332,17 +1361,23 @@ if ($WithM02) {
     }
 
     $M02WorkerRoot = Join-Path (Join-Path $RuntimeRoot "m02-workers") $M02WorkerId
-    $WorkerResources = @(
-        "fixed_root_reliability_projection_authority_v1.json",
-        "promoted_control_empirical_calibration_v1.json"
-    )
-    foreach ($ResourceName in $WorkerResources) {
-        $Source = Join-Path $PackageRoot "src\windows_solver\data\$ResourceName"
-        $Destination = Join-Path $M02WorkerRoot $ResourceName
-        if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
-            throw "M02 worker authority resource is absent: $Source"
+    New-Item -ItemType Directory -Force -Path $M02WorkerRoot | Out-Null
+    foreach ($Resource in $M02WorkerResourceReceipts) {
+        $Destination = Join-Path $M02WorkerRoot $Resource.file_name
+        if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+            if ((Get-Sha256 $Destination) -ne $Resource.sha256) {
+                throw "Immutable M02 worker resource is corrupted: $Destination"
+            }
+            continue
         }
-        Copy-Item -LiteralPath $Source -Destination $Destination -Force
+        $TempDestination = Join-Path $M02WorkerRoot `
+            ".$($Resource.file_name).$([Guid]::NewGuid().ToString('N')).tmp"
+        Copy-Item -LiteralPath $Resource.checkout_path -Destination $TempDestination -Force
+        if ((Get-Sha256 $TempDestination) -ne $Resource.sha256) {
+            Remove-Item -LiteralPath $TempDestination -Force
+            throw "M02 worker authority resource copy did not match source hash: $($Resource.checkout_path)"
+        }
+        Move-Item -LiteralPath $TempDestination -Destination $Destination -Force
         if (-not (Test-Path -LiteralPath $Destination -PathType Leaf)) {
             throw "M02 worker authority resource was not staged: $Destination"
         }
