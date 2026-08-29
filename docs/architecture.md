@@ -1629,13 +1629,23 @@ solver campaign-plan SELECTION.json
 solver campaign-prepare-resources SELECTION.json
 solver campaign-new SELECTION.json --output CHECKPOINT.json
 solver campaign-survey-binary64 SELECTION.json --checkpoint CHECKPOINT.json
+solver campaign-lock-binary64 SELECTION.json --checkpoint CHECKPOINT.json [--output LOCK.json]
 solver campaign-survey-promoted SELECTION.json --checkpoint CHECKPOINT.json
+solver campaign-admit-promoted SELECTION.json --checkpoint CHECKPOINT.json --binary64-lock LOCK.json --queue-ordinal N --review-receipt RECEIPT.json --calibration-receipt-path PATH --calibration-receipt-sha256 SHA256
+solver campaign-admit-promoted-queue SELECTION.json --checkpoint CHECKPOINT.json --binary64-lock LOCK.json (--review-receipt RECEIPT.json ... | --review-receipt-directory DIR) --calibration-receipt-path PATH --calibration-receipt-sha256 SHA256
 solver campaign-certify SELECTION.json --checkpoint CHECKPOINT.json [--queue QUEUE.json]
 solver campaign-evidence-validate SELECTION.json --checkpoint CHECKPOINT.json --queue QUEUE.json
 solver campaign-schema11-validate SELECTION.json --checkpoint CHECKPOINT.json [--pass PASS]
 solver campaign-recover SELECTION.json --output CANDIDATE.json --receipt RECEIPT.json
+solver campaign-recovery-validate SELECTION.json --checkpoint CHECKPOINT.json [--receipt RECEIPT.json]
+solver campaign-resolve-system-failure SELECTION.json --checkpoint CHECKPOINT.json --failure-receipt-sha256 SHA256 --repair-commit SHA --reason TEXT [--binary64-lock LOCK.json]
 solver campaign-merge MANIFEST.json --output CHECKPOINT.json
+solver campaign-cache-import SELECTION.json --checkpoint CHECKPOINT.json [--store PATH]
 solver campaign-reduce REDUCTION-BUNDLE.json --output REDUCTION.json
+solver campaign-smoke
+solver m02-validate MANIFEST.json
+solver m02-admit MANIFEST.json --output ADMISSION.json
+solver m02-export ADMISSION.json --admission-id ID
 ```
 
 `campaign-prepare-resources` is machine preparation and may invoke Julia.
