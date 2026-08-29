@@ -126,7 +126,8 @@ function leaf13_policy(
             FACTORED_REMAINDER_STATE_CONVENTION_ID,
         "reliable_digit_safety_margin" =>
             string(RELIABLE_DIGIT_SAFETY_MARGIN),
-        "required_digit_guard" => string(REQUIRED_DIGIT_GUARD),
+        "required_digit_guard" =>
+            string(ROOT_READOUT_REQUIRED_DIGIT_GUARD),
         "human_math_review_receipt_status" =>
             HUMAN_MATH_REVIEW_RECEIPT_STATUS,
         "human_math_review_receipt_sha256" =>

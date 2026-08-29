@@ -554,10 +554,6 @@ def resolve_layer1_system_failure_for_resume(
     if promoted_layer2_state_exists(result):
         raise ValueError("Layer-1 resolution cannot authorise promoted work")
     failure = _retained_system_failure(result, system_failure_receipt_sha256)
-    if failure.get("leaf_id") in result["survey_pass_ledger"]["binary64"]:
-        raise ValueError(
-            "Layer-1 resolution target already has a Binary64 disposition"
-        )
     fingerprint = failure.get("fingerprint_sha256")
     if not _is_sha256(fingerprint):
         raise ValueError("system failure fingerprint is invalid")

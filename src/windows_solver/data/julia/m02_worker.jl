@@ -2833,7 +2833,7 @@ function throw_coordinate_identity_mismatch(
         "COORDINATE_IDENTITY_MISMATCH",
         "$(label) failed the coordinate identity gate: $(reason)",
         diagnostics;
-        retryable=true,
+        retryable=false,
         stage="coordinate-inversion",
     ))
 end
@@ -9199,7 +9199,9 @@ function validate_request_batch(batch)
     )
 end
 
-function evaluate_validated_request(request, operation, digits, bits)
+function evaluate_request(request; validated=nothing)
+    operation, digits, bits = validated === nothing ?
+        validate_worker_request_contract(request) : validated
     return setprecision(BigFloat, bits) do
         if operation == "fixed-root-determinant-sample"
             return fixed_root_determinant_sample_fields(
@@ -9208,11 +9210,6 @@ function evaluate_validated_request(request, operation, digits, bits)
         end
         return result_fields(BigFloat, request, digits, bits)
     end
-end
-
-function evaluate_request(request)
-    operation, digits, bits = validate_worker_request_contract(request)
-    return evaluate_validated_request(request, operation, digits, bits)
 end
 
 function main()
@@ -9304,8 +9301,7 @@ function main()
                 )
             end
         else
-            _, digits, bits = validated
-            Dict(evaluate_validated_request(request, operation, digits, bits))
+            Dict(evaluate_request(request; validated=validated))
         end
         mkpath(dirname(response_path))
         write(response_path, JSON.json(result))
