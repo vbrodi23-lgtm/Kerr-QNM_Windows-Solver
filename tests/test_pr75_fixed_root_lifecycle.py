@@ -64,11 +64,7 @@ class _MatrixBackend:
         self.fail_bf40_component = fail_bf40_component
         self.interrupt_bf80 = interrupt_bf80
 
-    def fixed_root_survey_batch(self, job, **kwargs):
-        plan = FixedRootSurveyPlan(kwargs["plan"])
-        self.calls.append((self.digits, plan.value))
-        if self.digits == 80 and self.interrupt_bf80:
-            raise KeyboardInterrupt
+    def _captured_backend(self, plan: FixedRootSurveyPlan):
         prefix = "success"
         suffix = ""
         if (
@@ -81,7 +77,20 @@ class _MatrixBackend:
         case_id = f"{prefix}:{self.digits}:{plan.value}{suffix}"
         case = self.cases[case_id]
         response = self.results[case_id]["response"]
-        backend = _backend(CapturedJuliaAdapter(case, response), self.digits)
+        return _backend(CapturedJuliaAdapter(case, response), self.digits)
+
+    def prepare_fixed_root_survey_request(self, job, **kwargs):
+        plan = FixedRootSurveyPlan(kwargs["plan"])
+        return self._captured_backend(plan).prepare_fixed_root_survey_request(
+            job, **kwargs
+        )
+
+    def fixed_root_survey_batch(self, job, **kwargs):
+        plan = FixedRootSurveyPlan(kwargs["plan"])
+        self.calls.append((self.digits, plan.value))
+        if self.digits == 80 and self.interrupt_bf80:
+            raise KeyboardInterrupt
+        backend = self._captured_backend(plan)
         return backend.fixed_root_survey_batch(job, **kwargs)
 
 
