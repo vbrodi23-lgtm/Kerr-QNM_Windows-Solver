@@ -156,6 +156,7 @@ FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_SCHEMA = (
 FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_IDENTITY = (
     "cause-aware-fixed-root-exterior-endpoint-recovery/v1"
 )
+FIXED_ROOT_CONTROL_PROFILE = "fixed-root-deep-v1"
 FIXED_ROOT_ENDPOINT_ORDER_RULE = "bounded-doubling-prefix/v1"
 FIXED_ROOT_HORIZON_GEOMETRY_RULE = "bounded-negative-rho-depth/v1"
 FIXED_ROOT_INFINITY_GEOMETRY_RULE = "bounded-positive-rho-depth/v1"
@@ -2804,8 +2805,9 @@ class PreparedFixedRootSurveyRequest:
         if (
             request_copy.get("schema") != FIXED_ROOT_SURVEY_BATCH_SCHEMA
             or request_copy.get("schema_version") != 3
+            or request_copy.get("control_profile") != FIXED_ROOT_CONTROL_PROFILE
         ):
-            raise ValueError("prepared fixed-root request is not `/3`")
+            raise ValueError("prepared fixed-root request is not registered `/3`")
         _validated_fixed_root_endpoint_recovery_policy(
             request_copy.get("fixed_root_endpoint_recovery_policy")
         )
@@ -4726,6 +4728,7 @@ class JuliaPrecisionRootBackend:
             "schema_version": 3,
             "schema": FIXED_ROOT_SURVEY_BATCH_SCHEMA,
             "operation": FIXED_ROOT_SURVEY_BATCH_OPERATION,
+            "control_profile": FIXED_ROOT_CONTROL_PROFILE,
             "identity": BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
             "plan": contract.plan.value,
             "scientific_operation_identity": scientific_operation_identity,
@@ -4813,6 +4816,8 @@ class JuliaPrecisionRootBackend:
         )
         reliability_projection = request.get("fixed_root_reliability_projection")
         if (
+            request.get("control_profile") != FIXED_ROOT_CONTROL_PROFILE
+            or
             recovery_policy["base_endpoint_order"]
             != request["policy"]["endpoint_series_order"]
             or recovery_policy["horizon_geometry_schedule"][-1]
