@@ -210,7 +210,7 @@ _FLOAT_CONTEXT_KEYS = frozenset({
     "bf120_seconds",
     "total_leaf_seconds",
 })
-_BOOLEAN_CONTEXT_KEYS = frozenset({"fallback_used"})
+_BOOLEAN_CONTEXT_KEYS = frozenset({"fallback_used", "retryable", "terminal"})
 _STRING_CONTEXT_KEYS = frozenset(
     {
         "leaf_id",
@@ -240,6 +240,8 @@ _STRING_CONTEXT_KEYS = frozenset(
         "control_receipt_sha256",
         "control_return_sha256",
         "control_decision_sha256",
+        "transition_id",
+        "outcome_kind",
         "current_action_kind",
         "current_tier",
         "next_tier",
@@ -337,6 +339,13 @@ def _validate_context_values(values: Mapping[str, object]) -> Mapping[str, objec
         "current_action_kind": {"ROOT", "RESPONSE"},
         "current_tier": {"BF40", "BF80", "BF120"},
         "next_tier": {"BF40", "BF80", "BF120"},
+        "outcome_kind": {
+            "PROMOTION_PENDING",
+            "UNRESOLVED",
+            "DEFERRED",
+            "REJECTED",
+            "SYSTEM_FAILURE",
+        },
     }
     for name, allowed in enum_values.items():
         if values.get(name) is not None and values[name] not in allowed:
@@ -355,6 +364,7 @@ def _validate_context_values(values: Mapping[str, object]) -> Mapping[str, objec
         "control_receipt_sha256",
         "control_return_sha256",
         "control_decision_sha256",
+        "transition_id",
     ):
         digest = values.get(name)
         if digest is None:
@@ -435,6 +445,10 @@ class ProgressContext:
     control_receipt_sha256: str | None = None
     control_return_sha256: str | None = None
     control_decision_sha256: str | None = None
+    transition_id: str | None = None
+    outcome_kind: str | None = None
+    retryable: bool | None = None
+    terminal: bool | None = None
     current_action_kind: str | None = None
     current_tier: str | None = None
     next_tier: str | None = None
