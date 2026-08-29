@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import copy
+from itertools import product
 import unittest
 from typing import Mapping
 
 from windows_solver.operation_control import (
     FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION,
+    FIXED_ROOT_DEEP_CONTROL_PROFILE,
     FIXED_ROOT_SURVEY_BATCH_OPERATION,
+    ControlOutcomeKind,
     JULIA_WORKER_ORIGIN,
     NUMERICAL_CONTROL_FAILURE_CODES,
     OPERATION_CONTROL_RECEIPT_SCHEMA,
     PROMOTED_CONTROL_TRANSITIONS,
+    PromotedControlTransition,
     PYTHON_SUPERVISOR_ORIGIN,
     REQUEST_SCOPE,
     ROOT_READOUT_OPERATION,
@@ -39,6 +43,7 @@ def _fixed_request() -> dict[str, object]:
         "schema_version": 3,
         "schema": "windows-solver.fixed-root-survey-batch/3",
         "operation": FIXED_ROOT_SURVEY_BATCH_OPERATION,
+        "control_profile": FIXED_ROOT_DEEP_CONTROL_PROFILE,
         "leaf_id": "leaf-fixed",
         "job_id": "job-fixed",
         "backend_identity_sha256": "b" * 64,
@@ -139,6 +144,8 @@ def _validated_for_transition(transition):
         retryable=expected_operation_control_retryability(
             transition.failure_code,
             operation=transition.operation,
+            current_tier=transition.current_tier,
+            current_action_kind=transition.current_action_kind,
         ),
         retryable_basis="registry-test/v1",
         diagnostics={"reason": transition.failure_code},
@@ -456,12 +463,59 @@ class OperationControlTests(unittest.TestCase):
             diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
         )
 
+        validated = validate_operation_control_receipt(
+            receipt,
+            request=request,
+            request_sha256=identity.request_sha256,
+        )
         with self.assertRaisesRegex(ValueError, "retryability contradicts"):
-            validate_operation_control_receipt(
-                receipt,
-                request=request,
-                request_sha256=identity.request_sha256,
+            promoted_control_transition(
+                validated,
+                current_tier="BF40",
+                current_action_kind="RESPONSE",
             )
+
+    def test_fixed_root_promotion_predicate_has_one_valid_boolean_case(self) -> None:
+        promoted = 0
+        for survey, profile, proof, promotable, higher in product(
+            (False, True), repeat=5
+        ):
+            transition = PromotedControlTransition.from_authenticated_facts(
+                origin=JULIA_WORKER_ORIGIN,
+                operation=(
+                    FIXED_ROOT_SURVEY_BATCH_OPERATION
+                    if survey
+                    else ROOT_READOUT_OPERATION
+                ),
+                control_profile=(
+                    FIXED_ROOT_DEEP_CONTROL_PROFILE
+                    if profile
+                    else "compatibility-control-v1"
+                ),
+                failure_code=(
+                    "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE"
+                    if proof
+                    else "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+                ),
+                stage="asymptotic-preflight",
+                scope=SAMPLE_SCOPE,
+                current_tier="BF40" if promotable else "BF80",
+                current_action_kind="RESPONSE",
+                authorized_target_tier="BF80" if higher else "BF40",
+                registered_promotion_queue=None,
+                validator="matrix/v1",
+                exception_type="JuliaNumericalControlError",
+            )
+            is_promotion = (
+                transition.outcome_kind
+                is ControlOutcomeKind.PROMOTION_PENDING
+            )
+            self.assertEqual(
+                survey and profile and proof and promotable and higher,
+                is_promotion,
+            )
+            promoted += int(is_promotion)
+        self.assertEqual(1, promoted)
 
     def test_registry_is_exact_closed_and_self_consistent(self) -> None:
         self.assertTrue(PROMOTED_CONTROL_TRANSITIONS)
