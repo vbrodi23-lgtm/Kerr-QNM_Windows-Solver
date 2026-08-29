@@ -142,6 +142,7 @@ from .julia_response_backend import (
     validate_persisted_operation_control_receipt,
 )
 from .operation_control import (
+    PromotedControlTransition,
     ValidatedControlReceipt,
     execution_identity_from_request,
     operation_execution_identity,
@@ -440,6 +441,7 @@ class PromotedPassOutcome:
     worker_launch_limit: int = 3
     evidence_receipts: tuple[Mapping[str, object], ...] = ()
     calculation_artifact: Mapping[str, object] | None = None
+    control_transition: PromotedControlTransition | None = None
     source_calculation_stage_sha256: str | None = None
     calculation_chain: tuple[Mapping[str, object], ...] = ()
     tier_timing: tuple[Mapping[str, object], ...] = ()
@@ -1786,34 +1788,6 @@ def _promoted_control_receipt(
             )
         _bind_promoted_control_receipt_to_expected_action(receipt, expected_action)
     return receipt
-
-
-def _terminal_promoted_outcome(
-    decision: object,
-    *,
-    tiers: tuple[str, ...],
-    sample_count: int,
-    root_read_count: int,
-    worker_launch_count: int,
-) -> PromotedPassOutcome:
-    dispositions = {
-        FailureDisposition.UNRESOLVED: SurveyDisposition.UNRESOLVED,
-        FailureDisposition.DEFERRED: SurveyDisposition.DEFERRED,
-        FailureDisposition.REJECTED: SurveyDisposition.REJECTED,
-    }
-    disposition = dispositions.get(decision.disposition)
-    if disposition is None:
-        raise JuliaResponseBackendError(
-            f"promoted survey cannot contain {decision.failure_code}"
-        )
-    return PromotedPassOutcome(
-        disposition=disposition,
-        reason_code=decision.failure_code,
-        precision_tiers=tiers,
-        sample_count=sample_count,
-        root_read_count=root_read_count,
-        worker_launch_count=worker_launch_count,
-    )
 
 
 _PROMOTED_BACKGROUND_RECEIPT_SCHEMA = (
@@ -3430,6 +3404,7 @@ def reduce_promoted_exterior_from_checkpoint(
                 copy.deepcopy(dict(item)) for item in receipts
             ),
             calculation_artifact=decision_artifact,
+            control_transition=transition,
             source_calculation_stage_sha256=str(retained_stage["stage_sha256"]),
             calculation_chain=_raw_stage_chain(retained_stage),
             tier_timing=tuple(
@@ -3614,6 +3589,7 @@ def reduce_promoted_control_decision_from_checkpoint(
         worker_launch_count=int(counters[2]),
         evidence_receipts=tuple(copy.deepcopy(dict(item)) for item in receipts),
         calculation_artifact=copy.deepcopy(dict(decision)),
+        control_transition=transition,
         source_calculation_stage_sha256=str(decision_stage["stage_sha256"]),
         calculation_chain=_raw_stage_chain(decision_stage),
         tier_timing=tuple(
@@ -3686,6 +3662,7 @@ def reduce_promoted_horizon_from_checkpoint(
                 copy.deepcopy(dict(item)) for item in receipts
             ),
             calculation_artifact=decision_artifact,
+            control_transition=authority.classification.transition,
             source_calculation_stage_sha256=str(retained_stage["stage_sha256"]),
             calculation_chain=_raw_stage_chain(retained_stage),
             tier_timing=tuple(
@@ -7492,15 +7469,22 @@ def run_promoted_survey(
                 precision_tier="+".join(outcome.precision_tiers),
                 disposition=outcome.disposition,
             )
-            if (
-                failure_monitor.observe_leaf_outcome(leaf_id, report).disposition
-                is FailureDisposition.SYSTEM_FAILURE
-            ):
+            monitor_decision = (
+                failure_monitor.observe_leaf_outcome(leaf_id, report)
+                if outcome.control_transition is None
+                else failure_monitor.observe_control_transition(
+                    leaf_id,
+                    report,
+                    outcome.control_transition,
+                )
+            )
+            if monitor_decision.disposition is FailureDisposition.SYSTEM_FAILURE:
                 failure_monitor.observe_system_failure(
                     result,
                     leaf_id=leaf_id,
                     report=report,
                     persist_checkpoint=lambda value: persist(value),
+                    transition=outcome.control_transition,
                 )
         timing_by_tier = {
             item["tier"]: item["elapsed_seconds"] for item in outcome.tier_timing
