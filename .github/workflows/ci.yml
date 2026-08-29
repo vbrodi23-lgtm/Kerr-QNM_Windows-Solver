@@ -11,7 +11,9 @@ permissions:
 jobs:
   julia-factored-gsn:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # The authenticated PR75 lifecycle now includes the real Julia worker
+    # process seam after the complete vendored suite and regression harnesses.
+    timeout-minutes: 60
     env:
       M02_PROJECT: .ci/m02-project
       M02_PROJECT_SEED: src/windows_solver/data/julia/m02_project
