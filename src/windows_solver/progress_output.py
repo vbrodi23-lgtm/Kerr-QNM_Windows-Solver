@@ -188,15 +188,16 @@ _DASHBOARD_FORCED_KINDS = frozenset(
         ProgressEventKind.LEAF_INTERRUPTED,
     }
 ) | _AUTHENTICATION_WORKFLOW_KINDS
+# Internal completion facts update the live state but do not redraw normal
+# output.  The leaf lifecycle events above are the completion-driven render
+# boundary; explicit long-running progress events remain throttled below.
 _DASHBOARD_LIVE_KINDS = frozenset(
     {
         ProgressEventKind.NEWTON_ITERATION_STARTED,
         ProgressEventKind.NEWTON_ITERATION_COMPLETED,
         ProgressEventKind.DETERMINANT_STARTED,
-        ProgressEventKind.DETERMINANT_COMPLETED,
         ProgressEventKind.SUBOPERATION_STARTED,
         ProgressEventKind.SUBOPERATION_PROGRESS,
-        ProgressEventKind.SUBOPERATION_COMPLETED,
         ProgressEventKind.ODE_SOLVE_STARTED,
         ProgressEventKind.ODE_SOLVE_PROGRESS,
         ProgressEventKind.ODE_SOLVE_COMPLETED,
