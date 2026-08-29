@@ -67,7 +67,6 @@ from .campaign_failures import (
     FailureReport,
     ProductionFailureMonitor,
     abort_unexpected_system_failure,
-    classify_failure,
     require_system_failures_resolved_for_binary64_resume,
     reviewed_screening_promotion_queue,
 )
