@@ -4825,8 +4825,7 @@ class JuliaPrecisionRootBackend:
         reliability_projection = request.get("fixed_root_reliability_projection")
         if (
             request.get("control_profile") != FIXED_ROOT_CONTROL_PROFILE
-            or
-            recovery_policy["base_endpoint_order"]
+            or recovery_policy["base_endpoint_order"]
             != request["policy"]["endpoint_series_order"]
             or recovery_policy["horizon_geometry_schedule"][-1]
             != request["policy"]["rho_in"]
