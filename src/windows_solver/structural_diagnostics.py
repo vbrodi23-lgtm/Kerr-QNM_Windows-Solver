@@ -44,6 +44,10 @@ _EXECUTION_FIELDS = (
     "control_receipt_sha256",
     "control_return_sha256",
     "control_decision_sha256",
+    "transition_id",
+    "outcome_kind",
+    "retryable",
+    "terminal",
     "current_action_kind",
     "current_tier",
     "next_tier",
@@ -176,6 +180,7 @@ def _validate_material_execution(value: Mapping[str, object]) -> None:
         "control_receipt_sha256",
         "control_return_sha256",
         "control_decision_sha256",
+        "transition_id",
     ):
         if name in value:
             _digest_or_none(value.get(name), f"structural execution {name}")
@@ -196,6 +201,17 @@ def _validate_material_execution(value: Mapping[str, object]) -> None:
         raise ValueError("SAMPLE structural execution identity is invalid")
     for name in ("current_action_kind",):
         if value.get(name) is not None and value[name] not in {"ROOT", "RESPONSE"}:
+            raise ValueError(f"structural execution {name} is invalid")
+    if value.get("outcome_kind") is not None and value["outcome_kind"] not in {
+        "PROMOTION_PENDING",
+        "UNRESOLVED",
+        "DEFERRED",
+        "REJECTED",
+        "SYSTEM_FAILURE",
+    }:
+        raise ValueError("structural execution outcome_kind is invalid")
+    for name in ("retryable", "terminal"):
+        if value.get(name) is not None and not isinstance(value[name], bool):
             raise ValueError(f"structural execution {name} is invalid")
     for name in ("current_tier", "next_tier"):
         if value.get(name) is not None and value[name] not in {
