@@ -9,6 +9,7 @@ from windows_solver.campaign_failures import (
     FailureReport,
     classify_failure,
     decision_from_control_transition,
+    decision_from_survey_disposition,
     require_system_failures_resolved_for_binary64_resume,
     reviewed_screening_promotion_queue,
     resolve_layer1_system_failure_for_resume,
@@ -160,6 +161,11 @@ class CampaignFailureTests(unittest.TestCase):
         self.assertIs(FailureDisposition.PROMOTION_PENDING, decision.disposition)
         self.assertEqual("RESPONSE", decision.queue_kind)
         self.assertEqual("BF80", decision.next_precision_tier)
+
+        unresolved = decision_from_survey_disposition(
+            _report("operator-visible-reason"), "UNRESOLVED"
+        )
+        self.assertIs(FailureDisposition.UNRESOLVED, unresolved.disposition)
 
     def test_unknown_code_and_untyped_inner_cause_are_system_failures(self) -> None:
         unknown = classify_failure(_report("NEW_UNKNOWN_CODE"))
