@@ -1367,6 +1367,25 @@ if ($WithM02) {
             }
         }
     }
+    # Authority resources must be staged and validated before the worker
+    # script is published: from_runtime_receipt() and similar readiness
+    # checks on the Python side validate the worker's hash but not these
+    # JSON siblings, so a concurrent campaign reading an existing receipt
+    # that already names this $M02WorkerId could observe a hash-valid
+    # worker and launch it while a resource is still missing. Publishing
+    # m02_worker.jl last closes that window.
+    $M02WorkerRoot = Join-Path (Join-Path $RuntimeRoot "m02-workers") $M02WorkerId
+    foreach ($Resource in $M02WorkerResourceReceipts) {
+        $Destination = Join-Path $M02WorkerRoot $Resource.file_name
+        if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+            if ((Get-Sha256 $Destination) -ne $Resource.sha256) {
+                throw "Immutable M02 worker resource is corrupted: $Destination"
+            }
+            continue
+        }
+        Install-PersistentContractResource $Resource $Destination "M02 worker authority resource"
+    }
+
     if (-not (Test-PersistentSourceFile $WorkerSource $PersistentWorkerPath)) {
         if (($null -ne $PriorWorkerId -and $PriorWorkerId -ne $M02WorkerId) `
             -or ($null -ne $PriorWorkerSha256 -and $PriorWorkerSha256 -ne $WorkerSource.sha256)) {
@@ -1380,18 +1399,6 @@ if ($WithM02) {
     if (-not (Test-PersistentSourceFile $ProducerSource $PersistentProducerPath)) {
         Write-Step "Installing GSN producer source contract $M02GsnCacheId"
         Install-PersistentSourceFile $ProducerSource $PersistentProducerPath "GSN producer source"
-    }
-
-    $M02WorkerRoot = Join-Path (Join-Path $RuntimeRoot "m02-workers") $M02WorkerId
-    foreach ($Resource in $M02WorkerResourceReceipts) {
-        $Destination = Join-Path $M02WorkerRoot $Resource.file_name
-        if (Test-Path -LiteralPath $Destination -PathType Leaf) {
-            if ((Get-Sha256 $Destination) -ne $Resource.sha256) {
-                throw "Immutable M02 worker resource is corrupted: $Destination"
-            }
-            continue
-        }
-        Install-PersistentContractResource $Resource $Destination "M02 worker authority resource"
     }
 
     $DependencyRejectionReason = Get-M02EnvironmentRejectionReason $M02DependencySha256

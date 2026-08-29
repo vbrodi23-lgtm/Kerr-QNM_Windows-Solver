@@ -475,6 +475,23 @@ class PublicSurfaceTests(unittest.TestCase):
         # Resources must land inside the versioned worker dir, not the shared parent.
         self.assertIn(r"$M02WorkerId", deploy_block)
 
+        # The authority resources must be staged and validated *before*
+        # m02_worker.jl is published: a readiness check that only validates
+        # the worker's hash (e.g. from_runtime_receipt() on the Python side)
+        # must never be able to observe a hash-valid worker while a resource
+        # is still missing.
+        resource_loop_index = deploy_block.index(
+            "foreach ($Resource in $M02WorkerResourceReceipts)"
+        )
+        worker_install_index = deploy_block.index(
+            "if (-not (Test-PersistentSourceFile $WorkerSource $PersistentWorkerPath))"
+        )
+        self.assertLess(
+            resource_loop_index,
+            worker_install_index,
+            "authority resources must be staged before m02_worker.jl is published",
+        )
+
     def test_m02_worker_repair_does_not_delete_sibling_authority_resources(
         self,
     ) -> None:
