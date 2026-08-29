@@ -140,6 +140,7 @@ def _batch(job) -> JuliaFixedRootSurveyBatch:
         "schema": OPERATION_EXECUTION_IDENTITY_SCHEMA,
         "scope": "REQUEST",
         "operation": "fixed-root-survey-batch",
+        "control_profile": "fixed-root-deep-v1",
         "request_schema": "windows-solver.fixed-root-survey-batch/3",
         "request_sha256": request_sha256,
         "leaf_id": job.leaf_id,
