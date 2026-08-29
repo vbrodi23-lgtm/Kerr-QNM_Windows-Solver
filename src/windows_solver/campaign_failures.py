@@ -727,9 +727,8 @@ def classify_failure(report: FailureReport) -> FailureDecision:
     """Classify reviewed non-receipt outcomes; unknowns fail closed.
 
     Authenticated worker ``CONTROL`` outcomes are deliberately excluded from
-    this screening boundary.  They must enter through
-    :func:`classify_validated_control_receipt`, whose operation-discriminated
-    registry is the sole authority for a promoted CONTROL transition.
+    this screening boundary.  They must be resolved by ``operation_control``;
+    downstream campaign code consumes that immutable canonical transition.
     """
 
     diagnostics_complete = report.diagnostics.get("complete") is True
