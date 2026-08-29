@@ -2287,6 +2287,45 @@ def _migrate_fixed_root_v2_forensic_history(
         if not bucket:
             stages.pop(ordinal_key, None)
 
+    # Checkpoint mutators validate their input before appending their own
+    # ledger entry.  A `/2` stage can therefore be retired on one validation
+    # boundary and have its associated promoted pass/background supplied by
+    # the immediately following mutator.  Reconcile those late-arriving
+    # records into the already-created forensic entry so they can never regain
+    # current `/3` authority.
+    for history in forensic.values():
+        if not isinstance(history, dict):
+            continue
+        ordinal = history.get("queue_ordinal")
+        leaf_id = history.get("leaf_id")
+        if (
+            isinstance(ordinal, bool)
+            or not isinstance(ordinal, int)
+            or not isinstance(leaf_id, str)
+        ):
+            continue
+        promoted_pass = pass_ledgers["promoted"].pop(leaf_id, None)
+        background_bucket = backgrounds.get(str(ordinal))
+        promoted_background = None
+        if isinstance(background_bucket, dict):
+            promoted_background = background_bucket.pop(leaf_id, None)
+            if not background_bucket:
+                backgrounds.pop(str(ordinal), None)
+        changed = False
+        if promoted_pass is not None:
+            history["source_promoted_pass"] = copy.deepcopy(promoted_pass)
+            changed = True
+        if promoted_background is not None:
+            history["source_promoted_background"] = copy.deepcopy(
+                promoted_background
+            )
+            changed = True
+        if changed:
+            history["history_sha256"] = _sha256({
+                name: item for name, item in history.items()
+                if name != "history_sha256"
+            })
+
 
 def validate_schema11_checkpoint(
     value: Mapping[str, object],

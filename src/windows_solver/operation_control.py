@@ -724,6 +724,10 @@ _CONTROL_STAGE_BY_OPERATION: Mapping[
 # The Julia worker emits ``true`` only for these bounded continuation outcomes;
 # all other registered operation-control outcomes are non-retryable.
 _RETRYABLE_OPERATION_CONTROL_CODES = frozenset({
+    # Legacy/internal producers may still describe this condition as
+    # retryable.  Retryability is not promotion authority: the transition
+    # registry deliberately omits this generic code from ``_PROMOTION_CODES``.
+    "INSUFFICIENT_ASYMPTOTIC_PRECISION",
     "HORIZON_ARITHMETIC_INADEQUATE",
     "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
     "ODE_RESOURCE_LIMIT",

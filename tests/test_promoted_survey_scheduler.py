@@ -1655,13 +1655,13 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         )
         self.assertEqual([40, 40], calls)
         self.assertEqual(0, result.completed_count)
-        self.assertEqual(1, result.unresolved_count)
-        self.assertEqual(0, result.review_pending_count)
+        self.assertEqual(0, result.unresolved_count)
+        self.assertEqual(1, result.review_pending_count)
         tiers = result.checkpoint["survey_pass_ledger"]["promoted"][
             self.leaves[0].leaf_id
         ]["precision_tiers"]
         self.assertEqual(["BF40"], tiers)
-        self.assertEqual("UNRESOLVED", result.checkpoint[
+        self.assertEqual("AWAITING_ADMISSION", result.checkpoint[
             "promotion_queue"
         ]["entries"][0]["disposition"])
         self.assertNotIn("BF80", str(tiers))
