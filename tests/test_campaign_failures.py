@@ -129,6 +129,23 @@ class CampaignFailureTests(unittest.TestCase):
         self.assertIs(FailureDisposition.SYSTEM_FAILURE, decision.disposition)
         self.assertIsNone(decision.queue_kind)
 
+        raw_promoted = FailureReport(
+            failure_code="EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
+            failure_class="PROMOTED_SURVEY_DISPOSITION",
+            stage=report.stage,
+            worker_operation=report.worker_operation,
+            request_schema=report.request_schema,
+            backend_identity=report.backend_identity,
+            policy_identity=report.policy_identity,
+            precision_tier=report.precision_tier,
+            cause_type=report.cause_type,
+            diagnostics={"complete": True},
+        )
+        self.assertIs(
+            FailureDisposition.SYSTEM_FAILURE,
+            classify_failure(raw_promoted).disposition,
+        )
+
     def test_reporting_consumes_canonical_control_transition(self) -> None:
         transition = next(
             item
