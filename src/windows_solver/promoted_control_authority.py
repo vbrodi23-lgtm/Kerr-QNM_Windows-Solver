@@ -40,6 +40,8 @@ _CONTROL_DECISION_FIELDS = frozenset({
     "failure_code",
     "failure_fingerprint_sha256",
     "fingerprint_material",
+    "transition_id",
+    "transition",
     "disposition",
     "queue_kind",
     "current_tier",
@@ -698,6 +700,8 @@ class ControlClassificationMaterial:
             "fingerprint_material": copy.deepcopy(
                 dict(self.fingerprint_material)
             ),
+            "transition_id": self.transition.transition_id,
+            "transition": self.transition.to_mapping(),
             "disposition": self.transition.disposition,
             "queue_kind": self.transition.queue_kind,
             "current_tier": current_tier,
@@ -776,6 +780,7 @@ def classify_control_receipt_material(
         "failure_class": "CONTROL",
         "stage": receipt.stage,
         "worker_operation": identity.operation,
+        "control_profile": transition.control_profile,
         "request_schema": str(identity.mapping["request_schema"]),
         "backend_identity": str(identity.mapping["backend_identity_sha256"]),
         "policy_identity": effective_policy_identity,
@@ -785,6 +790,8 @@ def classify_control_receipt_material(
         "control_receipt_sha256": receipt.sha256,
         "execution_identity_sha256": identity.sha256,
         "effective_policy_identity": effective_policy_identity,
+        "transition_id": transition.transition_id,
+        "outcome_kind": transition.outcome_kind.value,
     }
     return ControlClassificationMaterial(
         receipt=receipt,
