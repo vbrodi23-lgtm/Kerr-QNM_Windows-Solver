@@ -35,6 +35,9 @@ _REVIEWED_SCREENING_PROMOTION_REASONS = MappingProxyType(
 )
 
 _LEAF_LOCAL_DISPOSITIONS = {
+    # The generic package condition remains readable for legacy/internal
+    # producers, but it has no promotion authority in schema 11.
+    "INSUFFICIENT_ASYMPTOTIC_PRECISION": FailureDisposition.UNRESOLVED,
     "ODE_RESOURCE_LIMIT": FailureDisposition.DEFERRED,
     "ROOT_READOUT_RESOURCE_INFEASIBLE": FailureDisposition.DEFERRED,
     "COORDINATE_INVERSION_STALLED": FailureDisposition.UNRESOLVED,

@@ -702,7 +702,8 @@ class _Backend:
                     stage=stage,
                     identity=identity,
                     retryable=expected_operation_control_retryability(
-                        self.failure_code
+                        self.failure_code,
+                        operation=identity.operation,
                     ),
                     retryable_basis="scheduler fixture control evidence/v1",
                     diagnostics=diagnostics,

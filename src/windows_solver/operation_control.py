@@ -724,6 +724,7 @@ _CONTROL_STAGE_BY_OPERATION: Mapping[
 # The Julia worker emits ``true`` only for these bounded continuation outcomes;
 # all other registered operation-control outcomes are non-retryable.
 _RETRYABLE_OPERATION_CONTROL_CODES = frozenset({
+    "INSUFFICIENT_ASYMPTOTIC_PRECISION",
     "HORIZON_ARITHMETIC_INADEQUATE",
     "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
     "ODE_RESOURCE_LIMIT",
@@ -737,13 +738,25 @@ _OPERATION_CONTROL_RETRYABILITY: Mapping[str, bool] = MappingProxyType({
 })
 
 
-def expected_operation_control_retryability(failure_code: str) -> bool:
+def expected_operation_control_retryability(
+    failure_code: str,
+    *,
+    operation: str | None = None,
+) -> bool:
     """Return the producer-owned retryability for one registered code."""
 
     try:
-        return _OPERATION_CONTROL_RETRYABILITY[failure_code]
+        retryable = _OPERATION_CONTROL_RETRYABILITY[failure_code]
     except KeyError as error:
         raise ValueError("operation control retryability code is not registered") from error
+    if operation is not None and operation not in _CONTROL_STAGE_BY_OPERATION:
+        raise ValueError("operation control retryability operation is invalid")
+    if (
+        failure_code == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+        and operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
+    ):
+        return False
+    return retryable
 
 
 def _validate_registered_control_emission(
@@ -771,7 +784,9 @@ def _validate_registered_control_emission(
     if (
         not isinstance(retryable, Mapping)
         or retryable.get("retryable")
-        is not expected_operation_control_retryability(code)
+        is not expected_operation_control_retryability(
+            code, operation=identity.operation
+        )
     ):
         raise ValueError("operation control retryability contradicts its code")
 

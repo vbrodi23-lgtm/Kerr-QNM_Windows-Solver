@@ -137,7 +137,8 @@ def _validated_for_transition(transition):
         stage=transition.stage,
         identity=identity,
         retryable=expected_operation_control_retryability(
-            transition.failure_code
+            transition.failure_code,
+            operation=transition.operation,
         ),
         retryable_basis="registry-test/v1",
         diagnostics={"reason": transition.failure_code},
