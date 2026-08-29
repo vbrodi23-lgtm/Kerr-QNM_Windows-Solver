@@ -1646,7 +1646,11 @@ def run_binary64_survey(
                 disposition=outcome.disposition,
             )
             if (
-                failure_monitor.observe_leaf_outcome(leaf_id, report).disposition
+                failure_monitor.observe_survey_disposition(
+                    leaf_id,
+                    report,
+                    outcome.disposition.value,
+                ).disposition
                 is FailureDisposition.SYSTEM_FAILURE
             ):
                 failure_monitor.observe_system_failure(
@@ -7469,7 +7473,11 @@ def run_promoted_survey(
                 disposition=outcome.disposition,
             )
             monitor_decision = (
-                failure_monitor.observe_leaf_outcome(leaf_id, report)
+                failure_monitor.observe_survey_disposition(
+                    leaf_id,
+                    report,
+                    outcome.disposition.value,
+                )
                 if outcome.control_transition is None
                 else failure_monitor.observe_control_transition(
                     leaf_id,
