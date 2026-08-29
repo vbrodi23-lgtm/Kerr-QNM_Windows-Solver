@@ -1109,13 +1109,18 @@ Malformed or unknown worker output is a system failure, not a numerical leaf res
 Only these typed numerical-insufficiency outcomes may request a later survey tier:
 
 ```text
-INSUFFICIENT_ASYMPTOTIC_PRECISION
+EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE
 HORIZON_ARITHMETIC_INADEQUATE
 FINITE_DIFFERENCE_NOISE_LIMIT
 DETERMINANT_UNCERTAINTY_TOO_LARGE
 ```
 
 Each must also satisfy its structured-diagnostics contract.
+
+`INSUFFICIENT_ASYMPTOTIC_PRECISION` is an internal package condition, not a
+campaign promotion authority. Fixed-root exterior `/3` independently validates
+the retained endpoint evidence and emits order exhaustion, geometry exhaustion,
+or arithmetic inadequacy. Only the last outcome may authorize BF40 → BF80.
 
 There is no broad rule that every typed control failure promotes.
 

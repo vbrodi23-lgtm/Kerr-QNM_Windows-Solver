@@ -15,18 +15,25 @@ const Potentials = GeneralizedSasakiNakamura.Potentials
 const Solutions = GeneralizedSasakiNakamura.Solutions
 const GSNBranchConvention = GSN.GSNBranchConvention
 const PROGRESS_PREFIX = "@@KERR_QNM_PROGRESS@@"
-const PROGRESS_SCHEMA = "windows-solver.progress/2"
+const PROGRESS_SCHEMA = "windows-solver.progress/3"
 const CONDITIONING_SCHEMA = "windows-solver.m02-conditioning/3"
 const FIXED_ROOT_SURVEY_BATCH_OPERATION = "fixed-root-survey-batch"
 const FIXED_ROOT_SURVEY_BATCH_SCHEMA =
-    "windows-solver.fixed-root-survey-batch/2"
+    "windows-solver.fixed-root-survey-batch/3"
 const FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA =
-    "windows-solver.fixed-root-survey-batch-response/2"
+    "windows-solver.fixed-root-survey-batch-response/3"
 const FIXED_ROOT_SURVEY_IDENTITY = "exterior-fixed-root-survey-raw/v1"
 const CANONICAL_EXTERIOR_BACKGROUND_IDENTITY =
     "canonical-exterior-background-wronskian/v1"
 const FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA =
-    "windows-solver.fixed-root-survey-conditioning/2"
+    "windows-solver.fixed-root-survey-conditioning/3"
+const FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_SCHEMA =
+    "windows-solver.fixed-root-endpoint-recovery-policy/1"
+const FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_IDENTITY =
+    "cause-aware-fixed-root-exterior-endpoint-recovery/v1"
+const FIXED_ROOT_ENDPOINT_ORDER_RULE = "bounded-doubling-prefix/v1"
+const FIXED_ROOT_HORIZON_GEOMETRY_RULE = "bounded-negative-rho-depth/v1"
+const FIXED_ROOT_INFINITY_GEOMETRY_RULE = "bounded-positive-rho-depth/v1"
 const OPERATION_EXECUTION_IDENTITY_SCHEMA =
     "windows-solver.operation-execution-identity/1"
 const OPERATION_CONTROL_RECEIPT_SCHEMA =
@@ -147,6 +154,24 @@ const FIXED_ROOT_SURVEY_POLICY_FIELDS = Set((
     "determinant_error_calibration_status",
     "determinant_error_missing_evidence_outcome",
     "determinant_error_preceding_precision_tier",
+))
+const FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_FIELDS = Set((
+    "schema",
+    "identity",
+    "endpoint_order_rule",
+    "base_endpoint_order",
+    "generated_maximum_order",
+    "endpoint_order_schedule",
+    "horizon_geometry_rule",
+    "horizon_geometry_schedule",
+    "infinity_geometry_rule",
+    "infinity_geometry_schedule",
+    "fixed_root_reliability_target_abs",
+    "fixed_root_reliability_rule",
+    "required_digit_guard",
+    "precision_digits",
+    "semantic_precision_tier",
+    "policy_sha256",
 ))
 const PROMOTED_ROOT_READOUT_POLICY_ID =
     "binary64-parity-primary-fixed-root-diagnostics-frequency-disk/v2"
@@ -2030,6 +2055,7 @@ mutable struct ConditioningAccumulator{T<:AbstractFloat}
     maximum_carrier_change_error::Union{Nothing,T}
     maximum_contour_angle_deformation::T
     horizon_endpoint_search_evidence::Vector{Any}
+    exterior_endpoint_recovery_evidence::Vector{Any}
     determinant_count::Int
 end
 
@@ -2051,6 +2077,7 @@ function ConditioningAccumulator(::Type{T}) where {T<:AbstractFloat}
         nothing,
         nothing,
         zero(T),
+        Any[],
         Any[],
         0,
     )
@@ -2331,7 +2358,12 @@ function build_sample_spectral_context(
     generated_endpoint_order = string(required(request, "mechanism_id")) ==
         "horizon-admittance" ?
         horizon_endpoint_maximum_order(request, base_endpoint_order) :
-        base_endpoint_order
+        get(request, "operation", nothing) ==
+            FIXED_ROOT_SURVEY_BATCH_OPERATION ?
+            parse_integer(
+                required(request, "fixed_root_endpoint_recovery_policy"),
+                "generated_maximum_order",
+            ) : base_endpoint_order
     spectral = CF.build_homogeneous_spectral_context(
         s,
         m,
@@ -3347,7 +3379,10 @@ function translate_numerical_control_failure(
                 "maximum_recurrence_digits_lost" =>
                     string(assessment.maximum_recurrence_digits_lost),
             ))
-            retryable = true
+            # The generic package condition is diagnostic only.  Fixed-root
+            # `/3` must emit a causal exterior endpoint outcome, and no
+            # campaign may treat this collapsed code as promotion authority.
+            retryable = false
         end
         stage = if failure_code == "NO_VERIFIED_HORIZON_ENDPOINT"
             "horizon-endpoint-geometry"
@@ -4161,6 +4196,229 @@ function emit_horizon_endpoint_candidate(candidate)
     ))
 end
 
+function fixed_root_endpoint_recovery_schedules(::Type{T}, request) where {T<:AbstractFloat}
+    policy = required(request, "fixed_root_endpoint_recovery_policy")
+    orders = Int[Int(value) for value in required(
+        policy, "endpoint_order_schedule"
+    )]
+    horizon = T[parse(T, string(value)) for value in required(
+        policy, "horizon_geometry_schedule"
+    )]
+    infinity = T[parse(T, string(value)) for value in required(
+        policy, "infinity_geometry_schedule"
+    )]
+    return policy, orders, horizon, infinity
+end
+
+function emit_exterior_endpoint_recovery(recovery)
+    for candidate in recovery.candidates
+        assessment = candidate.preparation.assessment
+        progress_emit("exterior_endpoint_recovery_attempt"; payload=Dict(
+            "endpoint_branch" => candidate.endpoint_branch,
+            "attempted_order" => candidate.endpoint_order,
+            "attempted_geometry" => string(candidate.geometry),
+            "limiting_resource" => candidate.limitation,
+            "selected_intervention" => candidate.selected_intervention,
+            "result" => candidate.result,
+            "maximum_last_term_ratio" =>
+                string(assessment.maximum_last_term_ratio),
+            "maximum_truncation_digits_lost" =>
+                string(assessment.maximum_truncation_digits_lost),
+            "predicted_reliable_digits" =>
+                string(assessment.predicted_reliable_digits),
+            "required_reliable_digits" =>
+                string(assessment.required_digits),
+        ))
+    end
+end
+
+function exterior_endpoint_recovery_receipts(request, recoveries, aggregate)
+    policy = required(request, "fixed_root_endpoint_recovery_policy")
+    receipts = Any[]
+    for recovery in recoveries
+        receipt = CF.canonical_single_endpoint_recovery_evidence(
+            recovery; aggregate_limitation=aggregate
+        )
+        schedule_field = recovery.endpoint_branch == "horizon-ingoing" ?
+            "horizon_geometry_schedule" : "infinity_geometry_schedule"
+        canonical_schedule = [
+            string(value) for value in required(policy, schedule_field)
+        ]
+        typed_schedule = [
+            parse(typeof(recovery.terminal.geometry), value)
+            for value in canonical_schedule
+        ]
+        receipt["candidate_geometry_schedule"] = canonical_schedule
+        for (attempt, candidate) in zip(
+            receipt["attempts"], recovery.candidates
+        )
+            geometry_index = findfirst(==(candidate.geometry), typed_schedule)
+            geometry_index === nothing && error(
+                "endpoint attempt geometry escaped its authenticated schedule"
+            )
+            attempt["attempted_geometry"] = canonical_schedule[geometry_index]
+        end
+        terminal_index = findfirst(
+            ==(recovery.terminal.geometry), typed_schedule
+        )
+        terminal_index === nothing && error(
+            "terminal endpoint geometry escaped its authenticated schedule"
+        )
+        receipt["terminal_geometry"] = canonical_schedule[terminal_index]
+        receipt["recovery_policy_sha256"] = string(required(
+            policy, "policy_sha256"
+        ))
+        push!(receipts, receipt)
+    end
+    return receipts
+end
+
+function exterior_endpoint_recovery_failure(
+    request, recoveries, aggregate
+)
+    failure_code, intervention, result = if aggregate ==
+            CF.ENDPOINT_SERIES_ORDER_LIMITED
+        (
+            "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE",
+            "ENDPOINT_ORDER_RECOVERY_EXHAUSTED",
+            "UNRESOLVED",
+        )
+    elseif aggregate == CF.ENDPOINT_GEOMETRY_LIMITED
+        (
+            "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED",
+            "ENDPOINT_GEOMETRY_RECOVERY_EXHAUSTED",
+            "UNRESOLVED",
+        )
+    elseif aggregate == CF.ENDPOINT_ARITHMETIC_LIMITED
+        (
+            "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
+            "ARITHMETIC_PRECISION_PROMOTION",
+            "ARITHMETIC_INADEQUATE",
+        )
+    else
+        error("unknown exterior endpoint aggregate limitation")
+    end
+    policy = required(request, "fixed_root_endpoint_recovery_policy")
+    diagnostics = Dict{String,Any}(
+        "reason" => failure_code,
+        "aggregate_limitation" => aggregate,
+        "endpoint_recovery_policy_identity" => string(required(
+            policy, "identity"
+        )),
+        "endpoint_recovery_policy_sha256" => string(required(
+            policy, "policy_sha256"
+        )),
+        "endpoint_receipts" => exterior_endpoint_recovery_receipts(
+            request, recoveries, aggregate
+        ),
+        "selected_intervention" => intervention,
+        "result" => result,
+        "factored_homogeneous_rhs_evaluations" => 0,
+    )
+    return numerical_control_failure(
+        request,
+        failure_code,
+        "fixed-root exterior endpoint recovery failed: $(aggregate)",
+        diagnostics;
+        retryable=aggregate == CF.ENDPOINT_ARITHMETIC_LIMITED,
+        stage="asymptotic-preflight",
+    )
+end
+
+function recover_fixed_root_exterior_endpoints(
+    ::Type{T}, request, spectral::CF.HomogeneousSpectralContext{T},
+    horizon_match_radius::T, infinity_match_radius::T,
+    required_digits::T,
+) where {T<:AbstractFloat}
+    policy, orders, horizon_schedule, infinity_schedule =
+        fixed_root_endpoint_recovery_schedules(T, request)
+    policy_identity = string(required(policy, "identity"))
+    rhs_counter = Ref(0)
+
+    horizon_cap = build_worker_contour_context(
+        T, request, spectral, horizon_match_radius,
+        "fixed-root-horizon-endpoint-cap",
+    )
+    horizon_recovery = CF.recover_single_factored_endpoint(
+        "horizon-ingoing", orders, horizon_schedule, policy_identity,
+        (order, geometry) -> begin
+            contour = geometry == horizon_cap.rho_in ? horizon_cap :
+                CF.build_contour_context(
+                    spectral,
+                    horizon_match_radius,
+                    horizon_cap.rstar_match,
+                    geometry,
+                    horizon_cap.rho_out,
+                    horizon_cap.radius_from_rho,
+                )
+            preparation = CF.prepare_factored_horizon_ingoing(
+                spectral, contour, required_digits; order=order
+            )
+            return preparation, contour
+        end;
+        factored_homogeneous_rhs_counter=rhs_counter,
+    )
+
+    infinity_cap = build_worker_outer_contour(
+        T, request, spectral, infinity_match_radius,
+        "fixed-root-infinity-endpoint-cap",
+    )
+    infinity_recovery = CF.recover_single_factored_endpoint(
+        "infinity-outgoing", orders, infinity_schedule, policy_identity,
+        (order, geometry) -> begin
+            contour = geometry == infinity_cap.rho_out ? infinity_cap :
+                CF.build_outer_contour_context(
+                    spectral,
+                    infinity_match_radius,
+                    infinity_cap.rstar_match,
+                    geometry,
+                    infinity_cap.radius_from_rho,
+                )
+            preparation = CF.prepare_factored_infinity_outgoing(
+                spectral, contour, required_digits; order=order
+            )
+            return preparation, contour
+        end;
+        factored_homogeneous_rhs_counter=rhs_counter,
+    )
+    emit_exterior_endpoint_recovery(horizon_recovery)
+    emit_exterior_endpoint_recovery(infinity_recovery)
+    recoveries = (horizon_recovery, infinity_recovery)
+    aggregate = CF.aggregate_endpoint_limitations(
+        recovery.outcome for recovery in recoveries
+    )
+    progress_emit("exterior_endpoint_recovery_decided"; payload=Dict(
+        "endpoint_branches" => [
+            recovery.endpoint_branch for recovery in recoveries
+        ],
+        "limiting_resource" => aggregate,
+        "selected_intervention" => aggregate == CF.ENDPOINT_ADEQUATE ?
+            "ENTER_HOMOGENEOUS_ODE" : aggregate ==
+                CF.ENDPOINT_SERIES_ORDER_LIMITED ?
+                "ENDPOINT_ORDER_RECOVERY" : aggregate ==
+                CF.ENDPOINT_GEOMETRY_LIMITED ?
+                "ENDPOINT_GEOMETRY_RECOVERY" :
+                "ARITHMETIC_PRECISION_PROMOTION",
+        "result" => aggregate == CF.ENDPOINT_ADEQUATE ?
+            "ADEQUATE" : "INADEQUATE",
+        "factored_homogeneous_rhs_evaluations" => rhs_counter[],
+    ))
+    aggregate == CF.ENDPOINT_ADEQUATE || throw(
+        exterior_endpoint_recovery_failure(request, recoveries, aggregate)
+    )
+    receipts = exterior_endpoint_recovery_receipts(
+        request, recoveries, aggregate
+    )
+    return (
+        horizon_recovery.terminal.payload,
+        horizon_recovery.terminal.preparation,
+        infinity_recovery.terminal.payload,
+        infinity_recovery.terminal.preparation,
+        receipts,
+        rhs_counter,
+    )
+end
+
 function evaluate_exterior_determinant(
     ::Type{T},
     request,
@@ -4180,28 +4438,41 @@ function evaluate_exterior_determinant(
         exterior_support_contract(T, request, a, readout)[1]
     end
     spectral = build_sample_spectral_context(T, request, omega, context)
-    lower_contour = build_worker_contour_context(
-        T, request, spectral, lower, "Xin"
-    )
     required_digits = required_reliable_digits(T, request)
-    horizon_ingoing = CF.prepare_factored_horizon_ingoing(
-        spectral, lower_contour, required_digits
-    )
     exterior_certificate_required =
         exterior_empirical_certificate_required(request)
-    readout_contour, infinity_outgoing, comparison_contour,
-        comparison_outgoing = if get(request, "operation", nothing) ==
-            FIXED_ROOT_SURVEY_BATCH_OPERATION
-        contour, preparation = select_worker_outer_endpoint(
-            T,
-            request,
-            spectral,
-            readout,
-            "Xup",
-            required_digits,
+    fixed_root_survey = get(request, "operation", nothing) ==
+        FIXED_ROOT_SURVEY_BATCH_OPERATION
+    lower_contour, horizon_ingoing, readout_contour, infinity_outgoing,
+        comparison_contour, comparison_outgoing,
+        factored_homogeneous_rhs_counter = if fixed_root_survey
+        horizon_contour, horizon_preparation,
+            infinity_contour, infinity_preparation,
+            recovery_receipts, rhs_counter =
+                recover_fixed_root_exterior_endpoints(
+                    T, request, spectral, lower, readout, required_digits
+                )
+        append!(
+            context.conditioning.exterior_endpoint_recovery_evidence,
+            recovery_receipts,
         )
-        contour, preparation, nothing, nothing
+        (
+            horizon_contour,
+            horizon_preparation,
+            infinity_contour,
+            infinity_preparation,
+            nothing,
+            nothing,
+            rhs_counter,
+        )
     elseif exterior_certificate_required
+        horizon_contour = build_worker_contour_context(
+            T, request, spectral, lower, "Xin"
+        )
+        horizon_preparation = CF.prepare_factored_horizon_ingoing(
+            spectral, horizon_contour, required_digits
+        )
+        outer, preparation, comparison, comparison_preparation =
         select_worker_outer_endpoint_pair(
             T,
             request,
@@ -4210,14 +4481,27 @@ function evaluate_exterior_determinant(
             "Xup",
             required_digits,
         )
+        (
+            horizon_contour, horizon_preparation, outer, preparation,
+            comparison, comparison_preparation, Ref(0),
+        )
     else
+        horizon_contour = build_worker_contour_context(
+            T, request, spectral, lower, "Xin"
+        )
+        horizon_preparation = CF.prepare_factored_horizon_ingoing(
+            spectral, horizon_contour, required_digits
+        )
         contour = build_worker_contour_context(
             T, request, spectral, readout, "Xup"
         )
         preparation = CF.prepare_factored_infinity_outgoing(
             spectral, contour, required_digits
         )
-        contour, preparation, nothing, nothing
+        (
+            horizon_contour, horizon_preparation, contour, preparation,
+            nothing, nothing, Ref(0),
+        )
     end
     emit_asymptotic_preparation(horizon_ingoing)
     emit_asymptotic_preparation(infinity_outgoing)
@@ -4234,7 +4518,9 @@ function evaluate_exterior_determinant(
         infinity_outgoing,
     )
 
-    factored_homogeneous_rhs_counter = Ref(0)
+    factored_homogeneous_rhs_counter[] == 0 || error(
+        "exterior homogeneous solve began after unaccounted RHS work"
+    )
     observation_factory = (leg, tspan, algorithm) ->
         ode_observation_factory(request, leg, tspan, algorithm)
     common_solve_options = (
@@ -8442,6 +8728,7 @@ function flatten_fixed_root_survey_request(document)
         "working_precision_bits",
         "semantic_precision_tier",
         "fixed_root_reliability_projection",
+        "fixed_root_endpoint_recovery_policy",
         "frequency_step",
         "coordinate_step",
         "sample_roles",
@@ -8496,6 +8783,8 @@ function flatten_fixed_root_survey_request(document)
             required(document, "semantic_precision_tier"),
         "fixed_root_reliability_projection" =>
             required(document, "fixed_root_reliability_projection"),
+        "fixed_root_endpoint_recovery_policy" =>
+            required(document, "fixed_root_endpoint_recovery_policy"),
         "frequency_step" => required(document, "frequency_step"),
         "coordinate_step" => required(document, "coordinate_step"),
         "sample_roles" => required(document, "sample_roles"),
@@ -8590,8 +8879,99 @@ function validate_fixed_root_survey_policy(request)
     return nothing
 end
 
+function validate_fixed_root_endpoint_recovery_policy(request)
+    recovery = required(request, "fixed_root_endpoint_recovery_policy")
+    recovery isa AbstractDict && Set(keys(recovery)) ==
+        FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_FIELDS || error(
+            "fixed-root endpoint recovery policy fields are invalid"
+        )
+    string(required(recovery, "schema")) ==
+        FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_SCHEMA || error(
+            "fixed-root endpoint recovery policy schema is invalid"
+        )
+    string(required(recovery, "identity")) ==
+        FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_IDENTITY || error(
+            "fixed-root endpoint recovery policy identity is invalid"
+        )
+    string(required(recovery, "endpoint_order_rule")) ==
+        FIXED_ROOT_ENDPOINT_ORDER_RULE || error(
+            "fixed-root endpoint order rule is invalid"
+        )
+    string(required(recovery, "horizon_geometry_rule")) ==
+        FIXED_ROOT_HORIZON_GEOMETRY_RULE || error(
+            "fixed-root horizon geometry rule is invalid"
+        )
+    string(required(recovery, "infinity_geometry_rule")) ==
+        FIXED_ROOT_INFINITY_GEOMETRY_RULE || error(
+            "fixed-root infinity geometry rule is invalid"
+        )
+    base_order = parse_integer(recovery, "base_endpoint_order")
+    maximum_order = parse_integer(recovery, "generated_maximum_order")
+    base_order == parse_integer(request, "endpoint_series_order") &&
+        maximum_order == 4 * base_order || error(
+            "fixed-root endpoint order bounds are invalid"
+        )
+    raw_orders = required(recovery, "endpoint_order_schedule")
+    raw_orders isa AbstractVector || error(
+        "fixed-root endpoint order schedule is invalid"
+    )
+    all(value -> value isa Integer && !(value isa Bool), raw_orders) ||
+        error("fixed-root endpoint order schedule is invalid")
+    orders = Int[Int(value) for value in raw_orders]
+    !isempty(orders) && first(orders) == base_order &&
+        last(orders) == maximum_order && issorted(orders) &&
+        length(unique(orders)) == length(orders) || error(
+            "fixed-root endpoint order schedule is invalid"
+        )
+    for index in 1:(length(orders) - 1)
+        orders[index + 1] == min(2 * orders[index], maximum_order) ||
+            error("fixed-root endpoint order schedule violates its rule")
+    end
+    horizon = required(recovery, "horizon_geometry_schedule")
+    infinity = required(recovery, "infinity_geometry_schedule")
+    horizon isa AbstractVector && infinity isa AbstractVector || error(
+        "fixed-root endpoint geometry schedules are invalid"
+    )
+    horizon_values = BigFloat[parse(BigFloat, string(value)) for value in horizon]
+    infinity_values = BigFloat[parse(BigFloat, string(value)) for value in infinity]
+    !isempty(horizon_values) && all(value -> value < 0, horizon_values) &&
+        issorted(abs.(horizon_values)) &&
+        length(unique(horizon_values)) == length(horizon_values) &&
+        last(horizon_values) == parse_real(BigFloat, request, "rho_in") ||
+        error("fixed-root horizon geometry schedule is invalid")
+    !isempty(infinity_values) && all(value -> value > 0, infinity_values) &&
+        issorted(infinity_values) &&
+        length(unique(infinity_values)) == length(infinity_values) &&
+        last(infinity_values) == parse_real(BigFloat, request, "rho_out") ||
+        error("fixed-root infinity geometry schedule is invalid")
+    projection = required(request, "fixed_root_reliability_projection")
+    for field in (
+        "fixed_root_reliability_target_abs",
+        "fixed_root_reliability_rule",
+        "required_digit_guard",
+    )
+        isequal(required(recovery, field), required(projection, field)) ||
+            error("fixed-root endpoint recovery reliability binding is invalid")
+    end
+    parse_integer(recovery, "precision_digits") ==
+        parse_integer(request, "precision_digits") || error(
+            "fixed-root endpoint recovery precision is invalid"
+        )
+    string(required(recovery, "semantic_precision_tier")) ==
+        string(required(request, "semantic_precision_tier")) || error(
+            "fixed-root endpoint recovery tier is invalid"
+        )
+    binding = Dict{String,Any}(
+        string(key) => value for (key, value) in recovery
+        if string(key) != "policy_sha256"
+    )
+    canonical_sha256(binding) == string(required(recovery, "policy_sha256")) ||
+        error("fixed-root endpoint recovery policy digest is invalid")
+    return recovery
+end
+
 function validate_fixed_root_survey_request(request)
-    parse_integer(request, "schema_version") == 2 ||
+    parse_integer(request, "schema_version") == 3 ||
         error("fixed-root survey schema version is invalid")
     string(required(request, "schema")) == FIXED_ROOT_SURVEY_BATCH_SCHEMA ||
         error("fixed-root survey schema is invalid")
@@ -8633,6 +9013,7 @@ function validate_fixed_root_survey_request(request)
         end
     end
     validate_fixed_root_survey_policy(request)
+    validate_fixed_root_endpoint_recovery_policy(request)
     string(required(request, "resource_policy_schema")) ==
         "windows-solver.execution-resource-policy/1" ||
         error("fixed-root survey resource policy is invalid")
@@ -8782,6 +9163,23 @@ function fixed_root_survey_conditioning_fields(
     reliability_projection = required(
         request, "fixed_root_reliability_projection"
     )
+    recovery_policy = required(
+        request, "fixed_root_endpoint_recovery_policy"
+    )
+    endpoint_receipts = accumulator.exterior_endpoint_recovery_evidence
+    length(endpoint_receipts) == 2 || error(
+        "fixed-root survey lacks its two endpoint recovery receipts"
+    )
+    all(
+        receipt -> required(receipt, "aggregate_limitation") ==
+            CF.ENDPOINT_ADEQUATE,
+        endpoint_receipts,
+    ) || error("fixed-root survey retained an inadequate endpoint")
+    maximum_truncation_digits_lost = maximum(
+        parse(T, string(required(
+            receipt, "maximum_truncation_digits_lost"
+        ))) for receipt in endpoint_receipts
+    )
     return Dict{String,Any}(
         "schema" => FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA,
         "fixed_root_reliability_target_abs" =>
@@ -8806,6 +9204,12 @@ function fixed_root_survey_conditioning_fields(
             numeric_text(accumulator.maximum_series_digits_lost),
         "maximum_recurrence_digits_lost" =>
             numeric_text(accumulator.maximum_recurrence_digits_lost),
+        "maximum_series_evaluation_digits_lost" =>
+            numeric_text(accumulator.maximum_series_digits_lost),
+        "maximum_last_term_ratio" =>
+            numeric_text(accumulator.maximum_last_term_ratio),
+        "maximum_truncation_digits_lost" =>
+            numeric_text(maximum_truncation_digits_lost),
         "minimum_asymptotic_predicted_reliable_digits" =>
             numeric_text(minimum_asymptotic),
         "endpoint_remainders_regular" =>
@@ -8817,6 +9221,15 @@ function fixed_root_survey_conditioning_fields(
         "predicted_reliable_digits" => numeric_text(predicted_reliable_digits),
         "required_reliable_digits" => numeric_text(required_digits),
         "precision_limited" => predicted_reliable_digits < required_digits,
+        "endpoint_recovery_policy_identity" => string(required(
+            recovery_policy, "identity"
+        )),
+        "endpoint_recovery_policy_sha256" => string(required(
+            recovery_policy, "policy_sha256"
+        )),
+        "endpoint_receipts" => endpoint_receipts,
+        "aggregate_limitation" => CF.ENDPOINT_ADEQUATE,
+        "factored_homogeneous_rhs_evaluations_before_recovery_decision" => 0,
         "determinant_count" => accumulator.determinant_count,
     )
 end
@@ -8966,7 +9379,7 @@ function fixed_root_survey_batch_fields(
     length(outputs) == length(roles) ||
         error("fixed-root survey response count is invalid")
     return Dict{String,Any}(
-        "schema_version" => 2,
+        "schema_version" => 3,
         "schema" => FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA,
         "status" => "ok",
         "operation" => FIXED_ROOT_SURVEY_BATCH_OPERATION,

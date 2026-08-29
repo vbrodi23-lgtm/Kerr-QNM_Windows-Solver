@@ -36,8 +36,8 @@ def _resource() -> dict[str, object]:
 
 def _fixed_request() -> dict[str, object]:
     return {
-        "schema_version": 2,
-        "schema": "windows-solver.fixed-root-survey-batch/2",
+        "schema_version": 3,
+        "schema": "windows-solver.fixed-root-survey-batch/3",
         "operation": FIXED_ROOT_SURVEY_BATCH_OPERATION,
         "leaf_id": "leaf-fixed",
         "job_id": "job-fixed",
@@ -228,7 +228,7 @@ class OperationControlTests(unittest.TestCase):
                     failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
                     stage="asymptotic-preflight",
                     identity=identity,
-                    retryable=True,
+                    retryable=False,
                     retryable_basis="fixed-sample-contract/v1",
                     diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
                 )
@@ -319,7 +319,7 @@ class OperationControlTests(unittest.TestCase):
             failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
             stage="asymptotic-preflight",
             identity=fixed_identity,
-            retryable=True,
+            retryable=False,
             retryable_basis="precision-insufficiency/v1",
             diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
         )
@@ -351,7 +351,7 @@ class OperationControlTests(unittest.TestCase):
             failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
             stage="asymptotic-preflight",
             identity=identity,
-            retryable=True,
+            retryable=False,
             retryable_basis="precision-insufficiency/v1",
             diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
         )
@@ -373,7 +373,7 @@ class OperationControlTests(unittest.TestCase):
             failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
             stage="asymptotic-preflight",
             identity=identity,
-            retryable=True,
+            retryable=False,
             retryable_basis="precision-insufficiency/v1",
             diagnostics={},
         )
@@ -396,7 +396,7 @@ class OperationControlTests(unittest.TestCase):
             failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
             stage="asymptotic-preflight",
             identity=identity,
-            retryable=True,
+            retryable=False,
             retryable_basis="precision-insufficiency/v1",
             diagnostics=diagnostics,
         )
@@ -450,7 +450,7 @@ class OperationControlTests(unittest.TestCase):
             failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
             stage="asymptotic-preflight",
             identity=identity,
-            retryable=False,
+            retryable=True,
             retryable_basis="caller-declared non-retryable/v1",
             diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
         )
@@ -489,10 +489,14 @@ class OperationControlTests(unittest.TestCase):
             if transition.operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
         }
         self.assertEqual(
-            NUMERICAL_CONTROL_FAILURE_CODES
+            (NUMERICAL_CONTROL_FAILURE_CODES
             - {
                 "FINITE_DIFFERENCE_NOISE_LIMIT",
                 "DETERMINANT_UNCERTAINTY_TOO_LARGE",
+            }) | {
+                "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE",
+                "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED",
+                "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
             },
             fixed_codes - {"ODE_RESOURCE_LIMIT", "WORKER_TIMEOUT"},
         )
@@ -502,7 +506,11 @@ class OperationControlTests(unittest.TestCase):
             if transition.operation == FIXED_ROOT_DETERMINANT_SAMPLE_OPERATION
         }
         self.assertEqual(
-            fixed_codes,
+            fixed_codes - {
+                "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE",
+                "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED",
+                "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
+            },
             determinant_codes,
         )
 
@@ -558,7 +566,7 @@ class OperationControlTests(unittest.TestCase):
                 failure_code="INSUFFICIENT_ASYMPTOTIC_PRECISION",
                 stage="asymptotic-preflight",
                 identity=identity,
-                retryable=True,
+                retryable=False,
                 retryable_basis="worker-requested-retry/v1",
                 diagnostics={"reason": "INSUFFICIENT_ASYMPTOTIC_PRECISION"},
             ),
@@ -573,12 +581,12 @@ class OperationControlTests(unittest.TestCase):
         self.assertEqual("UNRESOLVED", transition.disposition)
         self.assertIsNone(transition.next_tier)
 
-    def test_observed_bf40_failure_promotes_only_response_to_bf80(self) -> None:
+    def test_arithmetic_only_bf40_failure_promotes_response_to_bf80(self) -> None:
         transition = next(
             item
             for item in PROMOTED_CONTROL_TRANSITIONS.values()
             if item.operation == FIXED_ROOT_SURVEY_BATCH_OPERATION
-            and item.failure_code == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+            and item.failure_code == "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE"
             and item.current_tier == "BF40"
         )
         self.assertEqual(JULIA_WORKER_ORIGIN, transition.origin)

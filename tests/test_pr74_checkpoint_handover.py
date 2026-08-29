@@ -135,7 +135,7 @@ def _backend_with_adapter(
 
 
 class PR74CheckpointHandoverTests(unittest.TestCase):
-    def test_exact_failed_checkpoint_hands_ordinal_one_to_fresh_request_v2(self):
+    def test_exact_failed_checkpoint_hands_ordinal_one_to_fresh_request_v3(self):
         checkpoint, manifest = _load_fixture()
         self.assertEqual(
             manifest["source_checkpoint_sha256"],
@@ -274,7 +274,7 @@ class PR74CheckpointHandoverTests(unittest.TestCase):
             request_binding
         )
         self.assertEqual(canonical_request["schema"], FIXED_ROOT_SURVEY_BATCH_SCHEMA)
-        self.assertEqual(canonical_request["schema_version"], 2)
+        self.assertEqual(canonical_request["schema_version"], 3)
         self.assertEqual(wire_request["request_sha256"], request_sha256)
         self.assertEqual(wire_request["execution_identity"]["scope"], "REQUEST")
         self.assertNotIn("sample_index", wire_request["execution_identity"])
@@ -434,7 +434,7 @@ class PR74CheckpointHandoverTests(unittest.TestCase):
         self.assertEqual(
             dispatched_binding["schema"], FIXED_ROOT_SURVEY_BATCH_SCHEMA
         )
-        self.assertEqual(dispatched_binding["schema_version"], 2)
+        self.assertEqual(dispatched_binding["schema_version"], 3)
         self.assertEqual(
             dispatched_binding["leaf_id"], ordinal_one["leaf_id"]
         )

@@ -57,8 +57,54 @@ def _job():
 def _conditioning(request) -> dict[str, object]:
     policy = request["policy"]
     projection = request["fixed_root_reliability_projection"]
+    recovery = request["fixed_root_endpoint_recovery_policy"]
+    receipts = []
+    for branch, schedule_name in (
+        ("horizon-ingoing", "horizon_geometry_schedule"),
+        ("infinity-outgoing", "infinity_geometry_schedule"),
+    ):
+        geometry = recovery[schedule_name][0]
+        order = recovery["endpoint_order_schedule"][0]
+        attempt = {
+            "endpoint_branch": branch,
+            "attempted_endpoint_order": order,
+            "attempted_geometry": geometry,
+            "maximum_last_term_ratio": "1e-20",
+            "maximum_truncation_digits_lost": "0",
+            "maximum_recurrence_digits_lost": "1",
+            "maximum_series_evaluation_digits_lost": "1",
+            "predicted_reliable_digits": "35",
+            "required_reliable_digits": (
+                "16.698970004336018804786261105275506973231810118538"
+            ),
+            "candidate_limitation": "adequate/v1",
+            "selected_intervention": "ENTER_HOMOGENEOUS_ODE",
+            "result": "ADEQUATE",
+        }
+        receipts.append({
+            "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
+            "endpoint_branch": branch,
+            "recovery_policy_identity": recovery["identity"],
+            "recovery_policy_sha256": recovery["policy_sha256"],
+            "base_endpoint_order": recovery["base_endpoint_order"],
+            "generated_maximum_order": recovery["generated_maximum_order"],
+            "attempted_endpoint_orders": [order],
+            "terminal_endpoint_order": order,
+            "candidate_geometry_schedule": recovery[schedule_name],
+            "terminal_geometry": geometry,
+            "maximum_last_term_ratio": "1e-20",
+            "maximum_truncation_digits_lost": "0",
+            "maximum_recurrence_digits_lost": "1",
+            "maximum_series_evaluation_digits_lost": "1",
+            "predicted_reliable_digits": "35",
+            "required_reliable_digits": attempt["required_reliable_digits"],
+            "candidate_limitation": "adequate/v1",
+            "aggregate_limitation": "adequate/v1",
+            "factored_homogeneous_rhs_evaluations": 0,
+            "attempts": [attempt],
+        })
     return {
-        "schema": "windows-solver.fixed-root-survey-conditioning/2",
+        "schema": "windows-solver.fixed-root-survey-conditioning/3",
         "fixed_root_reliability_target_abs": projection[
             "fixed_root_reliability_target_abs"
         ],
@@ -76,6 +122,9 @@ def _conditioning(request) -> dict[str, object]:
         "determinant_normalisation": policy["determinant_normalisation"],
         "maximum_series_digits_lost": "1",
         "maximum_recurrence_digits_lost": "1",
+        "maximum_series_evaluation_digits_lost": "1",
+        "maximum_last_term_ratio": "1e-20",
+        "maximum_truncation_digits_lost": "0",
         "minimum_asymptotic_predicted_reliable_digits": "35",
         "endpoint_remainders_regular": True,
         "maximum_endpoint_reconstruction_error": "1e-30",
@@ -85,6 +134,11 @@ def _conditioning(request) -> dict[str, object]:
             "16.698970004336018804786261105275506973231810118538"
         ),
         "precision_limited": False,
+        "endpoint_recovery_policy_identity": recovery["identity"],
+        "endpoint_recovery_policy_sha256": recovery["policy_sha256"],
+        "endpoint_receipts": receipts,
+        "aggregate_limitation": "adequate/v1",
+        "factored_homogeneous_rhs_evaluations_before_recovery_decision": 0,
         "determinant_count": 1,
     }
 
@@ -110,7 +164,7 @@ class _BatchAdapter:
             request_sha256=request_sha256,
         )
         response = {
-            "schema_version": 2,
+            "schema_version": 3,
             "schema": FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA,
             "status": "ok",
             "operation": FIXED_ROOT_SURVEY_BATCH_OPERATION,
@@ -478,7 +532,7 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
         self.assertEqual(batch.sample_count, 9)
         request = adapter.requests[0]
         self.assertEqual(request["operation"], FIXED_ROOT_SURVEY_BATCH_OPERATION)
-        self.assertEqual(request["schema_version"], 2)
+        self.assertEqual(request["schema_version"], 3)
         self.assertEqual(request["schema"], FIXED_ROOT_SURVEY_BATCH_SCHEMA)
         self.assertEqual(request["plan"], FixedRootSurveyPlan.FULL_NINE.value)
         self.assertEqual(

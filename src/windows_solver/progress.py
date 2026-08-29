@@ -13,7 +13,7 @@ from types import MappingProxyType
 from typing import Protocol
 
 
-PROGRESS_SCHEMA = "windows-solver.progress/2"
+PROGRESS_SCHEMA = "windows-solver.progress/3"
 
 
 class ProgressMode(StrEnum):
@@ -112,6 +112,12 @@ class ProgressEventKind(StrEnum):
     HORIZON_ENDPOINTS_VERIFIED = "horizon_endpoints_verified"
     OUTER_ENDPOINT_SELECTED = "outer_endpoint_selected"
     OUTER_ENDPOINT_PAIR_SELECTED = "outer_endpoint_pair_selected"
+    EXTERIOR_ENDPOINT_RECOVERY_ATTEMPT = (
+        "exterior_endpoint_recovery_attempt"
+    )
+    EXTERIOR_ENDPOINT_RECOVERY_DECIDED = (
+        "exterior_endpoint_recovery_decided"
+    )
     COORDINATE_IDENTITY_CHECKED = "coordinate_identity_checked"
     COORDINATE_INVERSION_STALLED = "coordinate_inversion_stalled"
     DETERMINANT_ERROR_ESTIMATED = "determinant_error_estimated"

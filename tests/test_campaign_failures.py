@@ -78,7 +78,7 @@ class CampaignFailureTests(unittest.TestCase):
 
     def test_reviewed_screening_reasons_are_closed_and_bind_queue_kind(self) -> None:
         expected = {
-            "INSUFFICIENT_ASYMPTOTIC_PRECISION": "RESPONSE",
+            "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE": "RESPONSE",
             "HORIZON_ARITHMETIC_INADEQUATE": "RESPONSE",
             "ROOT_UNCERTAINTY_EVIDENCE_UNAVAILABLE": "ROOT",
             "FINITE_DIFFERENCE_NOISE_LIMIT": "RESPONSE",

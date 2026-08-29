@@ -3300,6 +3300,15 @@ def _control_trace_fields(outcome: PromotedPassOutcome) -> dict[str, object]:
         if isinstance(receipt, Mapping)
         else None
     )
+    diagnostics = (
+        receipt.get("diagnostics") if isinstance(receipt, Mapping) else None
+    )
+    endpoint_receipts = (
+        diagnostics.get("endpoint_receipts")
+        if isinstance(diagnostics, Mapping)
+        and isinstance(diagnostics.get("endpoint_receipts"), list)
+        else []
+    )
     return {
         "operation": (
             raw.get("operation")
@@ -3326,6 +3335,34 @@ def _control_trace_fields(outcome: PromotedPassOutcome) -> dict[str, object]:
         "current_action_kind": decision.get("current_action_kind"),
         "current_tier": decision.get("current_tier"),
         "next_tier": decision.get("next_tier"),
+        "endpoint_branches": [
+            item.get("endpoint_branch") for item in endpoint_receipts
+            if isinstance(item, Mapping)
+        ],
+        "attempted_endpoint_orders": [
+            item.get("attempted_endpoint_orders") for item in endpoint_receipts
+            if isinstance(item, Mapping)
+        ],
+        "attempted_endpoint_geometries": [
+            [
+                attempt.get("attempted_geometry")
+                for attempt in item.get("attempts", [])
+                if isinstance(attempt, Mapping)
+            ]
+            for item in endpoint_receipts if isinstance(item, Mapping)
+        ],
+        "limiting_resource": (
+            diagnostics.get("aggregate_limitation")
+            if isinstance(diagnostics, Mapping) else None
+        ),
+        "selected_intervention": (
+            diagnostics.get("selected_intervention")
+            if isinstance(diagnostics, Mapping) else None
+        ),
+        "endpoint_recovery_result": (
+            diagnostics.get("result")
+            if isinstance(diagnostics, Mapping) else None
+        ),
     }
 
 
@@ -3560,30 +3597,9 @@ def reduce_promoted_exterior_from_checkpoint(
     stage_sha256 = retained_stage.get("stage_sha256")
     if not isinstance(stage_sha256, str) or len(stage_sha256) != 64:
         raise ValueError("retained exterior calculation stage digest is invalid")
-    limited_families = tuple(
-        family
-        for family, roles in (
-            ("DOMEGA", BINARY64_FIXED_ROOT_SAMPLE_ROLES[1:5]),
-            ("D_C", BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:]),
-        )
-        if all(
-            sample.numerical_conditioning.mapping["precision_limited"] is True
-            for sample in composite.samples
-            if sample.role in roles
-        )
-    )
-    precision_insufficient = bool(limited_families)
     return PromotedPassOutcome(
-        disposition=(
-            SurveyDisposition.UNRESOLVED
-            if precision_insufficient
-            else SurveyDisposition.CALCULATED_AWAITING_ADMISSION
-        ),
-        reason_code=(
-            "INSUFFICIENT_ASYMPTOTIC_PRECISION"
-            if precision_insufficient
-            else "AWAITING_INDEPENDENT_REVIEW_ADMISSION"
-        ),
+        disposition=SurveyDisposition.CALCULATED_AWAITING_ADMISSION,
+        reason_code="AWAITING_INDEPENDENT_REVIEW_ADMISSION",
         precision_tiers=tuple(str(item) for item in tiers),
         operation_identity="promoted-exterior-checkpoint-reduction/v1",
         sample_count=int(counters[0]),
@@ -4529,7 +4545,7 @@ def _run_promoted_exterior_queue_entry(
             disposition=SurveyDisposition.UNRESOLVED,
             reason_code=control_receipt.failure_code,
             precision_tiers=tuple(tiers),
-            operation_identity="promoted-exterior-control-return/v2",
+            operation_identity="promoted-exterior-control-return/v3",
             sample_count=sample_count,
             root_read_count=root_reads,
             worker_launch_count=worker_launches,
@@ -7449,7 +7465,7 @@ def run_promoted_survey(
                                         else None
                                     ),
                                     operation_identity=(
-                                        "promoted-fixed-root-survey/v2"
+                                        "promoted-fixed-root-survey/v3"
                                     ),
                                     background_receipt_sha256=(
                                         details.get("background_receipt_sha256")

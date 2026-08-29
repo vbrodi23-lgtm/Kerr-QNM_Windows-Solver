@@ -165,7 +165,11 @@ class PR75FixedRootProcessSeamTests(unittest.TestCase):
         receipt = error.control_receipt
         self.assertEqual(receipt.origin, JULIA_WORKER_ORIGIN)
         self.assertEqual(
-            receipt.failure_code, "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+            receipt.failure_code, "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE"
+        )
+        self.assertEqual(
+            receipt.mapping["diagnostics"]["aggregate_limitation"],
+            "insufficient-arithmetic-precision/v1",
         )
         self.assertEqual(receipt.identity.operation, "fixed-root-survey-batch")
         self.assertEqual(receipt.identity.mapping["scope"], "SAMPLE")

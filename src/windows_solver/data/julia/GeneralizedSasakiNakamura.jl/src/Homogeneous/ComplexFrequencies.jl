@@ -63,6 +63,9 @@ export horizon_endpoint_candidates, select_verified_horizon_endpoints
 export select_horizon_endpoint_best_prefix
 export horizon_endpoint_prefix_orders
 export recover_verified_horizon_endpoint_pair
+export SingleEndpointRecoveryCandidate, SingleEndpointRecovery
+export recover_single_factored_endpoint, aggregate_endpoint_limitations
+export canonical_single_endpoint_recovery_evidence
 export verified_horizon_endpoints_from_recovery
 export canonical_horizon_endpoint_search_evidence
 export NO_GEOMETRY_VALID_CANDIDATE, MAX_SERIES_ORDER_INADEQUATE
@@ -1238,7 +1241,11 @@ function _build_factored_initial_condition(
     spectral::HomogeneousSpectralContext{T},
     contour::ComplexContourContext{T},
     branch::CarrierKind,
+    order::Int,
 ) where {T<:AbstractFloat}
+    0 <= order <= spectral.endpoint_order || throw(ArgumentError(
+        "factored endpoint prefix order is outside the generated series"
+    ))
     series = _branch_series(spectral.series, branch)
     if branch === INFINITY_OUTGOING
         return factored_infinity_outgoing_initialconditions(
@@ -1248,7 +1255,7 @@ function _build_factored_initial_condition(
             contour.radius_from_rho,
             spectral.convention,
             spectral.contract;
-            order=spectral.endpoint_order,
+            order=order,
         )
     elseif branch === HORIZON_INGOING
         return factored_horizon_ingoing_initialconditions(
@@ -1258,7 +1265,7 @@ function _build_factored_initial_condition(
             contour.radius_from_rho,
             spectral.convention,
             spectral.contract;
-            order=spectral.endpoint_order,
+            order=order,
         )
     elseif branch === HORIZON_OUTGOING
         return factored_horizon_outgoing_initialconditions(
@@ -1268,7 +1275,7 @@ function _build_factored_initial_condition(
             contour.radius_from_rho,
             spectral.convention,
             spectral.contract;
-            order=spectral.endpoint_order,
+            order=order,
         )
     end
     throw(ArgumentError("unsupported factored endpoint branch"))
@@ -1279,6 +1286,7 @@ function _prepare_factored_endpoint(
     contour::ComplexContourContext{T},
     branch::CarrierKind,
     required_digits::T,
+    order::Int,
 ) where {T<:AbstractFloat}
     return _translate_factored_failure(
         T,
@@ -1301,7 +1309,7 @@ function _prepare_factored_endpoint(
             _assert_contour_context_provenance(spectral, contour)
             series = _branch_series(spectral.series, branch)
             initial_condition = _build_factored_initial_condition(
-                spectral, contour, branch
+                spectral, contour, branch, order
             )
             initial_condition.regularity.finite || throw(ArgumentError(
                 "regular-remainder endpoint evidence is not finite"
@@ -1315,7 +1323,7 @@ function _prepare_factored_endpoint(
                 assessment,
                 required_digits,
                 spectral.precision_bits,
-                spectral.endpoint_order,
+                order,
                 spectral.frozen_branch_cell,
                 spectral.contour_deformation,
             )
@@ -1327,9 +1335,10 @@ function prepare_factored_infinity_outgoing(
     spectral::HomogeneousSpectralContext{T},
     contour::ComplexContourContext{T},
     required_digits::T,
+    ; order::Int=spectral.endpoint_order,
 ) where {T<:AbstractFloat}
     return _prepare_factored_endpoint(
-        spectral, contour, INFINITY_OUTGOING, required_digits
+        spectral, contour, INFINITY_OUTGOING, required_digits, order
     )
 end
 
@@ -1337,9 +1346,10 @@ function prepare_factored_horizon_ingoing(
     spectral::HomogeneousSpectralContext{T},
     contour::ComplexContourContext{T},
     required_digits::T,
+    ; order::Int=spectral.endpoint_order,
 ) where {T<:AbstractFloat}
     return _prepare_factored_endpoint(
-        spectral, contour, HORIZON_INGOING, required_digits
+        spectral, contour, HORIZON_INGOING, required_digits, order
     )
 end
 
@@ -1347,9 +1357,10 @@ function prepare_factored_horizon_outgoing(
     spectral::HomogeneousSpectralContext{T},
     contour::ComplexContourContext{T},
     required_digits::T,
+    ; order::Int=spectral.endpoint_order,
 ) where {T<:AbstractFloat}
     return _prepare_factored_endpoint(
-        spectral, contour, HORIZON_OUTGOING, required_digits
+        spectral, contour, HORIZON_OUTGOING, required_digits, order
     )
 end
 
@@ -1457,12 +1468,12 @@ function _assert_preparation_provenance(
                 spectral.precision_bits,
                 "prepared required_digits do not preserve request precision",
             ))
-            preparation.endpoint_order == spectral.endpoint_order || throw(
+            0 <= preparation.endpoint_order <= spectral.endpoint_order || throw(
                 _factored_error(
                     T,
                     INVALID_FACTORED_PROPAGATION_INPUT,
                     spectral.precision_bits,
-                    "prepared endpoint order differs from spectral context",
+                    "prepared endpoint order exceeds the generated series",
                 )
             )
             _branch_cells_match_exactly(
@@ -1490,7 +1501,8 @@ function _assert_preparation_provenance(
                 "prepared, spectral, and contour deformations differ",
             ))
             expected_initial_condition = _build_factored_initial_condition(
-                spectral, contour, preparation.branch
+                spectral, contour, preparation.branch,
+                preparation.endpoint_order,
             )
             _factored_initial_conditions_match_exactly(
                 preparation.initial_condition, expected_initial_condition
@@ -2728,11 +2740,10 @@ end
 # cancellation needs more precision; one already past its optimal truncation at
 # this radius needs a radius nearer the horizon, and neither more order nor
 # more precision will move it.
-const HORIZON_ENDPOINT_ADEQUATE = "adequate/v1"
-const HORIZON_ENDPOINT_ORDER_LIMITED = "insufficient-series-order/v1"
-const HORIZON_ENDPOINT_PRECISION_LIMITED =
-    "insufficient-arithmetic-precision/v1"
-const HORIZON_ENDPOINT_GEOMETRY_LIMITED = "insufficient-geometric-depth/v1"
+const HORIZON_ENDPOINT_ADEQUATE = ENDPOINT_ADEQUATE
+const HORIZON_ENDPOINT_ORDER_LIMITED = ENDPOINT_SERIES_ORDER_LIMITED
+const HORIZON_ENDPOINT_PRECISION_LIMITED = ENDPOINT_ARITHMETIC_LIMITED
+const HORIZON_ENDPOINT_GEOMETRY_LIMITED = ENDPOINT_GEOMETRY_LIMITED
 const NO_GEOMETRY_VALID_CANDIDATE = "no-geometry-valid-candidate/v1"
 const MAX_SERIES_ORDER_INADEQUATE = "maximum-series-order-inadequate/v1"
 const ARITHMETIC_PRECISION_INADEQUATE = "arithmetic-precision-inadequate/v1"
@@ -2810,17 +2821,191 @@ function horizon_endpoint_limitation(
     binding = argmin(
         assessment -> assessment.predicted_reliable_digits, assessments
     )
-    # A last-term ratio at or above one means the series has already passed its
-    # smallest term at this radius. Adding orders makes the tail grow and no
-    # number of digits outruns a divergent remainder; only a radius nearer the
-    # horizon moves this candidate.
-    binding.maximum_last_term_ratio >= one(T) &&
-        return HORIZON_ENDPOINT_GEOMETRY_LIMITED
-    arithmetic_loss = binding.maximum_recurrence_digits_lost +
-        binding.maximum_series_evaluation_digits_lost
-    return arithmetic_loss >= binding.maximum_truncation_digits_lost ?
-        HORIZON_ENDPOINT_PRECISION_LIMITED :
-        HORIZON_ENDPOINT_ORDER_LIMITED
+    return asymptotic_endpoint_limitation(binding)
+end
+
+"""One causal attempt for one factored exterior endpoint."""
+struct SingleEndpointRecoveryCandidate{T<:AbstractFloat}
+    endpoint_branch::String
+    endpoint_order::Int
+    geometry::T
+    preparation::FactoredEndpointPreparation{T}
+    payload::Any
+    limitation::String
+    selected_intervention::String
+    result::String
+end
+
+"""Complete bounded same-tier recovery history for one endpoint branch."""
+struct SingleEndpointRecovery{T<:AbstractFloat}
+    endpoint_branch::String
+    policy_identity::String
+    endpoint_orders::Vector{Int}
+    geometry_schedule::Vector{T}
+    candidates::Vector{SingleEndpointRecoveryCandidate{T}}
+    terminal::SingleEndpointRecoveryCandidate{T}
+    outcome::String
+    factored_homogeneous_rhs_evaluations::Int
+end
+
+"""
+    recover_single_factored_endpoint(branch, orders, geometries, policy, prepare)
+
+Run one bounded causal endpoint ladder without entering the homogeneous ODE.
+`prepare(order, geometry)` returns `(preparation, payload)`, where `payload`
+retains branch-specific contour data required if the candidate is selected.
+"""
+function recover_single_factored_endpoint(
+    endpoint_branch::AbstractString,
+    endpoint_orders::Vector{Int},
+    geometry_schedule::Vector{T},
+    policy_identity::AbstractString,
+    prepare_candidate::F;
+    factored_homogeneous_rhs_counter::Base.RefValue{Int}=Ref(0),
+) where {T<:AbstractFloat,F}
+    isempty(endpoint_orders) && throw(ArgumentError(
+        "single-endpoint recovery order schedule must be nonempty"
+    ))
+    isempty(geometry_schedule) && throw(ArgumentError(
+        "single-endpoint recovery geometry schedule must be nonempty"
+    ))
+    all(order -> order > 0, endpoint_orders) &&
+        issorted(endpoint_orders) &&
+        length(unique(endpoint_orders)) == length(endpoint_orders) ||
+        throw(ArgumentError("single-endpoint recovery orders are invalid"))
+    length(unique(geometry_schedule)) == length(geometry_schedule) ||
+        throw(ArgumentError("single-endpoint recovery geometry is duplicated"))
+    factored_homogeneous_rhs_counter[] == 0 || throw(ArgumentError(
+        "single-endpoint recovery began after homogeneous RHS work"
+    ))
+    order_index = 1
+    geometry_index = 1
+    candidates = SingleEndpointRecoveryCandidate{T}[]
+    while true
+        order = endpoint_orders[order_index]
+        geometry = geometry_schedule[geometry_index]
+        preparation, payload = prepare_candidate(order, geometry)
+        factored_homogeneous_rhs_counter[] == 0 || throw(ArgumentError(
+            "homogeneous RHS executed during endpoint recovery"
+        ))
+        limitation = asymptotic_endpoint_limitation(preparation.assessment)
+        intervention, result, terminal = if limitation == ENDPOINT_ADEQUATE
+            ("ENTER_HOMOGENEOUS_ODE", "ADEQUATE", true)
+        elseif limitation == ENDPOINT_SERIES_ORDER_LIMITED
+            order_index < length(endpoint_orders) ?
+                ("INCREASE_ENDPOINT_ORDER", "RETRY", false) :
+                ("NONE", "ORDER_EXHAUSTED", true)
+        elseif limitation == ENDPOINT_GEOMETRY_LIMITED
+            geometry_index < length(geometry_schedule) ?
+                ("DEEPEN_ENDPOINT_GEOMETRY", "RETRY", false) :
+                ("NONE", "GEOMETRY_EXHAUSTED", true)
+        elseif limitation == ENDPOINT_ARITHMETIC_LIMITED
+            ("PROMOTE_ARITHMETIC_TIER_IF_AGGREGATE_ALLOWS",
+             "ARITHMETIC_INADEQUATE", true)
+        else
+            throw(ArgumentError("unknown endpoint limitation"))
+        end
+        candidate = SingleEndpointRecoveryCandidate{T}(
+            String(endpoint_branch), order, geometry, preparation, payload,
+            limitation, intervention, result,
+        )
+        push!(candidates, candidate)
+        terminal && return SingleEndpointRecovery{T}(
+            String(endpoint_branch), String(policy_identity),
+            copy(endpoint_orders), copy(geometry_schedule), candidates,
+            candidate, limitation, factored_homogeneous_rhs_counter[],
+        )
+        if limitation == ENDPOINT_SERIES_ORDER_LIMITED
+            order_index += 1
+        else
+            geometry_index += 1
+            order_index = 1
+        end
+    end
+end
+
+"""Apply the determinant-wide mixed-blocker rule to endpoint limitations."""
+function aggregate_endpoint_limitations(limitations)
+    values = collect(limitations)
+    isempty(values) && throw(ArgumentError(
+        "endpoint limitation aggregate must be nonempty"
+    ))
+    all(==(ENDPOINT_ADEQUATE), values) && return ENDPOINT_ADEQUATE
+    any(==(ENDPOINT_SERIES_ORDER_LIMITED), values) &&
+        return ENDPOINT_SERIES_ORDER_LIMITED
+    any(==(ENDPOINT_GEOMETRY_LIMITED), values) &&
+        return ENDPOINT_GEOMETRY_LIMITED
+    all(value -> value in (ENDPOINT_ADEQUATE, ENDPOINT_ARITHMETIC_LIMITED), values) &&
+        any(==(ENDPOINT_ARITHMETIC_LIMITED), values) &&
+        return ENDPOINT_ARITHMETIC_LIMITED
+    throw(ArgumentError("endpoint limitation aggregate is inconsistent"))
+end
+
+function _single_endpoint_attempt_evidence(candidate)
+    assessment = candidate.preparation.assessment
+    return Dict{String,Any}(
+        "endpoint_branch" => candidate.endpoint_branch,
+        "attempted_endpoint_order" => candidate.endpoint_order,
+        "attempted_geometry" => string(candidate.geometry),
+        "maximum_last_term_ratio" => string(assessment.maximum_last_term_ratio),
+        "maximum_truncation_digits_lost" =>
+            string(assessment.maximum_truncation_digits_lost),
+        "maximum_recurrence_digits_lost" =>
+            string(assessment.maximum_recurrence_digits_lost),
+        "maximum_series_evaluation_digits_lost" =>
+            string(assessment.maximum_series_evaluation_digits_lost),
+        "predicted_reliable_digits" =>
+            string(assessment.predicted_reliable_digits),
+        "required_reliable_digits" => string(assessment.required_digits),
+        "candidate_limitation" => candidate.limitation,
+        "selected_intervention" => candidate.selected_intervention,
+        "result" => candidate.result,
+    )
+end
+
+"""Return the complete terminal receipt crossing the Julia/Python boundary."""
+function canonical_single_endpoint_recovery_evidence(
+    recovery::SingleEndpointRecovery;
+    aggregate_limitation::AbstractString=recovery.outcome,
+)
+    attempts = [_single_endpoint_attempt_evidence(candidate)
+                for candidate in recovery.candidates]
+    terminal = recovery.terminal.preparation.assessment
+    return Dict{String,Any}(
+        "schema" => "windows-solver.exterior-endpoint-recovery-receipt/1",
+        "endpoint_branch" => recovery.endpoint_branch,
+        "recovery_policy_identity" => recovery.policy_identity,
+        "base_endpoint_order" => first(recovery.endpoint_orders),
+        "generated_maximum_order" => last(recovery.endpoint_orders),
+        "attempted_endpoint_orders" =>
+            [candidate.endpoint_order for candidate in recovery.candidates],
+        "terminal_endpoint_order" => recovery.terminal.endpoint_order,
+        "candidate_geometry_schedule" => string.(recovery.geometry_schedule),
+        "terminal_geometry" => string(recovery.terminal.geometry),
+        "maximum_last_term_ratio" => string(maximum(
+            candidate.preparation.assessment.maximum_last_term_ratio
+            for candidate in recovery.candidates
+        )),
+        "maximum_truncation_digits_lost" => string(maximum(
+            candidate.preparation.assessment.maximum_truncation_digits_lost
+            for candidate in recovery.candidates
+        )),
+        "maximum_recurrence_digits_lost" => string(maximum(
+            candidate.preparation.assessment.maximum_recurrence_digits_lost
+            for candidate in recovery.candidates
+        )),
+        "maximum_series_evaluation_digits_lost" => string(maximum(
+            candidate.preparation.assessment.maximum_series_evaluation_digits_lost
+            for candidate in recovery.candidates
+        )),
+        "predicted_reliable_digits" => string(terminal.predicted_reliable_digits),
+        "required_reliable_digits" => string(terminal.required_digits),
+        "candidate_limitation" => recovery.outcome,
+        "aggregate_limitation" => String(aggregate_limitation),
+        "factored_homogeneous_rhs_evaluations" =>
+            recovery.factored_homogeneous_rhs_evaluations,
+        "attempts" => attempts,
+    )
 end
 
 """

@@ -336,7 +336,7 @@ class PR75FixedRootLifecycleTests(unittest.TestCase):
         self.assertEqual(final_stage["worker_launch_count"], 4)
         self.assertEqual(
             final_stage["calculation_artifact"]["schema"],
-            "windows-solver.promoted-exterior-calculation/3",
+            "windows-solver.promoted-exterior-calculation/4",
         )
         self.assertNotIn("BF120", json.dumps(resumed.checkpoint))
 

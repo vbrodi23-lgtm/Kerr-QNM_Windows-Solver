@@ -686,13 +686,26 @@ _FIXED_ROOT_SURVEY_CONTROL_STAGE: Mapping[str, tuple[str, ...]] = (
             "determinant-chart",
             "homogeneous-propagation",
         ),
+        "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE": (
+            "asymptotic-preflight",
+        ),
+        "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED": (
+            "asymptotic-preflight",
+        ),
+        "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE": (
+            "asymptotic-preflight",
+        ),
         "ODE_RESOURCE_LIMIT": ("homogeneous-propagation",),
         "WORKER_TIMEOUT": ("worker-supervision",),
     })
 )
 _FIXED_ROOT_DETERMINANT_CONTROL_STAGE: Mapping[str, tuple[str, ...]] = (
     MappingProxyType({
-        **dict(_FIXED_ROOT_SURVEY_CONTROL_STAGE),
+        **{
+            code: stages
+            for code, stages in _FIXED_ROOT_SURVEY_CONTROL_STAGE.items()
+            if not code.startswith("EXTERIOR_ENDPOINT_")
+        },
         "WORKER_TIMEOUT": ("worker-supervision",),
     })
 )
@@ -711,8 +724,8 @@ _CONTROL_STAGE_BY_OPERATION: Mapping[
 # The Julia worker emits ``true`` only for these bounded continuation outcomes;
 # all other registered operation-control outcomes are non-retryable.
 _RETRYABLE_OPERATION_CONTROL_CODES = frozenset({
-    "INSUFFICIENT_ASYMPTOTIC_PRECISION",
     "HORIZON_ARITHMETIC_INADEQUATE",
+    "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
     "ODE_RESOURCE_LIMIT",
     "ROOT_READOUT_RESOURCE_INFEASIBLE",
     "WORKER_TIMEOUT",
@@ -763,8 +776,8 @@ def _validate_registered_control_emission(
         raise ValueError("operation control retryability contradicts its code")
 
 _PROMOTION_CODES: Mapping[str, str] = MappingProxyType({
-    "INSUFFICIENT_ASYMPTOTIC_PRECISION": "RESPONSE",
     "HORIZON_ARITHMETIC_INADEQUATE": "RESPONSE",
+    "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE": "RESPONSE",
     "ROOT_UNCERTAINTY_EVIDENCE_UNAVAILABLE": "ROOT",
     "FINITE_DIFFERENCE_NOISE_LIMIT": "RESPONSE",
     "DETERMINANT_ERROR_EVIDENCE_UNAVAILABLE": "RESPONSE",

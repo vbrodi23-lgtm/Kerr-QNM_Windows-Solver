@@ -51,6 +51,7 @@ from windows_solver.operation_control import (
     OPERATION_EXECUTION_IDENTITY_SCHEMA,
     OperationExecutionIdentity,
     build_operation_control_receipt,
+    expected_operation_control_retryability,
     execution_identity_from_request,
     operation_execution_identity,
     validate_operation_control_receipt,
@@ -115,9 +116,34 @@ def _requested_contract(kwargs):
 
 def _fixture_fixed_root_request(job, digits: int, kwargs):
     contract = _requested_contract(kwargs)
+    recovery_binding = {
+        "schema": "windows-solver.fixed-root-endpoint-recovery-policy/1",
+        "identity": "cause-aware-fixed-root-exterior-endpoint-recovery/v1",
+        "endpoint_order_rule": "bounded-doubling-prefix/v1",
+        "base_endpoint_order": 28,
+        "generated_maximum_order": 112,
+        "endpoint_order_schedule": [28, 56, 112],
+        "horizon_geometry_rule": "bounded-negative-rho-depth/v1",
+        "horizon_geometry_schedule": ["-5000", "-10000", "-20000"],
+        "infinity_geometry_rule": "bounded-positive-rho-depth/v1",
+        "infinity_geometry_schedule": [
+            "100", "250", "500", "1000", "2000", "5000", "10000", "20000"
+        ],
+        "fixed_root_reliability_target_abs": "2e-11",
+        "fixed_root_reliability_rule": (
+            "minus-log10-target-plus-required-digit-guard/v1"
+        ),
+        "required_digit_guard": 6,
+        "precision_digits": digits,
+        "semantic_precision_tier": f"bigfloat-{digits}",
+    }
+    recovery = {
+        **recovery_binding,
+        "policy_sha256": _sha256(recovery_binding),
+    }
     return {
-        "schema_version": 2,
-        "schema": "windows-solver.fixed-root-survey-batch/2",
+        "schema_version": 3,
+        "schema": "windows-solver.fixed-root-survey-batch/3",
         "operation": "fixed-root-survey-batch",
         "leaf_id": job.leaf_id,
         "job_id": job.job_id,
@@ -129,7 +155,13 @@ def _fixture_fixed_root_request(job, digits: int, kwargs):
             else PrecisionTier.BIGFLOAT_80
         ),
         "semantic_precision_tier": f"bigfloat-{digits}",
-        "policy": {"job_policy_sha256": job.policy.identity_sha256},
+        "policy": {
+            "job_policy_sha256": job.policy.identity_sha256,
+            "endpoint_series_order": 28,
+            "rho_in": "-20000",
+            "rho_out": "20000",
+        },
+        "fixed_root_endpoint_recovery_policy": recovery,
         "execution_resource": _execution_resource_policy(),
         "plan": contract.plan.value,
         "scientific_operation_identity": contract.scientific_operation_identity,
@@ -137,6 +169,121 @@ def _fixture_fixed_root_request(job, digits: int, kwargs):
         "root_seal_sha256": kwargs["root_seal_sha256"],
         "branch_identity": kwargs["branch_identity"],
         "sample_roles": list(contract.sample_roles),
+    }
+
+
+def _endpoint_control_diagnostics(request, failure_code: str):
+    policy = request["fixed_root_endpoint_recovery_policy"]
+    limitation, intervention, outcome = {
+        "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE": (
+            "insufficient-series-order/v1",
+            "ENDPOINT_ORDER_RECOVERY_EXHAUSTED",
+            "UNRESOLVED",
+        ),
+        "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED": (
+            "insufficient-geometric-depth/v1",
+            "ENDPOINT_GEOMETRY_RECOVERY_EXHAUSTED",
+            "UNRESOLVED",
+        ),
+        "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE": (
+            "insufficient-arithmetic-precision/v1",
+            "ARITHMETIC_PRECISION_PROMOTION",
+            "ARITHMETIC_INADEQUATE",
+        ),
+    }[failure_code]
+    receipts = []
+    for branch, geometry_field in (
+        ("horizon-ingoing", "horizon_geometry_schedule"),
+        ("infinity-outgoing", "infinity_geometry_schedule"),
+    ):
+        geometries = policy[geometry_field]
+        orders = policy["endpoint_order_schedule"]
+        coordinates = (
+            [(order, geometries[0]) for order in orders]
+            if limitation == "insufficient-series-order/v1"
+            else [(orders[0], geometry) for geometry in geometries]
+            if limitation == "insufficient-geometric-depth/v1"
+            else [(orders[0], geometries[0])]
+        )
+        attempts = []
+        for index, (order, geometry) in enumerate(coordinates):
+            terminal = index == len(coordinates) - 1
+            last_ratio = (
+                "1" if limitation == "insufficient-geometric-depth/v1" else "0.1"
+            )
+            truncation = (
+                "2" if limitation == "insufficient-arithmetic-precision/v1" else "10"
+            )
+            selected = (
+                "PROMOTE_ARITHMETIC_TIER_IF_AGGREGATE_ALLOWS"
+                if limitation == "insufficient-arithmetic-precision/v1"
+                else "NONE" if terminal
+                else "INCREASE_ENDPOINT_ORDER"
+                if limitation == "insufficient-series-order/v1"
+                else "DEEPEN_ENDPOINT_GEOMETRY"
+            )
+            result = (
+                "ARITHMETIC_INADEQUATE"
+                if limitation == "insufficient-arithmetic-precision/v1"
+                else "ORDER_EXHAUSTED"
+                if terminal and limitation == "insufficient-series-order/v1"
+                else "GEOMETRY_EXHAUSTED"
+                if terminal else "RETRY"
+            )
+            attempts.append({
+                "endpoint_branch": branch,
+                "attempted_endpoint_order": order,
+                "attempted_geometry": geometry,
+                "maximum_last_term_ratio": last_ratio,
+                "maximum_truncation_digits_lost": truncation,
+                "maximum_recurrence_digits_lost": "1",
+                "maximum_series_evaluation_digits_lost": "1",
+                "predicted_reliable_digits": "10",
+                "required_reliable_digits": "20",
+                "candidate_limitation": limitation,
+                "selected_intervention": selected,
+                "result": result,
+            })
+        terminal_attempt = attempts[-1]
+        receipts.append({
+            "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
+            "endpoint_branch": branch,
+            "recovery_policy_identity": policy["identity"],
+            "recovery_policy_sha256": policy["policy_sha256"],
+            "base_endpoint_order": policy["base_endpoint_order"],
+            "generated_maximum_order": policy["generated_maximum_order"],
+            "attempted_endpoint_orders": [
+                attempt["attempted_endpoint_order"] for attempt in attempts
+            ],
+            "terminal_endpoint_order": terminal_attempt[
+                "attempted_endpoint_order"
+            ],
+            "candidate_geometry_schedule": geometries,
+            "terminal_geometry": terminal_attempt["attempted_geometry"],
+            "maximum_last_term_ratio": terminal_attempt[
+                "maximum_last_term_ratio"
+            ],
+            "maximum_truncation_digits_lost": terminal_attempt[
+                "maximum_truncation_digits_lost"
+            ],
+            "maximum_recurrence_digits_lost": "1",
+            "maximum_series_evaluation_digits_lost": "1",
+            "predicted_reliable_digits": "10",
+            "required_reliable_digits": "20",
+            "candidate_limitation": limitation,
+            "aggregate_limitation": limitation,
+            "factored_homogeneous_rhs_evaluations": 0,
+            "attempts": attempts,
+        })
+    return {
+        "reason": failure_code,
+        "aggregate_limitation": limitation,
+        "endpoint_recovery_policy_identity": policy["identity"],
+        "endpoint_recovery_policy_sha256": policy["policy_sha256"],
+        "endpoint_receipts": receipts,
+        "selected_intervention": intervention,
+        "result": outcome,
+        "factored_homogeneous_rhs_evaluations": 0,
     }
 
 
@@ -218,8 +365,56 @@ def _conditioning(
     *,
     precision_limited: bool = False,
 ) -> FixedRootSurveyConditioning:
+    del precision_limited
+    required = "16.698970004336018804786261105275506973231810118538"
+    receipts = []
+    for branch, geometry, schedule in (
+        ("horizon-ingoing", "-5000", ["-5000", "-10000", "-20000"]),
+        (
+            "infinity-outgoing", "100",
+            ["100", "250", "500", "1000", "2000", "5000", "10000", "20000"],
+        ),
+    ):
+        attempt = {
+            "endpoint_branch": branch,
+            "attempted_endpoint_order": 28,
+            "attempted_geometry": geometry,
+            "maximum_last_term_ratio": "1e-20",
+            "maximum_truncation_digits_lost": "0",
+            "maximum_recurrence_digits_lost": "1",
+            "maximum_series_evaluation_digits_lost": "1",
+            "predicted_reliable_digits": str(digits - 5),
+            "required_reliable_digits": required,
+            "candidate_limitation": "adequate/v1",
+            "selected_intervention": "ENTER_HOMOGENEOUS_ODE",
+            "result": "ADEQUATE",
+        }
+        receipts.append({
+            "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
+            "endpoint_branch": branch,
+            "recovery_policy_identity": (
+                "cause-aware-fixed-root-exterior-endpoint-recovery/v1"
+            ),
+            "recovery_policy_sha256": "f" * 64,
+            "base_endpoint_order": 28,
+            "generated_maximum_order": 112,
+            "attempted_endpoint_orders": [28],
+            "terminal_endpoint_order": 28,
+            "candidate_geometry_schedule": schedule,
+            "terminal_geometry": geometry,
+            "maximum_last_term_ratio": "1e-20",
+            "maximum_truncation_digits_lost": "0",
+            "maximum_recurrence_digits_lost": "1",
+            "maximum_series_evaluation_digits_lost": "1",
+            "predicted_reliable_digits": str(digits - 5),
+            "required_reliable_digits": required,
+            "candidate_limitation": "adequate/v1",
+            "aggregate_limitation": "adequate/v1",
+            "factored_homogeneous_rhs_evaluations": 0,
+            "attempts": [attempt],
+        })
     return FixedRootSurveyConditioning({
-        "schema": "windows-solver.fixed-root-survey-conditioning/2",
+        "schema": "windows-solver.fixed-root-survey-conditioning/3",
         "fixed_root_reliability_target_abs": "2e-11",
         "fixed_root_reliability_rule": (
             "minus-log10-target-plus-required-digit-guard/v1"
@@ -233,19 +428,29 @@ def _conditioning(
         "determinant_normalisation": "unit-asymptotic-branch-wronskian/v1",
         "maximum_series_digits_lost": "1",
         "maximum_recurrence_digits_lost": "1",
+        "maximum_series_evaluation_digits_lost": "1",
+        "maximum_last_term_ratio": "1e-20",
+        "maximum_truncation_digits_lost": "0",
         "minimum_asymptotic_predicted_reliable_digits": (
-            "10" if precision_limited else str(digits - 5)
+            str(digits - 5)
         ),
         "endpoint_remainders_regular": True,
         "maximum_endpoint_reconstruction_error": f"1e-{digits - 5}",
         "maximum_contour_angle_deformation": "0",
         "predicted_reliable_digits": (
-            "10" if precision_limited else str(digits - 6)
+            str(digits - 6)
         ),
         "required_reliable_digits": (
             "16.698970004336018804786261105275506973231810118538"
         ),
-        "precision_limited": precision_limited,
+        "precision_limited": False,
+        "endpoint_recovery_policy_identity": (
+            "cause-aware-fixed-root-exterior-endpoint-recovery/v1"
+        ),
+        "endpoint_recovery_policy_sha256": "f" * 64,
+        "endpoint_receipts": receipts,
+        "aggregate_limitation": "adequate/v1",
+        "factored_homogeneous_rhs_evaluations_before_recovery_decision": 0,
         "determinant_count": 1,
     })
 
@@ -285,7 +490,7 @@ def _batch(
             "schema": OPERATION_EXECUTION_IDENTITY_SCHEMA,
             "scope": "REQUEST",
             "operation": "fixed-root-survey-batch",
-            "request_schema": "windows-solver.fixed-root-survey-batch/2",
+            "request_schema": "windows-solver.fixed-root-survey-batch/3",
             "request_sha256": request_sha256,
             "leaf_id": leaf.leaf_id,
             "job_id": leaf.job.job_id,
@@ -467,6 +672,11 @@ class _Backend:
                         "elapsed_seconds": "1.25",
                     },
                 }
+            elif self.failure_code.startswith("EXTERIOR_ENDPOINT_"):
+                stage = "asymptotic-preflight"
+                diagnostics = _endpoint_control_diagnostics(
+                    canonical_request, self.failure_code
+                )
             else:
                 stage = "asymptotic-preflight"
                 diagnostics = {
@@ -491,7 +701,9 @@ class _Backend:
                     failure_code=self.failure_code,
                     stage=stage,
                     identity=identity,
-                    retryable=True,
+                    retryable=expected_operation_control_retryability(
+                        self.failure_code
+                    ),
                     retryable_basis="scheduler fixture control evidence/v1",
                     diagnostics=diagnostics,
                 ),
@@ -703,7 +915,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         self,
         target: str,
         *,
-        failure_code: str = "INSUFFICIENT_ASYMPTOTIC_PRECISION",
+        failure_code: str = "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
     ):
         durable: list[dict[str, object]] = []
 
@@ -940,8 +1152,8 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         result, calls = self._run(
             self._checkpoint(),
             calculate_only=True,
-            failure40="INSUFFICIENT_ASYMPTOTIC_PRECISION",
-            failure80="INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            failure40="EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
+            failure80="EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
         )
 
         leaf_id = self.leaves[0].leaf_id
@@ -956,7 +1168,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            "INSUFFICIENT_ASYMPTOTIC_PRECISION", retained["reason_code"]
+            "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE", retained["reason_code"]
         )
         self.assertEqual(["BF40", "BF80"], retained["precision_tiers"])
         self.assertEqual({}, result.checkpoint["evidence_ledger"])
@@ -978,7 +1190,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         class InterruptingBackend(_Backend):
             def fixed_root_survey_batch(self, job, **kwargs):
                 if self.digits == 40:
-                    self.failure_code = "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+                    self.failure_code = "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE"
                     return super().fixed_root_survey_batch(job, **kwargs)
                 if self.digits == 80:
                     self.calls.append(self.digits)
@@ -1242,7 +1454,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                     and FixedRootSurveyPlan(kwargs["plan"])
                     is FixedRootSurveyPlan.MECHANISM_COMPONENT_FOUR
                 ):
-                    self.failure_code = "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+                    self.failure_code = "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE"
                 return super().fixed_root_survey_batch(job, **kwargs)
 
         def stop_after_control_return(checkpoint):
@@ -1265,7 +1477,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         stage = durable[0]["promoted_stage_ledger"]["0"][self.leaves[0].leaf_id]
         control_return = stage["control_return"]
         self.assertEqual(
-            "windows-solver.promoted-exterior-control-return/3",
+            "windows-solver.promoted-exterior-control-return/4",
             control_return["schema"],
         )
         self.assertEqual(
@@ -1294,7 +1506,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
                     forged = dict(kwargs)
                     forged.pop("prepared_request", None)
                     forged["plan"] = FixedRootSurveyPlan.MECHANISM_COMPONENT_FOUR
-                    self.failure_code = "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+                    self.failure_code = "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE"
                     return super().fixed_root_survey_batch(job, **forged)
                 return super().fixed_root_survey_batch(job, **kwargs)
 
@@ -1457,8 +1669,8 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
     def test_bf80_control_exhaustion_is_unresolved_not_another_promotion(self):
         result, calls = self._run(
             self._checkpoint(),
-            failure40="INSUFFICIENT_ASYMPTOTIC_PRECISION",
-            failure80="INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            failure40="EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
+            failure80="EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
         )
         self.assertEqual([40, 80], calls)
         self.assertEqual(1, result.unresolved_count)
@@ -1471,12 +1683,32 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
     def test_allowlisted_bf40_control_failure_advances_only_to_bf80(self):
         result, calls = self._run(
             self._checkpoint(),
-            failure40="INSUFFICIENT_ASYMPTOTIC_PRECISION",
+            failure40="EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
         )
         self.assertEqual([40, 80, 80], calls)
         self.assertEqual(0, result.completed_count)
         self.assertEqual(0, result.unresolved_count)
         self.assertEqual(1, result.review_pending_count)
+
+    def test_generic_asymptotic_condition_cannot_authorize_bf80(self):
+        result, calls = self._run(
+            self._checkpoint(),
+            failure40="INSUFFICIENT_ASYMPTOTIC_PRECISION",
+        )
+        self.assertEqual([40], calls)
+        self.assertEqual(1, result.unresolved_count)
+
+    def test_order_and_geometry_exhaustion_remain_at_bf40(self):
+        for failure_code in (
+            "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE",
+            "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED",
+        ):
+            with self.subTest(failure_code=failure_code):
+                result, calls = self._run(
+                    self._checkpoint(), failure40=failure_code
+                )
+                self.assertEqual([40], calls)
+                self.assertEqual(1, result.unresolved_count)
         self.assertEqual("AWAITING_ADMISSION", result.checkpoint[
             "promotion_queue"
         ]["entries"][0]["disposition"])
@@ -1786,7 +2018,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             self._run(
                 self._checkpoint(PromotionQueueKind.ROOT),
-                failure40="INSUFFICIENT_ASYMPTOTIC_PRECISION",
+                failure40="EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
                 checkpoint_committed=stop_after_continuation,
             )
         forged = copy.deepcopy(durable[0])

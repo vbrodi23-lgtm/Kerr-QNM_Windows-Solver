@@ -12,11 +12,67 @@ include(joinpath(
     "m02_worker.jl",
 ))
 
+function deterministic_endpoint_receipts(::Type{T}, request, limitation::String) where {T<:AbstractFloat}
+    policy = required(request, "fixed_root_endpoint_recovery_policy")
+    required_digits = required_reliable_digits(T, request)
+    adequate = limitation == CF.ENDPOINT_ADEQUATE
+    predicted = adequate ? required_digits + T(5) : required_digits - one(T)
+    receipts = Any[]
+    for (branch, schedule_field) in (
+        ("horizon-ingoing", "horizon_geometry_schedule"),
+        ("infinity-outgoing", "infinity_geometry_schedule"),
+    )
+        schedule = required(policy, schedule_field)
+        order = first(required(policy, "endpoint_order_schedule"))
+        intervention = adequate ? "ENTER_HOMOGENEOUS_ODE" :
+            "PROMOTE_ARITHMETIC_TIER_IF_AGGREGATE_ALLOWS"
+        result = adequate ? "ADEQUATE" : "ARITHMETIC_INADEQUATE"
+        attempt = Dict{String,Any}(
+            "endpoint_branch" => branch,
+            "attempted_endpoint_order" => order,
+            "attempted_geometry" => first(schedule),
+            "maximum_last_term_ratio" => "0.1",
+            "maximum_truncation_digits_lost" => "2",
+            "maximum_recurrence_digits_lost" => "1",
+            "maximum_series_evaluation_digits_lost" => "1",
+            "predicted_reliable_digits" => numeric_text(predicted),
+            "required_reliable_digits" => numeric_text(required_digits),
+            "candidate_limitation" => limitation,
+            "selected_intervention" => intervention,
+            "result" => result,
+        )
+        push!(receipts, Dict{String,Any}(
+            "schema" => "windows-solver.exterior-endpoint-recovery-receipt/1",
+            "endpoint_branch" => branch,
+            "recovery_policy_identity" => required(policy, "identity"),
+            "recovery_policy_sha256" => required(policy, "policy_sha256"),
+            "base_endpoint_order" => required(policy, "base_endpoint_order"),
+            "generated_maximum_order" => required(policy, "generated_maximum_order"),
+            "attempted_endpoint_orders" => [order],
+            "terminal_endpoint_order" => order,
+            "candidate_geometry_schedule" => schedule,
+            "terminal_geometry" => first(schedule),
+            "maximum_last_term_ratio" => "0.1",
+            "maximum_truncation_digits_lost" => "2",
+            "maximum_recurrence_digits_lost" => "1",
+            "maximum_series_evaluation_digits_lost" => "1",
+            "predicted_reliable_digits" => numeric_text(predicted),
+            "required_reliable_digits" => numeric_text(required_digits),
+            "candidate_limitation" => limitation,
+            "aggregate_limitation" => limitation,
+            "factored_homogeneous_rhs_evaluations" => 0,
+            "attempts" => [attempt],
+        ))
+    end
+    return receipts
+end
+
 function deterministic_conditioning(::Type{T}, request, digits::Int) where {T<:AbstractFloat}
     required_digits = required_reliable_digits(T, request)
     reliability_projection = required(
         request, "fixed_root_reliability_projection"
     )
+    recovery_policy = required(request, "fixed_root_endpoint_recovery_policy")
     return Dict{String,Any}(
         "schema" => FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA,
         "fixed_root_reliability_target_abs" =>
@@ -39,6 +95,9 @@ function deterministic_conditioning(::Type{T}, request, digits::Int) where {T<:A
             EXTERIOR_DETERMINANT_NORMALISATION_ID,
         "maximum_series_digits_lost" => "1",
         "maximum_recurrence_digits_lost" => "1",
+        "maximum_series_evaluation_digits_lost" => "1",
+        "maximum_last_term_ratio" => "0.1",
+        "maximum_truncation_digits_lost" => "2",
         "minimum_asymptotic_predicted_reliable_digits" =>
             numeric_text(required_digits + T(8)),
         "endpoint_remainders_regular" => true,
@@ -47,6 +106,11 @@ function deterministic_conditioning(::Type{T}, request, digits::Int) where {T<:A
         "predicted_reliable_digits" => numeric_text(required_digits + T(5)),
         "required_reliable_digits" => numeric_text(required_digits),
         "precision_limited" => false,
+        "endpoint_recovery_policy_identity" => required(recovery_policy, "identity"),
+        "endpoint_recovery_policy_sha256" => required(recovery_policy, "policy_sha256"),
+        "endpoint_receipts" => deterministic_endpoint_receipts(T, request, CF.ENDPOINT_ADEQUATE),
+        "aggregate_limitation" => CF.ENDPOINT_ADEQUATE,
+        "factored_homogeneous_rhs_evaluations_before_recovery_decision" => 0,
         "determinant_count" => 1,
     )
 end
@@ -67,32 +131,23 @@ function deterministic_success_sample(
     )
 end
 
-function injected_insufficient_precision(::Type{T}, request, bits::Int) where {T<:AbstractFloat}
-    required_digits = required_reliable_digits(T, request)
-    assessment = CF.AsymptoticConditioningAssessment{T}(
-        false,
-        "INJECTED_INSUFFICIENT_ASYMPTOTIC_PRECISION",
-        bits,
-        T(parse_integer(request, "precision_digits")),
-        required_digits,
-        T(6),
-        T(2),
-        T(10),
-        parse(T, "1e-30"),
-        T(3),
-        parse(T, "1e-20"),
-        T(1),
-        T(4),
-        required_digits - one(T),
-        "deterministic-no-solver/v1",
-    )
-    throw(CF.FactoredPropagationError{T}(
-        CF.INSUFFICIENT_ASYMPTOTIC_PRECISION,
-        assessment,
-        bits,
-        0,
-        CF.FACTORED_HOMOGENEOUS_ODE_SCOPE_ID,
-        "deterministic PR75 asymptotic insufficiency",
+function injected_insufficient_precision(::Type{T}, request, _bits::Int) where {T<:AbstractFloat}
+    code = "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE"
+    policy = required(request, "fixed_root_endpoint_recovery_policy")
+    throw(numerical_control_failure(
+        request, code, "deterministic PR75 arithmetic insufficiency",
+        Dict{String,Any}(
+            "reason" => code,
+            "aggregate_limitation" => CF.ENDPOINT_ARITHMETIC_LIMITED,
+            "endpoint_recovery_policy_identity" => required(policy, "identity"),
+            "endpoint_recovery_policy_sha256" => required(policy, "policy_sha256"),
+            "endpoint_receipts" => deterministic_endpoint_receipts(
+                T, request, CF.ENDPOINT_ARITHMETIC_LIMITED
+            ),
+            "selected_intervention" => "ARITHMETIC_PRECISION_PROMOTION",
+            "result" => "ARITHMETIC_INADEQUATE",
+            "factored_homogeneous_rhs_evaluations" => 0,
+        ); retryable=true, stage="asymptotic-preflight",
     ))
 end
 
@@ -157,7 +212,7 @@ function compatibility_control_details()
     return Dict{String,Any}(
         "failure_code" => "INSUFFICIENT_ASYMPTOTIC_PRECISION",
         "stage" => "asymptotic-preflight",
-        "retryable" => true,
+        "retryable" => false,
         "diagnostics" => Dict{String,Any}(
             "reason" => "INSUFFICIENT_ASYMPTOTIC_PRECISION",
             "precision_bits" => 298,

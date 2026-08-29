@@ -342,13 +342,13 @@ def verify_case_matrix(
             expected_sample = case["request"]["samples"][int(target)]
             diagnostics = receipt.mapping["diagnostics"]
             if (
-                receipt.failure_code != "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+                receipt.failure_code != "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE"
                 or identity["scope"] != "SAMPLE"
                 or identity["sample_index"] != target
                 or identity["sample_role"] != expected_sample["sample_role"]
                 or diagnostics["factored_homogeneous_rhs_evaluations"] != 0
-                or diagnostics["avoided_ode_scope"]
-                != "factored-homogeneous-gsn/v1"
+                or diagnostics["aggregate_limitation"]
+                != "insufficient-arithmetic-precision/v1"
             ):
                 raise AssertionError("PR75 failure identity or zero-RHS proof is invalid")
             failure_count += 1

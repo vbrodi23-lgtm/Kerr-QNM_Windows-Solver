@@ -140,16 +140,37 @@ _DEFAULT_COORDINATE_STALL_MINIMUM_SPAN_FRACTION = "1e-6"
 _DEFAULT_COORDINATE_STALL_MINIMUM_STEP_FRACTION = "1e-12"
 _PROMOTED_REQUEST_PREFLIGHT_TIMEOUT_SECONDS = 600
 _PROMOTED_REQUEST_PREFLIGHT_OPERATION = "promoted-request-preflight"
-FIXED_ROOT_SURVEY_BATCH_SCHEMA = "windows-solver.fixed-root-survey-batch/2"
+FIXED_ROOT_SURVEY_BATCH_SCHEMA = "windows-solver.fixed-root-survey-batch/3"
 FIXED_ROOT_SURVEY_BATCH_RESPONSE_SCHEMA = (
-    "windows-solver.fixed-root-survey-batch-response/2"
+    "windows-solver.fixed-root-survey-batch-response/3"
 )
 FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA = (
-    "windows-solver.fixed-root-survey-conditioning/2"
+    "windows-solver.fixed-root-survey-conditioning/3"
 )
 FIXED_ROOT_RELIABILITY_PROJECTION_SCHEMA = (
     "windows-solver.fixed-root-reliability-projection/2"
 )
+FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_SCHEMA = (
+    "windows-solver.fixed-root-endpoint-recovery-policy/1"
+)
+FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_IDENTITY = (
+    "cause-aware-fixed-root-exterior-endpoint-recovery/v1"
+)
+FIXED_ROOT_ENDPOINT_ORDER_RULE = "bounded-doubling-prefix/v1"
+FIXED_ROOT_HORIZON_GEOMETRY_RULE = "bounded-negative-rho-depth/v1"
+FIXED_ROOT_INFINITY_GEOMETRY_RULE = "bounded-positive-rho-depth/v1"
+EXTERIOR_ENDPOINT_RECOVERY_RECEIPT_SCHEMA = (
+    "windows-solver.exterior-endpoint-recovery-receipt/1"
+)
+ENDPOINT_ADEQUATE = "adequate/v1"
+ENDPOINT_SERIES_ORDER_LIMITED = "insufficient-series-order/v1"
+ENDPOINT_ARITHMETIC_LIMITED = "insufficient-arithmetic-precision/v1"
+ENDPOINT_GEOMETRY_LIMITED = "insufficient-geometric-depth/v1"
+EXTERIOR_ENDPOINT_CONTROL_CODES = frozenset({
+    "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE",
+    "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED",
+    "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
+})
 _FIXED_ROOT_SURVEY_MAXIMUM_SAMPLE_COUNT = 9
 _FIXED_ROOT_SURVEY_BACKGROUND_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[:5]
 _FIXED_ROOT_SURVEY_COORDINATE_ROLES = BINARY64_FIXED_ROOT_SAMPLE_ROLES[5:]
@@ -229,6 +250,62 @@ def fixed_root_survey_plan_for_pair(
         ):
             return plan
     raise ValueError("fixed-root survey identity and roles are not one request plan")
+
+
+def _endpoint_order_schedule(base_order: int, maximum_order: int) -> list[int]:
+    if type(base_order) is not int or base_order <= 0 or maximum_order < base_order:
+        raise ValueError("fixed-root endpoint order bounds are invalid")
+    result: list[int] = []
+    current = base_order
+    while current < maximum_order:
+        result.append(current)
+        current *= 2
+    result.append(maximum_order)
+    return result
+
+
+def _fixed_root_endpoint_recovery_policy(
+    policy: Mapping[str, object],
+    reliability_projection: Mapping[str, object],
+    *,
+    precision_digits: int,
+) -> dict[str, object]:
+    """Authenticate the complete bounded same-tier endpoint ladder."""
+
+    base_order = policy.get("endpoint_series_order")
+    if type(base_order) is not int or base_order <= 0:
+        raise ValueError("fixed-root endpoint base order is invalid")
+    maximum_order = 4 * base_order
+    binding: dict[str, object] = {
+        "schema": FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_SCHEMA,
+        "identity": FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_IDENTITY,
+        "endpoint_order_rule": FIXED_ROOT_ENDPOINT_ORDER_RULE,
+        "base_endpoint_order": base_order,
+        "generated_maximum_order": maximum_order,
+        "endpoint_order_schedule": _endpoint_order_schedule(
+            base_order, maximum_order
+        ),
+        "horizon_geometry_rule": FIXED_ROOT_HORIZON_GEOMETRY_RULE,
+        "horizon_geometry_schedule": ["-5000", "-10000", "-20000"],
+        "infinity_geometry_rule": FIXED_ROOT_INFINITY_GEOMETRY_RULE,
+        "infinity_geometry_schedule": [
+            "100", "250", "500", "1000", "2000", "5000",
+            "10000", "20000",
+        ],
+        "fixed_root_reliability_target_abs": reliability_projection[
+            "fixed_root_reliability_target_abs"
+        ],
+        "fixed_root_reliability_rule": reliability_projection[
+            "fixed_root_reliability_rule"
+        ],
+        "required_digit_guard": reliability_projection["required_digit_guard"],
+        "precision_digits": precision_digits,
+        "semantic_precision_tier": f"bigfloat-{precision_digits}",
+    }
+    return {
+        **binding,
+        "policy_sha256": hashlib.sha256(canonical_json_bytes(binding)).hexdigest(),
+    }
 
 
 def consume_authenticated_binary64_provisional_predecessor(
@@ -1295,6 +1372,10 @@ def _control_receipt_diagnostics_validator(
         ),
         "request_binding": dict(request_binding),
     }
+    if code in EXTERIOR_ENDPOINT_CONTROL_CODES:
+        return _valid_exterior_endpoint_control_diagnostics(
+            receipt, request_binding=request_binding
+        )
     if code in NUMERICAL_CONTROL_FAILURE_CODES:
         return _valid_numerical_control_diagnostics(
             legacy,
@@ -1578,7 +1659,9 @@ def _raise_worker_failure(
         error_class = JuliaRootReadoutResourceLimitError
     elif (
         isinstance(structured, Mapping)
-        and structured.get("failure_code") in NUMERICAL_CONTROL_FAILURE_CODES
+        and structured.get("failure_code") in (
+            NUMERICAL_CONTROL_FAILURE_CODES | EXTERIOR_ENDPOINT_CONTROL_CODES
+        )
         and structured.get("failure_class") == "CONTROL"
         and control_receipt is not None
     ):
@@ -1822,6 +1905,69 @@ def _valid_insufficient_precision_diagnostics(
         and diagnostics.get("asymptotic_preflight_avoided_ode") is True
         and diagnostics.get("asymptotic_preflight_reason")
         == "INSUFFICIENT_ASYMPTOTIC_PRECISION"
+    )
+
+
+def _valid_exterior_endpoint_control_diagnostics(
+    receipt: Mapping[str, object],
+    *,
+    request_binding: Mapping[str, object],
+) -> bool:
+    code = receipt.get("failure_code")
+    diagnostics = receipt.get("diagnostics")
+    fields = {
+        "reason", "aggregate_limitation",
+        "endpoint_recovery_policy_identity",
+        "endpoint_recovery_policy_sha256", "endpoint_receipts",
+        "selected_intervention", "result",
+        "factored_homogeneous_rhs_evaluations",
+    }
+    expected = {
+        "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE": (
+            ENDPOINT_SERIES_ORDER_LIMITED,
+            "ENDPOINT_ORDER_RECOVERY_EXHAUSTED",
+            "UNRESOLVED",
+        ),
+        "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED": (
+            ENDPOINT_GEOMETRY_LIMITED,
+            "ENDPOINT_GEOMETRY_RECOVERY_EXHAUSTED",
+            "UNRESOLVED",
+        ),
+        "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE": (
+            ENDPOINT_ARITHMETIC_LIMITED,
+            "ARITHMETIC_PRECISION_PROMOTION",
+            "ARITHMETIC_INADEQUATE",
+        ),
+    }.get(str(code))
+    if (
+        receipt.get("stage") != "asymptotic-preflight"
+        or expected is None
+        or not isinstance(diagnostics, Mapping)
+        or set(diagnostics) != fields
+        or diagnostics.get("reason") != code
+        or diagnostics.get("aggregate_limitation") != expected[0]
+        or diagnostics.get("selected_intervention") != expected[1]
+        or diagnostics.get("result") != expected[2]
+        or diagnostics.get("factored_homogeneous_rhs_evaluations") != 0
+        or request_binding.get("schema") != FIXED_ROOT_SURVEY_BATCH_SCHEMA
+    ):
+        return False
+    try:
+        policy = _validated_fixed_root_endpoint_recovery_policy(
+            request_binding.get("fixed_root_endpoint_recovery_policy")
+        )
+        _validated_exterior_endpoint_recovery_evidence(
+            diagnostics.get("endpoint_receipts"),
+            policy,
+            expected_aggregate=expected[0],
+        )
+    except (TypeError, ValueError, JuliaResponseBackendError):
+        return False
+    return (
+        diagnostics.get("endpoint_recovery_policy_identity")
+        == policy["identity"]
+        and diagnostics.get("endpoint_recovery_policy_sha256")
+        == policy["policy_sha256"]
     )
 
 
@@ -2635,7 +2781,7 @@ class JuliaResponseEvaluation:
 
 @dataclass(frozen=True, slots=True)
 class PreparedFixedRootSurveyRequest:
-    """Immutable scheduler-to-adapter authority for one exact `/2` wire request."""
+    """Immutable scheduler-to-adapter authority for one exact `/3` wire request."""
 
     request: Mapping[str, object]
     request_binding: Mapping[str, object]
@@ -2653,6 +2799,14 @@ class PreparedFixedRootSurveyRequest:
         )
         if document.get("operation") != FIXED_ROOT_SURVEY_BATCH_OPERATION:
             raise ValueError("prepared request is not a fixed-root survey")
+        if (
+            request_copy.get("schema") != FIXED_ROOT_SURVEY_BATCH_SCHEMA
+            or request_copy.get("schema_version") != 3
+        ):
+            raise ValueError("prepared fixed-root request is not `/3`")
+        _validated_fixed_root_endpoint_recovery_policy(
+            request_copy.get("fixed_root_endpoint_recovery_policy")
+        )
         identity = operation_execution_identity(document.get("execution_identity"))
         if (
             identity.scope != REQUEST_SCOPE
@@ -2699,6 +2853,280 @@ def _survey_decimal_complex_from_mapping(
     )
 
 
+def _validated_fixed_root_endpoint_recovery_policy(
+    value: object,
+) -> dict[str, object]:
+    fields = {
+        "schema", "identity", "endpoint_order_rule", "base_endpoint_order",
+        "generated_maximum_order", "endpoint_order_schedule",
+        "horizon_geometry_rule", "horizon_geometry_schedule",
+        "infinity_geometry_rule", "infinity_geometry_schedule",
+        "fixed_root_reliability_target_abs", "fixed_root_reliability_rule",
+        "required_digit_guard", "precision_digits", "semantic_precision_tier",
+        "policy_sha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ValueError("fixed-root endpoint recovery policy fields are invalid")
+    if (
+        value["schema"] != FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_SCHEMA
+        or value["identity"] != FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_IDENTITY
+        or value["endpoint_order_rule"] != FIXED_ROOT_ENDPOINT_ORDER_RULE
+        or value["horizon_geometry_rule"] != FIXED_ROOT_HORIZON_GEOMETRY_RULE
+        or value["infinity_geometry_rule"] != FIXED_ROOT_INFINITY_GEOMETRY_RULE
+    ):
+        raise ValueError("fixed-root endpoint recovery policy identity is invalid")
+    base = value["base_endpoint_order"]
+    maximum = value["generated_maximum_order"]
+    orders = value["endpoint_order_schedule"]
+    if (
+        type(base) is not int or type(maximum) is not int
+        or not isinstance(orders, list)
+        or maximum != 4 * base
+        or any(type(order) is not int for order in orders)
+        or orders != _endpoint_order_schedule(base, maximum)
+    ):
+        raise ValueError("fixed-root endpoint recovery order schedule is invalid")
+    horizon = value["horizon_geometry_schedule"]
+    infinity = value["infinity_geometry_schedule"]
+    try:
+        horizon_values = [
+            _finite_decimal_text(item, "horizon endpoint geometry")
+            for item in horizon
+        ]
+        infinity_values = [
+            _finite_decimal_text(item, "infinity endpoint geometry")
+            for item in infinity
+        ]
+    except TypeError as error:
+        raise ValueError("fixed-root endpoint geometry schedule is invalid") from error
+    if (
+        not isinstance(horizon, list) or not horizon_values
+        or any(item >= 0 for item in horizon_values)
+        or [abs(item) for item in horizon_values]
+        != sorted(abs(item) for item in horizon_values)
+        or len(set(horizon_values)) != len(horizon_values)
+        or not isinstance(infinity, list) or not infinity_values
+        or any(item <= 0 for item in infinity_values)
+        or infinity_values != sorted(infinity_values)
+        or len(set(infinity_values)) != len(infinity_values)
+    ):
+        raise ValueError("fixed-root endpoint geometry schedule is invalid")
+    digits = value["precision_digits"]
+    if (
+        digits not in (40, 80)
+        or value["semantic_precision_tier"] != f"bigfloat-{digits}"
+        or type(value["required_digit_guard"]) is not int
+    ):
+        raise ValueError("fixed-root endpoint recovery precision binding is invalid")
+    content = {name: value[name] for name in fields if name != "policy_sha256"}
+    expected_sha256 = hashlib.sha256(canonical_json_bytes(content)).hexdigest()
+    if value["policy_sha256"] != expected_sha256:
+        raise ValueError("fixed-root endpoint recovery policy digest is invalid")
+    return json.loads(canonical_json_bytes(dict(value)))
+
+
+_ENDPOINT_ATTEMPT_FIELDS = {
+    "endpoint_branch", "attempted_endpoint_order", "attempted_geometry",
+    "maximum_last_term_ratio", "maximum_truncation_digits_lost",
+    "maximum_recurrence_digits_lost",
+    "maximum_series_evaluation_digits_lost", "predicted_reliable_digits",
+    "required_reliable_digits", "candidate_limitation",
+    "selected_intervention", "result",
+}
+_ENDPOINT_RECEIPT_FIELDS = {
+    "schema", "endpoint_branch", "recovery_policy_identity",
+    "recovery_policy_sha256", "base_endpoint_order",
+    "generated_maximum_order", "attempted_endpoint_orders",
+    "terminal_endpoint_order", "candidate_geometry_schedule",
+    "terminal_geometry", "maximum_last_term_ratio",
+    "maximum_truncation_digits_lost", "maximum_recurrence_digits_lost",
+    "maximum_series_evaluation_digits_lost", "predicted_reliable_digits",
+    "required_reliable_digits", "candidate_limitation",
+    "aggregate_limitation", "factored_homogeneous_rhs_evaluations",
+    "attempts",
+}
+
+
+def _recomputed_endpoint_limitation(attempt: Mapping[str, object]) -> str:
+    predicted = _finite_decimal_text(
+        attempt["predicted_reliable_digits"], "endpoint predicted digits"
+    )
+    required = _finite_decimal_text(
+        attempt["required_reliable_digits"], "endpoint required digits",
+        nonnegative=True,
+    )
+    last_ratio = _finite_decimal_text(
+        attempt["maximum_last_term_ratio"], "endpoint last-term ratio",
+        nonnegative=True,
+    )
+    truncation = _finite_decimal_text(
+        attempt["maximum_truncation_digits_lost"],
+        "endpoint truncation loss", nonnegative=True,
+    )
+    recurrence = _finite_decimal_text(
+        attempt["maximum_recurrence_digits_lost"],
+        "endpoint recurrence loss", nonnegative=True,
+    )
+    evaluation = _finite_decimal_text(
+        attempt["maximum_series_evaluation_digits_lost"],
+        "endpoint series-evaluation loss", nonnegative=True,
+    )
+    if predicted >= required:
+        return ENDPOINT_ADEQUATE
+    if last_ratio >= 1:
+        return ENDPOINT_GEOMETRY_LIMITED
+    if recurrence + evaluation >= truncation:
+        return ENDPOINT_ARITHMETIC_LIMITED
+    return ENDPOINT_SERIES_ORDER_LIMITED
+
+
+def _aggregate_endpoint_limitations(limitations: list[str]) -> str:
+    if limitations and all(item == ENDPOINT_ADEQUATE for item in limitations):
+        return ENDPOINT_ADEQUATE
+    if ENDPOINT_SERIES_ORDER_LIMITED in limitations:
+        return ENDPOINT_SERIES_ORDER_LIMITED
+    if ENDPOINT_GEOMETRY_LIMITED in limitations:
+        return ENDPOINT_GEOMETRY_LIMITED
+    if ENDPOINT_ARITHMETIC_LIMITED in limitations and all(
+        item in {ENDPOINT_ADEQUATE, ENDPOINT_ARITHMETIC_LIMITED}
+        for item in limitations
+    ):
+        return ENDPOINT_ARITHMETIC_LIMITED
+    raise ValueError("exterior endpoint limitations cannot be aggregated")
+
+
+def _validated_endpoint_recovery_receipt(
+    value: object,
+    policy: Mapping[str, object],
+    *,
+    endpoint_branch: str,
+) -> tuple[dict[str, object], str]:
+    if not isinstance(value, Mapping) or set(value) != _ENDPOINT_RECEIPT_FIELDS:
+        raise ValueError("exterior endpoint recovery receipt fields are invalid")
+    if (
+        value["schema"] != EXTERIOR_ENDPOINT_RECOVERY_RECEIPT_SCHEMA
+        or value["endpoint_branch"] != endpoint_branch
+        or value["recovery_policy_identity"] != policy["identity"]
+        or value["recovery_policy_sha256"] != policy["policy_sha256"]
+        or value["base_endpoint_order"] != policy["base_endpoint_order"]
+        or value["generated_maximum_order"] != policy["generated_maximum_order"]
+        or value["candidate_geometry_schedule"]
+        != policy[f"{endpoint_branch.split('-')[0]}_geometry_schedule"]
+        or value["factored_homogeneous_rhs_evaluations"] != 0
+    ):
+        raise ValueError("exterior endpoint recovery receipt binding is invalid")
+    attempts = value["attempts"]
+    if not isinstance(attempts, list) or not attempts:
+        raise ValueError("exterior endpoint recovery attempts are absent")
+    orders = policy["endpoint_order_schedule"]
+    geometries = value["candidate_geometry_schedule"]
+    order_index = 0
+    geometry_index = 0
+    recomputed: list[str] = []
+    metric_names = (
+        "maximum_last_term_ratio", "maximum_truncation_digits_lost",
+        "maximum_recurrence_digits_lost",
+        "maximum_series_evaluation_digits_lost",
+    )
+    maxima = {name: Decimal("-Infinity") for name in metric_names}
+    for index, attempt in enumerate(attempts):
+        if not isinstance(attempt, Mapping) or set(attempt) != _ENDPOINT_ATTEMPT_FIELDS:
+            raise ValueError("exterior endpoint recovery attempt fields are invalid")
+        if (
+            order_index >= len(orders)
+            or geometry_index >= len(geometries)
+            or attempt["endpoint_branch"] != endpoint_branch
+            or attempt["attempted_endpoint_order"] != orders[order_index]
+            or attempt["attempted_geometry"] != geometries[geometry_index]
+        ):
+            raise ValueError("exterior endpoint recovery trajectory is invalid")
+        limitation = _recomputed_endpoint_limitation(attempt)
+        if attempt["candidate_limitation"] != limitation:
+            raise ValueError("Julia endpoint limitation disagrees with its evidence")
+        recomputed.append(limitation)
+        for name in metric_names:
+            maxima[name] = max(
+                maxima[name],
+                _finite_decimal_text(attempt[name], f"endpoint {name}", nonnegative=True),
+            )
+        terminal = index == len(attempts) - 1
+        if limitation == ENDPOINT_ADEQUATE:
+            expected = ("ENTER_HOMOGENEOUS_ODE", "ADEQUATE", True)
+        elif limitation == ENDPOINT_ARITHMETIC_LIMITED:
+            expected = (
+                "PROMOTE_ARITHMETIC_TIER_IF_AGGREGATE_ALLOWS",
+                "ARITHMETIC_INADEQUATE", True,
+            )
+        elif limitation == ENDPOINT_SERIES_ORDER_LIMITED:
+            exhausted = order_index == len(orders) - 1
+            expected = (
+                "NONE" if exhausted else "INCREASE_ENDPOINT_ORDER",
+                "ORDER_EXHAUSTED" if exhausted else "RETRY",
+                exhausted,
+            )
+        else:
+            exhausted = geometry_index == len(geometries) - 1
+            expected = (
+                "NONE" if exhausted else "DEEPEN_ENDPOINT_GEOMETRY",
+                "GEOMETRY_EXHAUSTED" if exhausted else "RETRY",
+                exhausted,
+            )
+        if (
+            attempt["selected_intervention"] != expected[0]
+            or attempt["result"] != expected[1]
+            or terminal is not expected[2]
+        ):
+            raise ValueError("exterior endpoint recovery intervention is invalid")
+        if not terminal:
+            if limitation == ENDPOINT_SERIES_ORDER_LIMITED:
+                order_index += 1
+            else:
+                geometry_index += 1
+                order_index = 0
+    terminal_attempt = attempts[-1]
+    if (
+        value["attempted_endpoint_orders"]
+        != [attempt["attempted_endpoint_order"] for attempt in attempts]
+        or value["terminal_endpoint_order"]
+        != terminal_attempt["attempted_endpoint_order"]
+        or value["terminal_geometry"] != terminal_attempt["attempted_geometry"]
+        or value["predicted_reliable_digits"]
+        != terminal_attempt["predicted_reliable_digits"]
+        or value["required_reliable_digits"]
+        != terminal_attempt["required_reliable_digits"]
+        or value["candidate_limitation"] != recomputed[-1]
+    ):
+        raise ValueError("exterior endpoint terminal evidence is inconsistent")
+    for name in metric_names:
+        if _finite_decimal_text(value[name], f"terminal {name}", nonnegative=True) != maxima[name]:
+            raise ValueError("exterior endpoint summary maximum is invalid")
+    return json.loads(canonical_json_bytes(dict(value))), recomputed[-1]
+
+
+def _validated_exterior_endpoint_recovery_evidence(
+    value: object,
+    policy: Mapping[str, object],
+    *,
+    expected_aggregate: str | None = None,
+) -> tuple[list[dict[str, object]], str]:
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError("exterior determinant requires two endpoint receipts")
+    validated: list[dict[str, object]] = []
+    limitations: list[str] = []
+    for raw, branch in zip(value, ("horizon-ingoing", "infinity-outgoing")):
+        receipt, limitation = _validated_endpoint_recovery_receipt(
+            raw, policy, endpoint_branch=branch
+        )
+        validated.append(receipt)
+        limitations.append(limitation)
+    aggregate = _aggregate_endpoint_limitations(limitations)
+    if expected_aggregate is not None and aggregate != expected_aggregate:
+        raise ValueError("exterior endpoint aggregate limitation is invalid")
+    if any(receipt["aggregate_limitation"] != aggregate for receipt in validated):
+        raise ValueError("exterior endpoint receipts disagree on aggregate cause")
+    return validated, aggregate
+
+
 @dataclass(frozen=True, slots=True)
 class FixedRootSurveyConditioning:
     """Bounded, survey-only conditioning telemetry for one raw sample."""
@@ -2719,6 +3147,9 @@ class FixedRootSurveyConditioning:
             "determinant_normalisation",
             "maximum_series_digits_lost",
             "maximum_recurrence_digits_lost",
+            "maximum_series_evaluation_digits_lost",
+            "maximum_last_term_ratio",
+            "maximum_truncation_digits_lost",
             "minimum_asymptotic_predicted_reliable_digits",
             "endpoint_remainders_regular",
             "maximum_endpoint_reconstruction_error",
@@ -2726,6 +3157,11 @@ class FixedRootSurveyConditioning:
             "predicted_reliable_digits",
             "required_reliable_digits",
             "precision_limited",
+            "endpoint_recovery_policy_identity",
+            "endpoint_recovery_policy_sha256",
+            "endpoint_receipts",
+            "aggregate_limitation",
+            "factored_homogeneous_rhs_evaluations_before_recovery_decision",
             "determinant_count",
         }
         if not isinstance(self.mapping, Mapping) or set(self.mapping) != fields:
@@ -2780,6 +3216,9 @@ class FixedRootSurveyConditioning:
         for name in (
             "maximum_series_digits_lost",
             "maximum_recurrence_digits_lost",
+            "maximum_series_evaluation_digits_lost",
+            "maximum_last_term_ratio",
+            "maximum_truncation_digits_lost",
             "minimum_asymptotic_predicted_reliable_digits",
             "maximum_endpoint_reconstruction_error",
             "maximum_contour_angle_deformation",
@@ -2819,6 +3258,19 @@ class FixedRootSurveyConditioning:
             or type(self.mapping["precision_limited"]) is not bool
             or self.mapping["determinant_count"] != 1
             or self.mapping["precision_limited"] is not (predicted < required)
+            or self.mapping["precision_limited"] is not False
+            or self.mapping["endpoint_recovery_policy_identity"]
+            != FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_IDENTITY
+            or not isinstance(
+                self.mapping["endpoint_recovery_policy_sha256"], str
+            )
+            or len(self.mapping["endpoint_recovery_policy_sha256"]) != 64
+            or self.mapping["aggregate_limitation"] != ENDPOINT_ADEQUATE
+            or self.mapping[
+                "factored_homogeneous_rhs_evaluations_before_recovery_decision"
+            ] != 0
+            or not isinstance(self.mapping["endpoint_receipts"], list)
+            or len(self.mapping["endpoint_receipts"]) != 2
         ):
             raise ValueError("fixed-root survey conditioning bounds are invalid")
         object.__setattr__(
@@ -4253,8 +4705,23 @@ class JuliaPrecisionRootBackend:
         fixed_root_policy, reliability_projection = (
             self._fixed_root_survey_policy(job)
         )
+        endpoint_recovery_policy = _fixed_root_endpoint_recovery_policy(
+            fixed_root_policy,
+            reliability_projection,
+            precision_digits=self.digits,
+        )
+        fixed_root_policy = dict(fixed_root_policy)
+        fixed_root_policy["rho_in"] = endpoint_recovery_policy[
+            "horizon_geometry_schedule"
+        ][-1]
+        fixed_root_policy["rho_out"] = endpoint_recovery_policy[
+            "infinity_geometry_schedule"
+        ][-1]
+        fixed_root_policy["rho_out_candidate_schedule"] = list(
+            endpoint_recovery_policy["infinity_geometry_schedule"]
+        )
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "schema": FIXED_ROOT_SURVEY_BATCH_SCHEMA,
             "operation": FIXED_ROOT_SURVEY_BATCH_OPERATION,
             "identity": BINARY64_FIXED_ROOT_SURVEY_IDENTITY,
@@ -4282,6 +4749,7 @@ class JuliaPrecisionRootBackend:
             "working_precision_bits": math.ceil(self.digits * math.log2(10)) + 32,
             "semantic_precision_tier": f"bigfloat-{self.digits}",
             "fixed_root_reliability_projection": reliability_projection,
+            "fixed_root_endpoint_recovery_policy": endpoint_recovery_policy,
             "frequency_step": format(frequency_step, ".17g"),
             "coordinate_step": format(coordinate_step, ".17g"),
             "sample_roles": list(sample_roles),
@@ -4338,6 +4806,31 @@ class JuliaPrecisionRootBackend:
                 "prepared fixed-root request disagrees with scheduler inputs"
             )
         request = prepared_request.request
+        recovery_policy = _validated_fixed_root_endpoint_recovery_policy(
+            request.get("fixed_root_endpoint_recovery_policy")
+        )
+        reliability_projection = request.get("fixed_root_reliability_projection")
+        if (
+            recovery_policy["base_endpoint_order"]
+            != request["policy"]["endpoint_series_order"]
+            or recovery_policy["horizon_geometry_schedule"][-1]
+            != request["policy"]["rho_in"]
+            or recovery_policy["infinity_geometry_schedule"][-1]
+            != request["policy"]["rho_out"]
+            or recovery_policy["precision_digits"] != self.digits
+            or not isinstance(reliability_projection, Mapping)
+            or any(
+                recovery_policy[field] != reliability_projection.get(field)
+                for field in (
+                    "fixed_root_reliability_target_abs",
+                    "fixed_root_reliability_rule",
+                    "required_digit_guard",
+                )
+            )
+        ):
+            raise JuliaResponseBackendError(
+                "fixed-root endpoint recovery policy disagrees with request"
+            )
         contract = fixed_root_survey_request_contract(plan)
         sample_roles = contract.sample_roles
         scientific_operation_identity = contract.scientific_operation_identity
@@ -4401,7 +4894,7 @@ class JuliaPrecisionRootBackend:
             "sample_count": len(sample_roles),
         }
         if (
-            response["schema_version"] != 2
+            response["schema_version"] != 3
             or response["status"] != "ok"
             or any(response[name] != value for name, value in expected_bindings.items())
             or not isinstance(response["samples"], list)
@@ -4517,6 +5010,25 @@ class JuliaPrecisionRootBackend:
                 raise JuliaResponseBackendError(
                     "M02 fixed-root survey reliability telemetry disagrees "
                     "with request"
+                )
+            try:
+                _validated_exterior_endpoint_recovery_evidence(
+                    telemetry["endpoint_receipts"],
+                    recovery_policy,
+                    expected_aggregate=ENDPOINT_ADEQUATE,
+                )
+            except ValueError as error:
+                raise JuliaResponseBackendError(
+                    "M02 fixed-root endpoint recovery evidence is invalid"
+                ) from error
+            if (
+                telemetry["endpoint_recovery_policy_identity"]
+                != recovery_policy["identity"]
+                or telemetry["endpoint_recovery_policy_sha256"]
+                != recovery_policy["policy_sha256"]
+            ):
+                raise JuliaResponseBackendError(
+                    "M02 fixed-root endpoint recovery telemetry moved"
                 )
             raw_evidence = raw["determinant_error_evidence"]
             determinant_error_evidence = None

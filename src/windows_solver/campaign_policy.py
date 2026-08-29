@@ -38,10 +38,10 @@ PROMOTED_CONTROL_CONTINUATION_STAGE_SCHEMA = (
     "windows-solver.promoted-control-continuation-stage/1"
 )
 PROMOTED_CONTROL_RETURN_SCHEMA = (
-    "windows-solver.promoted-exterior-control-return/3"
+    "windows-solver.promoted-exterior-control-return/4"
 )
 PROMOTED_CONTROL_DECISION_SCHEMA = (
-    "windows-solver.promoted-exterior-control-decision/1"
+    "windows-solver.promoted-exterior-control-decision/2"
 )
 PROMOTED_HORIZON_CONTROL_RETURN_SCHEMA = (
     "windows-solver.promoted-horizon-control-return/2"
@@ -78,7 +78,7 @@ _PROMOTED_CONTROL_DECISION_SCHEMAS = frozenset(
     _PROMOTED_CONTROL_DECISION_RETURN_SCHEMAS
 )
 _PROMOTED_ARTIFACT_DIGEST_FIELDS = {
-    "windows-solver.promoted-exterior-calculation/3": "calculation_sha256",
+    "windows-solver.promoted-exterior-calculation/4": "calculation_sha256",
     "windows-solver.promoted-horizon-calculation/3": "calculation_sha256",
     PROMOTED_CONTROL_RETURN_SCHEMA: "control_return_sha256",
     PROMOTED_CONTROL_DECISION_SCHEMA: "control_decision_sha256",
@@ -184,7 +184,9 @@ _SCHEMA11_LAYER2_LEDGER_FIELDS = {
     "promoted_background_ledger",
     "promoted_root_ledger",
 }
-_SCHEMA11_FIELDS = _SCHEMA11_BASE_FIELDS | _SCHEMA11_LAYER2_LEDGER_FIELDS
+_SCHEMA11_PRE_PR75_FIELDS = _SCHEMA11_BASE_FIELDS | _SCHEMA11_LAYER2_LEDGER_FIELDS
+_SCHEMA11_FORENSIC_FIELDS = {"forensic_fixed_root_v2_history"}
+_SCHEMA11_FIELDS = _SCHEMA11_PRE_PR75_FIELDS | _SCHEMA11_FORENSIC_FIELDS
 _PASS_ENTRY_FIELDS = {
     "leaf_id",
     "pass",
@@ -885,6 +887,7 @@ def empty_schema11_checkpoint(
         "promoted_stage_ledger": {},
         "promoted_background_ledger": {},
         "promoted_root_ledger": {},
+        "forensic_fixed_root_v2_history": {},
         "attempts": [],
         "system_failures": [],
         "recovery_receipts": [],
@@ -2198,19 +2201,111 @@ def complete_promoted_publication(
     return result
 
 
+def _contains_fixed_root_v2_artifact(value: object) -> bool:
+    if isinstance(value, Mapping):
+        if value.get("schema") in {
+            "windows-solver.fixed-root-survey-batch/2",
+            "windows-solver.fixed-root-survey-batch-response/2",
+            "windows-solver.fixed-root-survey-conditioning/2",
+        }:
+            return True
+        return any(_contains_fixed_root_v2_artifact(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_fixed_root_v2_artifact(item) for item in value)
+    return False
+
+
+def _migrate_fixed_root_v2_forensic_history(
+    result: dict[str, object],
+) -> None:
+    """Retire `/2` exterior authority without replaying upstream work."""
+
+    queue = result.get("promotion_queue")
+    stages = result.get("promoted_stage_ledger")
+    forensic = result.get("forensic_fixed_root_v2_history")
+    pass_ledgers = result.get("survey_pass_ledger")
+    backgrounds = result.get("promoted_background_ledger")
+    if (
+        not isinstance(queue, Mapping)
+        or not isinstance(queue.get("entries"), list)
+        or not isinstance(stages, dict)
+        or not isinstance(forensic, dict)
+        or not isinstance(pass_ledgers, Mapping)
+        or not isinstance(pass_ledgers.get("promoted"), dict)
+        or not isinstance(backgrounds, dict)
+    ):
+        return
+    entries = queue["entries"]
+    for ordinal_key in list(stages):
+        bucket = stages.get(ordinal_key)
+        if not isinstance(ordinal_key, str) or not ordinal_key.isdigit() or not isinstance(bucket, dict):
+            continue
+        ordinal = int(ordinal_key)
+        if ordinal >= len(entries) or not isinstance(entries[ordinal], dict):
+            continue
+        entry = entries[ordinal]
+        for leaf_id in list(bucket):
+            stage = bucket.get(leaf_id)
+            if not isinstance(stage, Mapping) or not _contains_fixed_root_v2_artifact(stage):
+                continue
+            stage_content = {
+                name: item for name, item in stage.items() if name != "stage_sha256"
+            }
+            stage_sha256 = stage.get("stage_sha256")
+            if (
+                stage_sha256 != _sha256(stage_content)
+                or entry.get("leaf_id") != leaf_id
+                or entry.get("retained_promoted_stage_sha256") != stage_sha256
+            ):
+                raise ValueError("fixed-root /2 forensic source is unauthenticated")
+            promoted_pass = pass_ledgers["promoted"].pop(leaf_id, None)
+            background_bucket = backgrounds.get(ordinal_key)
+            promoted_background = None
+            if isinstance(background_bucket, dict):
+                promoted_background = background_bucket.pop(leaf_id, None)
+                if not background_bucket:
+                    backgrounds.pop(ordinal_key, None)
+            history_content = {
+                "schema": "windows-solver.fixed-root-v2-forensic-history/1",
+                "authority": "FORENSIC_ONLY",
+                "migration_reason": "FIXED_ROOT_ENDPOINT_RECOVERY_V3_REQUIRED",
+                "queue_ordinal": ordinal,
+                "leaf_id": leaf_id,
+                "source_stage_sha256": stage_sha256,
+                "source_stage": copy.deepcopy(dict(stage)),
+                "source_promoted_pass": copy.deepcopy(promoted_pass),
+                "source_promoted_background": copy.deepcopy(promoted_background),
+            }
+            history_content["history_sha256"] = _sha256(history_content)
+            forensic[f"{ordinal}:{leaf_id}"] = history_content
+            bucket.pop(leaf_id)
+            entry["minimum_requested_tier"] = "BF40"
+            entry["disposition"] = PromotionQueueDisposition.PENDING.value
+            entry["disposition_receipt_sha256"] = None
+            entry["retained_promoted_stage_sha256"] = None
+            result["state"] = "PARTIAL"
+        if not bucket:
+            stages.pop(ordinal_key, None)
+
+
 def validate_schema11_checkpoint(
     value: Mapping[str, object],
 ) -> dict[str, object]:
     if not isinstance(value, Mapping) or set(value) not in {
         frozenset(_SCHEMA11_BASE_FIELDS),
+        frozenset(_SCHEMA11_PRE_PR75_FIELDS),
         frozenset(_SCHEMA11_FIELDS),
     }:
         raise ValueError("schema-11 checkpoint envelope fields are invalid")
     result = copy.deepcopy(dict(value))
     if set(result) == _SCHEMA11_BASE_FIELDS:
         result.update({field: {} for field in _SCHEMA11_LAYER2_LEDGER_FIELDS})
+        result["forensic_fixed_root_v2_history"] = {}
+    elif set(result) == _SCHEMA11_PRE_PR75_FIELDS:
+        result["forensic_fixed_root_v2_history"] = {}
     if result["schema_version"] != CAMPAIGN_CHECKPOINT_SCHEMA_VERSION:
         raise ValueError("campaign checkpoint is not schema 11")
+    _migrate_fixed_root_v2_forensic_history(result)
     if not isinstance(result["campaign_id"], str) or not result["campaign_id"]:
         raise ValueError("schema-11 campaign_id is invalid")
     if not isinstance(result["selection_id"], str) or not result["selection_id"]:
@@ -2682,6 +2777,32 @@ def validate_schema11_checkpoint(
     for field in ("attempts", "system_failures", "recovery_receipts"):
         if not isinstance(result[field], list):
             raise ValueError(f"schema-11 {field} must be an array")
+    forensic = result["forensic_fixed_root_v2_history"]
+    if not isinstance(forensic, dict):
+        raise ValueError("schema-11 fixed-root forensic history is invalid")
+    for key, history in forensic.items():
+        if (
+            not isinstance(key, str)
+            or not isinstance(history, Mapping)
+            or set(history) != {
+                "schema", "authority", "migration_reason", "queue_ordinal",
+                "leaf_id", "source_stage_sha256", "source_stage",
+                "source_promoted_pass", "source_promoted_background",
+                "history_sha256",
+            }
+            or history.get("schema")
+            != "windows-solver.fixed-root-v2-forensic-history/1"
+            or history.get("authority") != "FORENSIC_ONLY"
+            or history.get("migration_reason")
+            != "FIXED_ROOT_ENDPOINT_RECOVERY_V3_REQUIRED"
+            or history.get("history_sha256") != _sha256({
+                name: item for name, item in history.items()
+                if name != "history_sha256"
+            })
+            or not _is_sha256(history.get("source_stage_sha256"))
+            or not _contains_fixed_root_v2_artifact(history.get("source_stage"))
+        ):
+            raise ValueError("schema-11 fixed-root forensic history is invalid")
     report = result["report_status_receipt"]
     if report is not None and not isinstance(report, Mapping):
         raise ValueError("schema-11 report status receipt is invalid")
