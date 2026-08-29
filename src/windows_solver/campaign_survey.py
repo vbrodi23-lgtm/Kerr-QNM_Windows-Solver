@@ -141,6 +141,7 @@ from .julia_response_backend import (
     validate_persisted_operation_control_receipt,
 )
 from .operation_control import (
+    ControlOutcomeKind,
     PromotedControlTransition,
     ValidatedControlReceipt,
     execution_identity_from_request,
@@ -3114,34 +3115,21 @@ def _control_decision_authorizes_bf80(
     *,
     action_kind: str | None = None,
 ) -> bool:
-    decision = outcome.calculation_artifact
-    if not isinstance(decision, Mapping):
+    transition = outcome.control_transition
+    if not isinstance(transition, PromotedControlTransition):
         return False
-    transition = decision.get("transition")
-    event = transition.get("event") if isinstance(transition, Mapping) else None
-    resolved = (
-        transition.get("outcome") if isinstance(transition, Mapping) else None
-    )
     return (
-        decision.get("schema") == _PROMOTED_CONTROL_DECISION_SCHEMA
-        and isinstance(event, Mapping)
-        and isinstance(resolved, Mapping)
-        and resolved.get("kind") == "PROMOTION_PENDING"
-        and resolved.get("next_tier") == "BF80"
+        transition.outcome_kind is ControlOutcomeKind.PROMOTION_PENDING
+        and transition.next_tier == "BF80"
         and (
             action_kind is None
-            or event.get("current_action_kind") == action_kind
+            or transition.current_action_kind == action_kind
         )
     )
 
 
 def _outcome_authorizes_bf80(outcome: PromotedPassOutcome) -> bool:
-    artifact = outcome.calculation_artifact
-    if isinstance(artifact, Mapping) and artifact.get("schema") == (
-        _PROMOTED_CONTROL_DECISION_SCHEMA
-    ):
-        return _control_decision_authorizes_bf80(outcome)
-    return False
+    return _control_decision_authorizes_bf80(outcome)
 
 
 def _control_trace_fields(outcome: PromotedPassOutcome) -> dict[str, object]:
@@ -3175,7 +3163,12 @@ def _control_trace_fields(outcome: PromotedPassOutcome) -> dict[str, object]:
         and isinstance(diagnostics.get("endpoint_receipts"), list)
         else []
     )
-    transition = decision.get("transition")
+    transition_authority = outcome.control_transition
+    transition = (
+        transition_authority.to_mapping()
+        if isinstance(transition_authority, PromotedControlTransition)
+        else None
+    )
     transition_outcome = (
         transition.get("outcome")
         if isinstance(transition, Mapping)
@@ -3204,7 +3197,11 @@ def _control_trace_fields(outcome: PromotedPassOutcome) -> dict[str, object]:
         "control_receipt_sha256": decision.get("control_receipt_sha256"),
         "control_return_sha256": decision.get("control_return_sha256"),
         "control_decision_sha256": decision.get("control_decision_sha256"),
-        "transition_id": decision.get("transition_id"),
+        "transition_id": (
+            transition_authority.transition_id
+            if isinstance(transition_authority, PromotedControlTransition)
+            else None
+        ),
         "outcome_kind": (
             transition_outcome.get("kind")
             if isinstance(transition_outcome, Mapping)
@@ -3220,9 +3217,21 @@ def _control_trace_fields(outcome: PromotedPassOutcome) -> dict[str, object]:
             if isinstance(transition_outcome, Mapping)
             else None
         ),
-        "current_action_kind": decision.get("current_action_kind"),
-        "current_tier": decision.get("current_tier"),
-        "next_tier": decision.get("next_tier"),
+        "current_action_kind": (
+            transition_authority.current_action_kind
+            if isinstance(transition_authority, PromotedControlTransition)
+            else None
+        ),
+        "current_tier": (
+            transition_authority.current_tier
+            if isinstance(transition_authority, PromotedControlTransition)
+            else None
+        ),
+        "next_tier": (
+            transition_authority.next_tier
+            if isinstance(transition_authority, PromotedControlTransition)
+            else None
+        ),
         "endpoint_branches": [
             item.get("endpoint_branch") for item in endpoint_receipts
             if isinstance(item, Mapping)
@@ -4314,7 +4323,7 @@ def _run_promoted_exterior_queue_entry(
             != retained_decision.get("control_decision_sha256")
         ):
             raise ValueError("promoted continuation lacks mandatory CONTROL proof")
-        _revalidate_promoted_control_proof(
+        continuation_authority = _revalidate_promoted_control_proof(
             raw_control_return,
             retained_decision,
             queue_ordinal=int(entry["queue_ordinal"]),
@@ -4346,6 +4355,9 @@ def _run_promoted_exterior_queue_entry(
                 reason_code=str(retained_decision.get("failure_code")),
                 precision_tiers=("BF40",),
                 calculation_artifact=retained_decision,
+                control_transition=(
+                    continuation_authority.classification.transition
+                ),
             )
         ):
             raise ValueError("promoted continuation does not authorize BF80")
@@ -6502,9 +6514,12 @@ def run_promoted_survey(
                     )
             if (
                 durable_control_decision
-                and isinstance(reduced.calculation_artifact, Mapping)
-                and reduced.calculation_artifact.get("disposition")
-                == FailureDisposition.SYSTEM_FAILURE.value
+                and isinstance(
+                    reduced.control_transition,
+                    PromotedControlTransition,
+                )
+                and reduced.control_transition.outcome_kind
+                is ControlOutcomeKind.SYSTEM_FAILURE
             ):
                 guarded(lambda: (_ for _ in ()).throw(
                     JuliaResponseBackendError(
