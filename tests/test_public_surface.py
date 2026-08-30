@@ -639,10 +639,22 @@ class PublicSurfaceTests(unittest.TestCase):
         for helper in (
             "function reconstruct_real_inner_horizon_match_state",
             "function assert_real_inner_exterior_preparations_ready",
-            "function fixed_root_exterior_horizon_recovery_geometry",
-            "function prepare_real_inner_exterior_horizon_ingoing",
+            "function recover_fixed_root_real_inner_horizon_endpoint",
         ):
             self.assertIn(helper, worker)
+
+        owner_start = worker.index(
+            "function recover_fixed_root_real_inner_horizon_endpoint"
+        )
+        owner_end = worker.index("\nfunction ", owner_start + 1)
+        owner_block = worker[owner_start:owner_end]
+        self.assertIn("build_worker_real_inner_horizon_contour", owner_block)
+        self.assertIn("CF.horizon_endpoint_geometry_candidates", owner_block)
+        self.assertIn("CF.horizon_endpoint_candidates", owner_block)
+        self.assertIn("CF.prepare_real_inner_horizon_endpoint", owner_block)
+        self.assertIn("real_inner_horizon_endpoint_receipt", owner_block)
+        self.assertNotIn("build_worker_contour_context", owner_block)
+        self.assertNotIn("CF.prepare_factored_horizon_ingoing", owner_block)
 
         recover_start = worker.index(
             "function recover_fixed_root_exterior_endpoints"
@@ -651,9 +663,8 @@ class PublicSurfaceTests(unittest.TestCase):
             "\nfunction evaluate_exterior_determinant", recover_start
         )
         recover_block = worker[recover_start:recover_end]
-        self.assertIn("build_worker_real_inner_horizon_contour", recover_block)
         self.assertIn(
-            "prepare_real_inner_exterior_horizon_ingoing", recover_block
+            "recover_fixed_root_real_inner_horizon_endpoint", recover_block
         )
         self.assertNotIn("build_worker_contour_context", recover_block)
         self.assertNotIn("CF.prepare_factored_horizon_ingoing", recover_block)
@@ -1974,10 +1985,14 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "insufficient-arithmetic-precision/v1",
             "insufficient-geometric-depth/v1",
             "cause-aware-fixed-root-exterior-endpoint-recovery/v1",
+            "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2",
             "bounded-doubling-prefix/v1",
             "bounded-negative-rho-depth/v1",
+            "bounded-real-inner-tortoise-depth/v1",
             "bounded-positive-rho-depth/v1",
             "windows-solver.fixed-root-v2-forensic-history/1",
+            "windows-solver.fixed-root-endpoint-forensic-history/2",
+            "windows-solver.exterior-endpoint-recovery-receipt/2",
             "forensic_fixed_root_v2_history",
             "_contains_fixed_root_v2_artifact",
             "_migrate_fixed_root_v2_forensic_history",

@@ -123,6 +123,41 @@ def _require_shared_batch_context(
     ):
         if getattr(background, field) != getattr(component, field):
             raise ValueError("promoted fixed-root worker batches disagree on context")
+    background_policy = {
+        (
+            sample.numerical_conditioning.mapping[
+                "endpoint_recovery_policy_identity"
+            ],
+            sample.numerical_conditioning.mapping[
+                "endpoint_recovery_policy_sha256"
+            ],
+            sample.numerical_conditioning.mapping[
+                "fixed_root_reliability_projection_sha256"
+            ],
+        )
+        for sample in background.samples
+    }
+    component_policy = {
+        (
+            sample.numerical_conditioning.mapping[
+                "endpoint_recovery_policy_identity"
+            ],
+            sample.numerical_conditioning.mapping[
+                "endpoint_recovery_policy_sha256"
+            ],
+            sample.numerical_conditioning.mapping[
+                "fixed_root_reliability_projection_sha256"
+            ],
+        )
+        for sample in component.samples
+    }
+    if (
+        len(background_policy) != 1
+        or background_policy != component_policy
+        or background.execution_identity["effective_policy_identity"]
+        != component.execution_identity["effective_policy_identity"]
+    ):
+        raise ValueError("promoted fixed-root worker batches disagree on policy")
 
 
 @dataclass(frozen=True, slots=True)

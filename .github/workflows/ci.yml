@@ -9,11 +9,96 @@ permissions:
   contents: read
 
 jobs:
-  julia-factored-gsn:
+  real-inner-fixed-root-seam:
     runs-on: ubuntu-latest
-    # The authenticated PR75 lifecycle now includes the real Julia worker
-    # process seam after the complete vendored suite and regression harnesses.
-    timeout-minutes: 60
+    timeout-minutes: 120
+    env:
+      M02_PROJECT: .ci/m02-project
+      M02_PROJECT_SEED: src/windows_solver/data/julia/m02_project
+      GSN_PROJECT: src/windows_solver/data/julia/GeneralizedSasakiNakamura.jl
+      ANGULAR_PROJECT: src/windows_solver/data/julia/SpinWeightedSpheroidalHarmonics.jl
+      JULIA_NUM_THREADS: "1"
+      JULIA_NUM_PRECOMPILE_TASKS: "4"
+      JULIA_PKG_PRECOMPILE_AUTO: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package
+        run: python -m pip install ".[numerical-tests]"
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: "1.10.11"
+      - name: Materialize pinned M02 Julia project
+        shell: bash
+        run: |
+          julia --startup-file=no --history-file=no -e '
+            seed_project = abspath(ENV["M02_PROJECT_SEED"])
+            project = abspath(ENV["M02_PROJECT"])
+            mkpath(project)
+            cp(
+              joinpath(seed_project, "Project.toml"),
+              joinpath(project, "Project.toml");
+              force=true,
+            )
+            let manifest = read(joinpath(seed_project, "Manifest.seed.toml"), String)
+              for source in (ENV["GSN_PROJECT"], ENV["ANGULAR_PROJECT"])
+                source_path = abspath(source)
+                seed_path = string(
+                  "path = \"../vendor/", basename(source_path), "\""
+                )
+                pinned_path = string(
+                  "path = \"", replace(source_path, "\\" => "/"), "\""
+                )
+                occursin(seed_path, manifest) || error(
+                  "seed manifest lacks path dependency: $seed_path"
+                )
+                manifest = replace(manifest, seed_path => pinned_path)
+              end
+              occursin("../vendor/", manifest) && error(
+                "materialized manifest retains a seed vendor path"
+              )
+              write(joinpath(project, "Manifest.toml"), manifest)
+            end
+          '
+      - uses: julia-actions/cache@v3
+        with:
+          delete-old-caches: "false"
+      - name: Instantiate and precompile pinned M02 project
+        shell: bash
+        run: |
+          julia --startup-file=no --history-file=no --project="$M02_PROJECT" -e '
+            using Pkg
+            Pkg.instantiate()
+            Pkg.precompile()
+          '
+      - name: Stage immutable M02 worker bundle
+        shell: bash
+        run: |
+          runtime_root="$RUNNER_TEMP/m02-worker-runtime"
+          receipt="$RUNNER_TEMP/m02-worker-bundle.json"
+          python tools/stage_m02_worker_bundle.py \
+            --runtime-root "$runtime_root" \
+            --receipt "$receipt"
+          echo "M02_WORKER_BUNDLE_RECEIPT=$receipt" >> "$GITHUB_ENV"
+      - name: Run deterministic real-inner fixed-root endpoint contract
+        shell: bash
+        run: |
+          julia --startup-file=no --history-file=no --project="$M02_PROJECT" \
+            tests/julia/test_m02_exterior_real_inner_endpoint.jl
+      - name: Run installed-worker real-inner production seam
+        shell: bash
+        env:
+          PR76_REAL_INNER_PRODUCTION_SEAM: "1"
+        run: |
+          python -m unittest \
+            tests.test_m02_exterior_real_inner_production_seam -v
+
+  julia-factored-gsn:
+    needs: real-inner-fixed-root-seam
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
     env:
       M02_PROJECT: .ci/m02-project
       M02_PROJECT_SEED: src/windows_solver/data/julia/m02_project
@@ -126,6 +211,7 @@ jobs:
             tests.test_pr75_fixed_root_process_seam -v
 
   test:
+    needs: real-inner-fixed-root-seam
     strategy:
       fail-fast: false
       matrix:
