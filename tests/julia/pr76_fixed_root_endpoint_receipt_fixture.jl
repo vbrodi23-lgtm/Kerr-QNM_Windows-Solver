@@ -16,6 +16,10 @@ function deterministic_endpoint_receipts(
     else
         parse_real(T, request, "support_lower")
     end
+    match_radius_text = canonical_real_inner_horizon_match_radius_text(
+        request,
+        match_radius,
+    )
     spin = parse_real(T, request, "spin")
     rplus = one(T) + sqrt(one(T) - spin^2)
     horizon_distance = T("0.01")
@@ -50,7 +54,7 @@ function deterministic_endpoint_receipts(
         "contour_identity" => "real-inner-tortoise-contour/v1",
         "recovery_policy_identity" => required(policy, "identity"),
         "recovery_policy_sha256" => required(policy, "policy_sha256"),
-        "match_radius" => numeric_text(match_radius),
+        "match_radius" => match_radius_text,
         "rstar_match" => "1",
         "rho_floor" => required(policy, "horizon_endpoint_rho_floor"),
         "rho_schedule" => horizon_schedule,
