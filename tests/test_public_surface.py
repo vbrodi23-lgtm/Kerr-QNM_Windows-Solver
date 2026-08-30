@@ -612,6 +612,114 @@ class PublicSurfaceTests(unittest.TestCase):
             self.assertFalse((worker_dir / resource_name).is_file())
             self.assertTrue((data_root / resource_name).is_file())
 
+    def test_exterior_determinant_uses_the_verified_real_inner_horizon_contour(
+        self,
+    ) -> None:
+        """The exterior horizon-ingoing endpoint must be seeded on the same
+        real-inner contour proven to approach r_plus, not on the joined,
+        frequency-aligned contour the library's own comments warn is not
+        guaranteed to approach the horizon for damped modes.
+
+        Regression guard for the defect where every exterior mechanism's
+        horizon-ingoing endpoint was prepared on
+        build_worker_contour_context()/CF.prepare_factored_horizon_ingoing()
+        -- the same joined-contour pipeline already migrated away from for
+        the standalone horizon-admittance mechanism -- causing the
+        asymptotic series to be evaluated on a trajectory that never
+        actually approached the horizon (last_term_ratio pinned near 1
+        regardless of series order or search depth).
+        """
+        root = Path(__file__).resolve().parents[1]
+        worker = (
+            root / "src" / "windows_solver" / "data" / "julia" / "m02_worker.jl"
+        ).read_text(encoding="utf-8")
+
+        # New orchestration helpers must exist and must not reintroduce the
+        # joined-contour horizon-ingoing pipeline.
+        for helper in (
+            "function reconstruct_real_inner_horizon_match_state",
+            "function assert_real_inner_exterior_preparations_ready",
+            "function fixed_root_exterior_horizon_recovery_geometry",
+            "function prepare_real_inner_exterior_horizon_ingoing",
+        ):
+            self.assertIn(helper, worker)
+
+        recover_start = worker.index(
+            "function recover_fixed_root_exterior_endpoints"
+        )
+        recover_end = worker.index(
+            "\nfunction evaluate_exterior_determinant", recover_start
+        )
+        recover_block = worker[recover_start:recover_end]
+        self.assertIn("build_worker_real_inner_horizon_contour", recover_block)
+        self.assertIn(
+            "prepare_real_inner_exterior_horizon_ingoing", recover_block
+        )
+        self.assertNotIn("build_worker_contour_context", recover_block)
+        self.assertNotIn("CF.prepare_factored_horizon_ingoing", recover_block)
+
+        determinant_start = worker.index(
+            "function evaluate_exterior_determinant"
+        )
+        determinant_end = worker.index(
+            "\nfunction ", determinant_start + 1
+        )
+        determinant_block = worker[determinant_start:determinant_end]
+
+        # All three branches (fixed-root survey, certificate-required, and
+        # the default certification path) must build the horizon-ingoing
+        # endpoint on the real-inner contour, never the joined one.
+        self.assertEqual(
+            determinant_block.count("build_worker_real_inner_horizon_contour"),
+            2,
+            "exterior_certificate_required and the default branch must each "
+            "build the real-inner horizon contour",
+        )
+        self.assertNotIn(
+            'build_worker_contour_context(\n            T, request, spectral, lower, "Xin"',
+            determinant_block,
+        )
+        self.assertEqual(
+            determinant_block.count(
+                "prepare_real_inner_exterior_horizon_ingoing"
+            ),
+            2,
+        )
+        self.assertNotIn(
+            "CF.prepare_factored_horizon_ingoing", determinant_block
+        )
+
+        # The horizon leg must propagate and reconstruct through the
+        # real-inner pipeline, not the joined-contour one.
+        self.assertIn(
+            "CF.solve_factored_horizon_branch_to_match", determinant_block
+        )
+        self.assertNotIn(
+            "CF.solve_factored_xin_to_match(", determinant_block
+        )
+        self.assertIn(
+            "xin_match = reconstruct_real_inner_horizon_match_state",
+            determinant_block,
+        )
+        self.assertNotIn(
+            "xin_match = CF.reconstruct_factored_match_state",
+            determinant_block,
+        )
+        # The infinity leg is unaffected by this defect and must still use
+        # the joined-contour pipeline unchanged.
+        self.assertIn("CF.solve_factored_xup_to_match", determinant_block)
+        self.assertIn(
+            "xup_match = CF.reconstruct_factored_match_state",
+            determinant_block,
+        )
+        self.assertIn(
+            "assert_real_inner_exterior_preparations_ready", determinant_block
+        )
+        self.assertNotIn(
+            "CF.assert_factored_exterior_preparations_ready",
+            determinant_block,
+        )
+
     def test_m02_bootstrap_configures_utf8_console_before_julia(self) -> None:
         root = Path(__file__).resolve().parents[1]
         bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(

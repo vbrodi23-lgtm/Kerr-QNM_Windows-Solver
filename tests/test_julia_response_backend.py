@@ -2662,9 +2662,17 @@ class JuliaResponseBackendTests(unittest.TestCase):
             "solve_xup_scattering_coefficients",
         ):
             self.assertNotIn(f"function {retired}(", worker)
-        self.assertIn("CF.prepare_factored_horizon_ingoing(", worker)
+        # The exterior determinant's horizon-ingoing leg was migrated off the
+        # joined-contour pipeline onto the same verified real-inner contour
+        # already used by the standalone horizon-admittance mechanism, so
+        # these two joined-contour calls must not reappear for that leg.
+        self.assertNotIn("CF.prepare_factored_horizon_ingoing(", worker)
+        self.assertNotIn("CF.solve_factored_xin_to_match(", worker)
+        self.assertIn("CF.prepare_real_inner_horizon_endpoint(", worker)
+        self.assertIn("CF.solve_factored_horizon_branch_to_match(", worker)
+        # The infinity-outgoing leg is unaffected and must remain on the
+        # joined-contour pipeline unchanged.
         self.assertIn("CF.prepare_factored_infinity_outgoing(", worker)
-        self.assertIn("CF.solve_factored_xin_to_match(", worker)
         self.assertIn("CF.solve_factored_xup_to_match(", worker)
 
     def test_promoted_branch_authentication_uses_a_mode_specific_enclosure(self):

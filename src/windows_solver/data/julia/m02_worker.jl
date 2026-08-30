@@ -4341,36 +4341,200 @@ function exterior_endpoint_recovery_failure(
     )
 end
 
+"""
+    reconstruct_real_inner_horizon_match_state(propagated, spectral, contour)
+
+Reconstruct the physical `(X, dX/drstar)` state at the match radius from a
+horizon-ingoing solution propagated on a real-inner horizon contour.
+
+`CF.reconstruct_factored_match_state` only dispatches on
+`ComplexContourContext`, because it resolves the branch tangent through
+`CF._branch_tangent`, which has no method for `RealInnerHorizonContour`. A
+real-inner contour carries a single real unit tangent regardless of branch, so
+the reconstruction is written out here directly instead of widening that
+library dispatch. This mirrors `CF.reconstruct_factored_match_state`'s body
+exactly -- the same `CF.reconstruct_state` call and the same tangent division
+-- substituting the real-inner contour's own provenance check and its single
+`tangent` field for the joined contour's per-branch tangent lookup.
+"""
+function reconstruct_real_inner_horizon_match_state(
+    propagated,
+    spectral::CF.HomogeneousSpectralContext{T},
+    contour,
+) where {T<:AbstractFloat}
+    contour.contour_id == CF.REAL_INNER_HORIZON_CONTOUR_ID || error(
+        "real-inner horizon contour identity changed"
+    )
+    contour.precision_bits == spectral.precision_bits || error(
+        "real-inner horizon contour precision does not match the spectral context"
+    )
+    propagated.carrier.kind === CF.HORIZON_INGOING || error(
+        "real-inner horizon match-state reconstruction requires a " *
+        "horizon-ingoing propagated solution"
+    )
+    propagated.endpoint_rho == zero(T) || error(
+        "real-inner horizon match-state reconstruction is defined at rho=0"
+    )
+    raw = reconstruct_state(
+        propagated.endpoint, propagated.carrier, propagated.endpoint_rho
+    )
+    tangent = contour.tangent
+    isfinite(real(tangent)) && isfinite(imag(tangent)) && !iszero(tangent) ||
+        error("real-inner horizon contour tangent is nonfinite or zero")
+    dX_drstar = raw.Xrho / tangent
+    isfinite(real(raw.X)) && isfinite(imag(raw.X)) &&
+        isfinite(real(raw.Xrho)) && isfinite(imag(raw.Xrho)) &&
+        isfinite(real(dX_drstar)) && isfinite(imag(dX_drstar)) || error(
+            "reconstructed real-inner horizon match state is nonfinite"
+        )
+    return CF.FactoredMatchState{T}(
+        raw.X,
+        raw.Xrho,
+        dX_drstar,
+        propagated.endpoint_rho,
+        propagated.carrier.kind,
+        tangent,
+        CF.MATCH_RADIAL_DERIVATIVE_CONVENTION_ID,
+    )
+end
+
+"""
+    assert_real_inner_exterior_preparations_ready(spectral, horizon_contour,
+                                                   horizon_ingoing,
+                                                   infinity_contour,
+                                                   infinity_outgoing)
+
+Fail closed before any factored homogeneous RHS work when either leg of a
+real-inner-horizon exterior determinant is not ready.
+
+`CF.assert_factored_exterior_preparations_ready` only dispatches on
+`ComplexContourContext` and `FactoredEndpointPreparation` for both legs, so it
+cannot accept the real-inner horizon leg's `RealInnerHorizonContour` and
+`RealInnerHorizonEndpoint`. This checks the two legs directly instead of
+calling that library function. Every check here is otherwise redundant with
+one the downstream `CF.prepare_real_inner_horizon_endpoint` /
+`CF.solve_factored_horizon_branch_to_match` / `CF.solve_factored_xup_to_match`
+calls already perform internally before touching the homogeneous ODE; this
+function exists only to fail before either leg starts, rather than after one
+leg has already spent RHS work while the other is invalid.
+"""
+function assert_real_inner_exterior_preparations_ready(
+    spectral::CF.HomogeneousSpectralContext{T},
+    horizon_contour,
+    horizon_ingoing,
+    infinity_contour::CF.ComplexContourContext{T},
+    infinity_outgoing::CF.FactoredEndpointPreparation{T},
+) where {T<:AbstractFloat}
+    horizon_contour.contour_id == CF.REAL_INNER_HORIZON_CONTOUR_ID || error(
+        "exterior horizon-ingoing contour identity changed"
+    )
+    horizon_ingoing.branch === CF.HORIZON_INGOING || error(
+        "exterior horizon-ingoing preparation branch slot is not canonical"
+    )
+    horizon_ingoing.assessment.adequate || error(
+        "exterior horizon-ingoing preparation is not adequate"
+    )
+    infinity_outgoing.branch === CF.INFINITY_OUTGOING || error(
+        "exterior infinity-outgoing preparation branch slot is not canonical"
+    )
+    CF.assert_factored_preflights_adequate(infinity_outgoing)
+    return nothing
+end
+
+"""
+    fixed_root_exterior_horizon_recovery_geometry(T, request)
+
+Return the shallow-first geometry candidate ladder for the exterior
+horizon-ingoing endpoint, deepened to its declared floor.
+
+The real-inner contour's own solved range is bounded by
+`horizon_rho_inner_min`, so its candidate geometry must be drawn from
+`horizon_endpoint_rho_candidates` (the same request fields the standalone
+horizon-admittance mechanism already uses), not from
+`fixed_root_endpoint_recovery_policy.horizon_geometry_schedule` -- that
+schedule was sized for the joined contour's own, much deeper, solved range
+and can fall outside the real-inner contour's bound.
+"""
+function fixed_root_exterior_horizon_recovery_geometry(
+    ::Type{T}, request
+) where {T<:AbstractFloat}
+    candidates = horizon_endpoint_rho_candidates(T, request)
+    floor = horizon_endpoint_rho_floor(T, request)
+    while true
+        deeper = CF.deepen_horizon_endpoint_rho_candidates(candidates, floor)
+        deeper === nothing && break
+        candidates = deeper
+    end
+    return candidates
+end
+
+"""
+    prepare_real_inner_exterior_horizon_ingoing(request, spectral, contour,
+                                                 order, geometry,
+                                                 required_digits)
+
+Prepare the exterior determinant's horizon-ingoing endpoint on the real-inner
+contour already proven to approach `r_plus` (`build_worker_real_inner_horizon_contour`),
+using the same `CF.horizon_endpoint_geometry_candidates` /
+`CF.horizon_endpoint_candidates` / `CF.prepare_real_inner_horizon_endpoint`
+sequence `evaluate_horizon_determinant` already relies on for the standalone
+horizon-admittance mechanism -- just evaluated for a single `(order, geometry)`
+pair, since this function is called once per attempt from inside
+`CF.recover_single_factored_endpoint`'s generic order/geometry recovery
+driver. That driver only reads `preparation.assessment`, so it accepts a
+`CF.RealInnerHorizonEndpoint` returned here exactly as it accepts the joined
+contour's `CF.FactoredEndpointPreparation`.
+"""
+function prepare_real_inner_exterior_horizon_ingoing(
+    request,
+    spectral::CF.HomogeneousSpectralContext{T},
+    contour,
+    order::Int,
+    geometry::T,
+    required_digits::T,
+) where {T<:AbstractFloat}
+    maximum_horizon_distance = parse_real(
+        T, request, "horizon_maximum_endpoint_distance"
+    )
+    geometry_candidates = CF.horizon_endpoint_geometry_candidates(
+        spectral, contour;
+        rho_candidates=T[geometry],
+        maximum_horizon_distance=maximum_horizon_distance,
+    )
+    candidates = CF.horizon_endpoint_candidates(
+        spectral, contour, geometry_candidates, required_digits;
+        endpoint_orders=Int[order],
+    )
+    candidate = only(candidates)
+    return CF.prepare_real_inner_horizon_endpoint(
+        spectral, contour, candidate, CF.HORIZON_INGOING, required_digits
+    )
+end
+
 function recover_fixed_root_exterior_endpoints(
     ::Type{T}, request, spectral::CF.HomogeneousSpectralContext{T},
     horizon_match_radius::T, infinity_match_radius::T,
     required_digits::T,
 ) where {T<:AbstractFloat}
-    policy, orders, horizon_schedule, infinity_schedule =
+    policy, orders, _unused_horizon_schedule, infinity_schedule =
         fixed_root_endpoint_recovery_schedules(T, request)
     policy_identity = string(required(policy, "identity"))
     rhs_counter = Ref(0)
 
-    horizon_cap = build_worker_contour_context(
+    horizon_cap = build_worker_real_inner_horizon_contour(
         T, request, spectral, horizon_match_radius,
         "fixed-root-horizon-endpoint-cap",
     )
+    horizon_schedule =
+        fixed_root_exterior_horizon_recovery_geometry(T, request)
     horizon_recovery = CF.recover_single_factored_endpoint(
         "horizon-ingoing", orders, horizon_schedule, policy_identity,
         (order, geometry) -> begin
-            contour = geometry == horizon_cap.rho_in ? horizon_cap :
-                CF.build_contour_context(
-                    spectral,
-                    horizon_match_radius,
-                    horizon_cap.rstar_match,
-                    geometry,
-                    horizon_cap.rho_out,
-                    horizon_cap.radius_from_rho,
-                )
-            preparation = CF.prepare_factored_horizon_ingoing(
-                spectral, contour, required_digits; order=order
+            preparation = prepare_real_inner_exterior_horizon_ingoing(
+                request, spectral, horizon_cap, order, geometry,
+                required_digits,
             )
-            return preparation, contour
+            return preparation, horizon_cap
         end;
         factored_homogeneous_rhs_counter=rhs_counter,
     )
@@ -4482,11 +4646,16 @@ function evaluate_exterior_determinant(
             rhs_counter,
         )
     elseif exterior_certificate_required
-        horizon_contour = build_worker_contour_context(
+        horizon_contour = build_worker_real_inner_horizon_contour(
             T, request, spectral, lower, "Xin"
         )
-        horizon_preparation = CF.prepare_factored_horizon_ingoing(
-            spectral, horizon_contour, required_digits
+        horizon_preparation = prepare_real_inner_exterior_horizon_ingoing(
+            request,
+            spectral,
+            horizon_contour,
+            spectral.endpoint_order,
+            first(fixed_root_exterior_horizon_recovery_geometry(T, request)),
+            required_digits,
         )
         outer, preparation, comparison, comparison_preparation =
         select_worker_outer_endpoint_pair(
@@ -4502,11 +4671,16 @@ function evaluate_exterior_determinant(
             comparison, comparison_preparation, Ref(0),
         )
     else
-        horizon_contour = build_worker_contour_context(
+        horizon_contour = build_worker_real_inner_horizon_contour(
             T, request, spectral, lower, "Xin"
         )
-        horizon_preparation = CF.prepare_factored_horizon_ingoing(
-            spectral, horizon_contour, required_digits
+        horizon_preparation = prepare_real_inner_exterior_horizon_ingoing(
+            request,
+            spectral,
+            horizon_contour,
+            spectral.endpoint_order,
+            first(fixed_root_exterior_horizon_recovery_geometry(T, request)),
+            required_digits,
         )
         contour = build_worker_contour_context(
             T, request, spectral, readout, "Xup"
@@ -4526,7 +4700,7 @@ function evaluate_exterior_determinant(
     # Authenticate both distinct match-radius preparations before testing
     # either assessment. An inadequate branch exits before readiness,
     # observers, or any factored homogeneous RHS evaluation.
-    CF.assert_factored_exterior_preparations_ready(
+    assert_real_inner_exterior_preparations_ready(
         spectral,
         lower_contour,
         horizon_ingoing,
@@ -4551,10 +4725,11 @@ function evaluate_exterior_determinant(
         factored_homogeneous_rhs_counter=factored_homogeneous_rhs_counter,
     )
     xin_propagated = progress_operation("Xin") do
-        CF.solve_factored_xin_to_match(
+        CF.solve_factored_horizon_branch_to_match(
             spectral,
             lower_contour,
             horizon_ingoing;
+            ode_leg="Xin_inner_to_match",
             common_solve_options...,
         )
     end
@@ -4582,7 +4757,7 @@ function evaluate_exterior_determinant(
     emit_factored_solution(xup_propagated)
     comparison_xup_propagated === nothing ||
         emit_factored_solution(comparison_xup_propagated)
-    xin_match = CF.reconstruct_factored_match_state(
+    xin_match = reconstruct_real_inner_horizon_match_state(
         xin_propagated, spectral, lower_contour
     )
     xup_match = CF.reconstruct_factored_match_state(
