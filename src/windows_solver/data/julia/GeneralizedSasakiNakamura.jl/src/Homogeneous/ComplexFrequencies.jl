@@ -2799,6 +2799,26 @@ function _candidate_adequate(
         candidate.outgoing_assessment !== nothing
 end
 
+function _branch_candidate_adequate(
+    candidate::HorizonEndpointCandidate{T},
+    maximum_horizon_distance::T,
+    branch::CarrierKind,
+) where {T<:AbstractFloat}
+    _geometry_candidate_adequate(
+        candidate.geometry, maximum_horizon_distance
+    ) || return false
+    if branch === HORIZON_INGOING
+        return candidate.ingoing_adequate &&
+            candidate.ingoing_evaluation !== nothing &&
+            candidate.ingoing_assessment !== nothing
+    elseif branch === HORIZON_OUTGOING
+        return candidate.outgoing_adequate &&
+            candidate.outgoing_evaluation !== nothing &&
+            candidate.outgoing_assessment !== nothing
+    end
+    return false
+end
+
 """
     horizon_endpoint_limitation(candidate, maximum_horizon_distance)
 
@@ -3999,8 +4019,8 @@ function prepare_real_inner_horizon_endpoint(
                     spectral.precision_bits,
                     "real-inner endpoint branch must be a horizon branch",
                 ))
-            _candidate_adequate(
-                candidate, candidate.geometry.horizon_distance
+            _branch_candidate_adequate(
+                candidate, candidate.geometry.horizon_distance, branch
             ) || throw(_factored_error(
                 T,
                 NO_VERIFIED_HORIZON_ENDPOINT,

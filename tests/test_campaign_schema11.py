@@ -4,6 +4,9 @@ import copy
 import hashlib
 import unittest
 
+from windows_solver.campaign_recovery import (
+    migrate_fixed_root_endpoint_policy_checkpoint,
+)
 from windows_solver.campaign_policy import (
     EvidenceLevel,
     PromotionQueueDisposition,
@@ -14,6 +17,7 @@ from windows_solver.campaign_policy import (
     append_promotion,
     empty_schema11_checkpoint,
     finish_promotion,
+    promotion_source_fingerprint_sha256,
     record_evidence,
     record_survey_disposition,
     retain_promoted_calculation,
@@ -341,6 +345,152 @@ class Schema11CheckpointTests(unittest.TestCase):
         history = migrated["forensic_fixed_root_v2_history"]["0:leaf-1"]
         self.assertEqual("FORENSIC_ONLY", history["authority"])
         self.assertEqual(stage, history["source_stage"])
+
+    def test_v1_endpoint_stage_migrates_forensically_with_zero_numerics(self) -> None:
+        checkpoint = append_promotion(
+            empty_schema11_checkpoint("campaign-1", "selection-1"),
+            leaf_id="leaf-1",
+            queue_kind=PromotionQueueKind.RESPONSE,
+            reason_code="REVIEWED_ERROR_EVIDENCE_PENDING",
+            minimum_requested_tier="BF40",
+            scientific_computation_identity="b" * 64,
+        )
+        source_policy_binding = {
+            "schema": "windows-solver.fixed-root-endpoint-recovery-policy/1",
+            "identity": "cause-aware-fixed-root-exterior-endpoint-recovery/v1",
+            "endpoint_order_rule": "bounded-doubling-prefix/v1",
+            "base_endpoint_order": 28,
+            "generated_maximum_order": 112,
+            "endpoint_order_schedule": [28, 56, 112],
+            "horizon_geometry_rule": "bounded-negative-rho-depth/v1",
+            "horizon_geometry_schedule": ["-5000", "-10000", "-20000"],
+            "infinity_geometry_rule": "bounded-positive-rho-depth/v1",
+            "infinity_geometry_schedule": [
+                "100", "250", "500", "1000", "2000", "5000", "10000",
+                "20000",
+            ],
+            "fixed_root_reliability_target_abs": "2e-11",
+            "fixed_root_reliability_rule": (
+                "minus-log10-target-plus-required-digit-guard/v1"
+            ),
+            "required_digit_guard": 6,
+            "precision_digits": 40,
+            "semantic_precision_tier": "bigfloat-40",
+        }
+        source_policy = {
+            **source_policy_binding,
+            "policy_sha256": _sha256(source_policy_binding),
+        }
+        stage_content = {
+            "schema": "windows-solver.promoted-calculation-stage/1",
+            "leaf_id": "leaf-1",
+            "queue_ordinal": 0,
+            "route": "EXTERIOR_BF40",
+            "execution_mode": "CALCULATE_ONLY",
+            "admission_state": "AWAITING_ADMISSION",
+            "precision_tiers": ["BF40"],
+            "batch": {
+                "schema": "windows-solver.fixed-root-survey-batch/3",
+                "fixed_root_endpoint_recovery_policy": source_policy,
+                "sample_count": 5,
+            },
+            "receipts": [{
+                "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
+                "reason": "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED",
+            }],
+        }
+        stage = {**stage_content, "stage_sha256": _sha256(stage_content)}
+        checkpoint = retain_promoted_calculation(
+            checkpoint,
+            queue_ordinal=0,
+            promoted_stage=stage,
+            execution_mode="CALCULATE_ONLY",
+            disposition_receipt={"schema": "admission-pending/v1"},
+            promoted_background={"status": "ACQUIRED"},
+            promoted_root={"root_seal_sha256": "d" * 64},
+        )
+        checkpoint = record_survey_disposition(
+            checkpoint,
+            survey_pass=SurveyPass.PROMOTED,
+            leaf_id="leaf-1",
+            disposition=SurveyDisposition.CALCULATED_AWAITING_ADMISSION,
+            reason_code="AWAITING_INDEPENDENT_REVIEW_ADMISSION",
+            **_pass_limits(),
+        )
+        checkpoint["system_failures"].append({
+            "failure_code": "PRESERVED_HISTORY_FIXTURE",
+            "leaf_id": "unrelated-leaf",
+        })
+        source_entry = copy.deepcopy(
+            checkpoint["promotion_queue"]["entries"][0]
+        )
+        source_fingerprint = promotion_source_fingerprint_sha256(source_entry)
+        preserved_binary64 = copy.deepcopy(
+            checkpoint["survey_pass_ledger"]["binary64"]
+        )
+        preserved_failures = copy.deepcopy(checkpoint["system_failures"])
+        preserved_campaign = checkpoint["campaign_id"]
+        preserved_selection = checkpoint["selection_id"]
+
+        migrated = migrate_fixed_root_endpoint_policy_checkpoint(checkpoint)
+
+        entry = migrated["promotion_queue"]["entries"][0]
+        self.assertEqual("PENDING", entry["disposition"])
+        self.assertEqual("BF40", entry["minimum_requested_tier"])
+        self.assertEqual(source_fingerprint, entry["source_fingerprint_sha256"])
+        self.assertEqual(source_fingerprint,
+            promotion_source_fingerprint_sha256(entry))
+        self.assertEqual(
+            source_entry["scientific_computation_identity"],
+            entry["scientific_computation_identity"],
+        )
+        self.assertEqual(preserved_campaign, migrated["campaign_id"])
+        self.assertEqual(preserved_selection, migrated["selection_id"])
+        self.assertEqual(
+            preserved_binary64, migrated["survey_pass_ledger"]["binary64"]
+        )
+        self.assertEqual(preserved_failures, migrated["system_failures"])
+        self.assertIsNone(entry["retained_promoted_stage_sha256"])
+        self.assertEqual({}, migrated["promoted_stage_ledger"])
+        self.assertEqual({}, migrated["promoted_background_ledger"])
+        self.assertEqual({}, migrated["survey_pass_ledger"]["promoted"])
+        self.assertEqual(
+            "d" * 64,
+            migrated["promoted_root_ledger"]["0"]["leaf-1"]["payload"][
+                "root_seal_sha256"
+            ],
+        )
+        history = migrated["forensic_fixed_root_v2_history"]["0:leaf-1"]
+        self.assertEqual("FORENSIC_ONLY", history["authority"])
+        self.assertEqual(stage, history["source_stage"])
+        self.assertEqual(
+            "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2",
+            history["replacement_recovery_policy_identity"],
+        )
+        self.assertEqual(
+            "c16dc97b3288277320068a4fa23ad75aaa94e396c768b141d78812504674f104",
+            history["replacement_recovery_policy_sha256"],
+        )
+        self.assertEqual(
+            "bigfloat-40",
+            history["replacement_recovery_policy"]["semantic_precision_tier"],
+        )
+        self.assertEqual(
+            [
+                "-10", "-25", "-50", "-75", "-100", "-150", "-225",
+                "-337.5", "-400",
+            ],
+            history["replacement_recovery_policy"]["horizon_geometry_schedule"],
+        )
+        self.assertEqual(
+            {
+                "root_solves": 0,
+                "determinant_calls": 0,
+                "ode_calls": 0,
+                "sample_calls": 0,
+            },
+            history["numerical_migration_work"],
+        )
 
     def test_legacy_stage_cannot_smuggle_an_unknown_typed_artifact(self) -> None:
         checkpoint = append_promotion(

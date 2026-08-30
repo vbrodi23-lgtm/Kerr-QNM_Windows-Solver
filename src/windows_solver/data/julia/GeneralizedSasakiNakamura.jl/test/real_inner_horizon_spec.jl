@@ -288,6 +288,58 @@ end
     @test !candidates[1].outgoing_adequate
 end
 
+@testset "ingoing preparation ignores unrelated outgoing inadequacy" begin
+    T = BigFloat
+    context = horizon_spec_context(T)
+    radial = real_inner_map(context, T)
+    contour = CF_HORIZON.build_real_inner_horizon_contour(
+        context.spectral, context.match_radius, context.rstar_match,
+        -T(100), radial,
+    )
+    maximum_distance = T(1) / T(10)
+    required_digits = T(5)
+    candidates = horizon_series_candidates(
+        context,
+        contour,
+        horizon_geometry_candidates(
+            context, contour; maximum_distance=maximum_distance
+        );
+        required_digits=required_digits,
+        maximum_distance=maximum_distance,
+    )
+    adequate_ingoing = filter(
+        candidate -> candidate.ingoing_adequate &&
+            candidate.ingoing_evaluation !== nothing &&
+            candidate.ingoing_assessment !== nothing,
+        candidates,
+    )
+    @test !isempty(adequate_ingoing)
+    if !isempty(adequate_ingoing)
+        candidate = first(adequate_ingoing)
+        ingoing_only = CF_HORIZON.HorizonEndpointCandidate{T}(
+            candidate.geometry,
+            true,
+            false,
+            candidate.ingoing_evaluation,
+            nothing,
+            candidate.ingoing_assessment,
+            nothing,
+            candidate.endpoint_order,
+            candidate.attempted_endpoint_order,
+        )
+        prepared = CF_HORIZON.prepare_real_inner_horizon_endpoint(
+            context.spectral,
+            contour,
+            ingoing_only,
+            FS_HORIZON.HORIZON_INGOING,
+            required_digits,
+        )
+        @test prepared.branch === FS_HORIZON.HORIZON_INGOING
+        @test prepared.assessment.adequate
+        @test prepared.endpoint_order == candidate.ingoing_evaluation.order
+    end
+end
+
 @testset "verification requires a second adequate endpoint" begin
     T = BigFloat
     context = horizon_spec_context(T)

@@ -31,10 +31,14 @@ const FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA =
 const FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_SCHEMA =
     "windows-solver.fixed-root-endpoint-recovery-policy/1"
 const FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_IDENTITY =
-    "cause-aware-fixed-root-exterior-endpoint-recovery/v1"
+    "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2"
 const FIXED_ROOT_ENDPOINT_ORDER_RULE = "bounded-doubling-prefix/v1"
-const FIXED_ROOT_HORIZON_GEOMETRY_RULE = "bounded-negative-rho-depth/v1"
+const FIXED_ROOT_HORIZON_GEOMETRY_RULE =
+    "bounded-real-inner-tortoise-depth/v1"
 const FIXED_ROOT_INFINITY_GEOMETRY_RULE = "bounded-positive-rho-depth/v1"
+const FIXED_ROOT_INFINITY_GEOMETRY_SCHEDULE = (
+    "100", "250", "500", "1000", "2000", "5000", "10000", "20000",
+)
 const OPERATION_EXECUTION_IDENTITY_SCHEMA =
     "windows-solver.operation-execution-identity/1"
 const OPERATION_CONTROL_RECEIPT_SCHEMA =
@@ -61,16 +65,18 @@ const FIXED_ROOT_POLICY_CONTROL_FIELDS = (
 )
 const FIXED_ROOT_RELIABILITY_TARGET_CONTROL_FIELD =
     "root_correction_tolerance"
-const FIXED_ROOT_RELIABILITY_PROJECTION_AUTHORITY_PATH = normpath(joinpath(
-    @__DIR__, "..", "fixed_root_reliability_projection_authority_v1.json"
-))
+const FIXED_ROOT_RELIABILITY_PROJECTION_AUTHORITY_PATH = let
+    same_dir = normpath(joinpath(@__DIR__, "fixed_root_reliability_projection_authority_v1.json"))
+    isfile(same_dir) ? same_dir : normpath(joinpath(@__DIR__, "..", "fixed_root_reliability_projection_authority_v1.json"))
+end
 const PROMOTED_CONTROL_CALIBRATION_RECEIPT_SCHEMA =
     "windows-solver.promoted-control-empirical-calibration-receipt/1"
 const PROMOTED_CONTROL_CALIBRATION_IDENTITY =
     "promoted-control-empirical-calibration/v1"
-const PROMOTED_CONTROL_CALIBRATION_RECEIPT_PATH = normpath(joinpath(
-    @__DIR__, "..", "promoted_control_empirical_calibration_v1.json"
-))
+const PROMOTED_CONTROL_CALIBRATION_RECEIPT_PATH = let
+    same_dir = normpath(joinpath(@__DIR__, "promoted_control_empirical_calibration_v1.json"))
+    isfile(same_dir) ? same_dir : normpath(joinpath(@__DIR__, "..", "promoted_control_empirical_calibration_v1.json"))
+end
 const OPERATION_EXECUTION_COMMON_FIELDS = Set((
     "schema",
     "scope",
@@ -170,6 +176,9 @@ const FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_FIELDS = Set((
     "endpoint_order_schedule",
     "horizon_geometry_rule",
     "horizon_geometry_schedule",
+    "horizon_rho_inner_min",
+    "horizon_endpoint_rho_floor",
+    "horizon_maximum_endpoint_distance",
     "infinity_geometry_rule",
     "infinity_geometry_schedule",
     "fixed_root_reliability_target_abs",
@@ -2421,8 +2430,8 @@ end
 Build the joined contour context used by the exterior determinant family.
 
 The horizon determinant no longer uses this: it builds an outer-only map and a
-separate real-inner horizon map, so nothing constructs a -5000 -> +5000 joined
-coordinate solve for a horizon calculation that reads at most ~100 units inside.
+separate bounded real-inner horizon map, so no horizon calculation constructs a
+deep joined coordinate solve merely to read a shallow interior endpoint.
 """
 function build_worker_contour_context(
     ::Type{T},
@@ -2754,6 +2763,8 @@ function build_worker_real_inner_horizon_contour(
     spectral::CF.HomogeneousSpectralContext{T},
     match_radius::T,
     label::String,
+    ;
+    retain_coordinate_identity::Bool=false,
 ) where {T<:AbstractFloat}
     rho_inner_min = parse_real(T, request, "horizon_rho_inner_min")
     rho_inner_min < zero(T) || error(
@@ -2791,14 +2802,18 @@ function build_worker_real_inner_horizon_contour(
     radius_from_rho = observed_radial_map(
         raw_radius_from_rho, label, rho_inner_min, zero(T)
     )
-    assert_coordinate_identity(
+    coordinate_identity = assert_coordinate_identity(
         T, request, spectral, radius_from_rho, rstar_match,
         complex(one(T), zero(T)),
         range(zero(T), rho_inner_min; length=9), label,
     )
-    return CF.build_real_inner_horizon_contour(
+    contour = CF.build_real_inner_horizon_contour(
         spectral, match_radius, rstar_match, rho_inner_min, radius_from_rho
     )
+    return retain_coordinate_identity ? (
+        contour=contour,
+        coordinate_identity=coordinate_identity,
+    ) : contour
 end
 
 """
@@ -4247,49 +4262,57 @@ function emit_exterior_endpoint_recovery(recovery)
     end
 end
 
-function exterior_endpoint_recovery_receipts(request, recoveries, aggregate)
+function canonical_infinity_endpoint_recovery_receipt(
+    request, recovery, aggregate
+)
     policy = required(request, "fixed_root_endpoint_recovery_policy")
-    receipts = Any[]
-    for recovery in recoveries
-        receipt = CF.canonical_single_endpoint_recovery_evidence(
-            recovery; aggregate_limitation=aggregate
+    recovery.endpoint_branch == "infinity-outgoing" || error(
+        "the v1 endpoint receipt is retained only for infinity-outgoing"
+    )
+    receipt = CF.canonical_single_endpoint_recovery_evidence(
+        recovery; aggregate_limitation=aggregate
+    )
+    canonical_schedule = [
+        string(value) for value in required(
+            policy, "infinity_geometry_schedule"
         )
-        schedule_field = recovery.endpoint_branch == "horizon-ingoing" ?
-            "horizon_geometry_schedule" : "infinity_geometry_schedule"
-        canonical_schedule = [
-            string(value) for value in required(policy, schedule_field)
-        ]
-        typed_schedule = [
-            parse(typeof(recovery.terminal.geometry), value)
-            for value in canonical_schedule
-        ]
-        receipt["candidate_geometry_schedule"] = canonical_schedule
-        for (attempt, candidate) in zip(
-            receipt["attempts"], recovery.candidates
+    ]
+    typed_schedule = [
+        parse(typeof(recovery.terminal.geometry), value)
+        for value in canonical_schedule
+    ]
+    receipt["candidate_geometry_schedule"] = canonical_schedule
+    for (attempt, candidate) in zip(receipt["attempts"], recovery.candidates)
+        geometry_index = findfirst(==(candidate.geometry), typed_schedule)
+        geometry_index === nothing && error(
+            "infinity attempt geometry escaped its authenticated schedule"
         )
-            geometry_index = findfirst(==(candidate.geometry), typed_schedule)
-            geometry_index === nothing && error(
-                "endpoint attempt geometry escaped its authenticated schedule"
-            )
-            attempt["attempted_geometry"] = canonical_schedule[geometry_index]
-        end
-        terminal_index = findfirst(
-            ==(recovery.terminal.geometry), typed_schedule
-        )
-        terminal_index === nothing && error(
-            "terminal endpoint geometry escaped its authenticated schedule"
-        )
-        receipt["terminal_geometry"] = canonical_schedule[terminal_index]
-        receipt["recovery_policy_sha256"] = string(required(
-            policy, "policy_sha256"
-        ))
-        push!(receipts, receipt)
+        attempt["attempted_geometry"] = canonical_schedule[geometry_index]
     end
-    return receipts
+    terminal_index = findfirst(==(recovery.terminal.geometry), typed_schedule)
+    terminal_index === nothing && error(
+        "terminal infinity geometry escaped its authenticated schedule"
+    )
+    receipt["terminal_geometry"] = canonical_schedule[terminal_index]
+    receipt["recovery_policy_sha256"] = string(required(
+        policy, "policy_sha256"
+    ))
+    return receipt
+end
+
+function exterior_endpoint_recovery_receipts(
+    request, horizon_receipt, infinity_recovery, aggregate
+)
+    horizon = deepcopy(horizon_receipt)
+    horizon["aggregate_limitation"] = aggregate
+    infinity = canonical_infinity_endpoint_recovery_receipt(
+        request, infinity_recovery, aggregate
+    )
+    return Any[horizon, infinity]
 end
 
 function exterior_endpoint_recovery_failure(
-    request, recoveries, aggregate
+    request, receipts, aggregate
 )
     failure_code, intervention, result = if aggregate ==
             CF.ENDPOINT_SERIES_ORDER_LIMITED
@@ -4323,9 +4346,7 @@ function exterior_endpoint_recovery_failure(
         "endpoint_recovery_policy_sha256" => string(required(
             policy, "policy_sha256"
         )),
-        "endpoint_receipts" => exterior_endpoint_recovery_receipts(
-            request, recoveries, aggregate
-        ),
+        "endpoint_receipts" => receipts,
         "selected_intervention" => intervention,
         "result" => result,
         "factored_homogeneous_rhs_evaluations" => 0,
@@ -4335,7 +4356,542 @@ function exterior_endpoint_recovery_failure(
         failure_code,
         "fixed-root exterior endpoint recovery failed: $(aggregate)",
         diagnostics;
+        retryable=aggregate == CF.ENDPOINT_ARITHMETIC_LIMITED,
         stage="asymptotic-preflight",
+    )
+end
+
+"""
+    reconstruct_real_inner_horizon_match_state(propagated, spectral, contour)
+
+Reconstruct the physical `(X, dX/drstar)` state at the match radius from a
+horizon-ingoing solution propagated on a real-inner horizon contour.
+
+`CF.reconstruct_factored_match_state` only dispatches on
+`ComplexContourContext`, because it resolves the branch tangent through
+`CF._branch_tangent`, which has no method for `RealInnerHorizonContour`. A
+real-inner contour carries a single real unit tangent regardless of branch, so
+the reconstruction is written out here directly instead of widening that
+library dispatch. This mirrors `CF.reconstruct_factored_match_state`'s body
+exactly -- the same `CF.reconstruct_state` call and the same tangent division
+-- substituting the real-inner contour's own provenance check and its single
+`tangent` field for the joined contour's per-branch tangent lookup.
+"""
+function reconstruct_real_inner_horizon_match_state(
+    propagated,
+    spectral::CF.HomogeneousSpectralContext{T},
+    contour,
+) where {T<:AbstractFloat}
+    contour.contour_id == CF.REAL_INNER_HORIZON_CONTOUR_ID || error(
+        "real-inner horizon contour identity changed"
+    )
+    contour.precision_bits == spectral.precision_bits || error(
+        "real-inner horizon contour precision does not match the spectral context"
+    )
+    propagated.carrier.kind === CF.HORIZON_INGOING || error(
+        "real-inner horizon match-state reconstruction requires a " *
+        "horizon-ingoing propagated solution"
+    )
+    propagated.endpoint_rho == zero(T) || error(
+        "real-inner horizon match-state reconstruction is defined at rho=0"
+    )
+    raw = reconstruct_state(
+        propagated.endpoint, propagated.carrier, propagated.endpoint_rho
+    )
+    tangent = contour.tangent
+    isfinite(real(tangent)) && isfinite(imag(tangent)) && !iszero(tangent) ||
+        error("real-inner horizon contour tangent is nonfinite or zero")
+    dX_drstar = raw.Xrho / tangent
+    isfinite(real(raw.X)) && isfinite(imag(raw.X)) &&
+        isfinite(real(raw.Xrho)) && isfinite(imag(raw.Xrho)) &&
+        isfinite(real(dX_drstar)) && isfinite(imag(dX_drstar)) || error(
+            "reconstructed real-inner horizon match state is nonfinite"
+        )
+    return CF.FactoredMatchState{T}(
+        raw.X,
+        raw.Xrho,
+        dX_drstar,
+        propagated.endpoint_rho,
+        propagated.carrier.kind,
+        tangent,
+        CF.MATCH_RADIAL_DERIVATIVE_CONVENTION_ID,
+    )
+end
+
+"""
+    assert_real_inner_exterior_preparations_ready(spectral, horizon_contour,
+                                                   horizon_ingoing,
+                                                   infinity_contour,
+                                                   infinity_outgoing)
+
+Fail closed before any factored homogeneous RHS work when either leg of a
+real-inner-horizon exterior determinant is not ready.
+
+`CF.assert_factored_exterior_preparations_ready` only dispatches on
+`ComplexContourContext` and `FactoredEndpointPreparation` for both legs, so it
+cannot accept the real-inner horizon leg's `RealInnerHorizonContour` and
+`RealInnerHorizonEndpoint`. This checks the two legs directly instead of
+calling that library function. Every check here is otherwise redundant with
+one the downstream `CF.prepare_real_inner_horizon_endpoint` /
+`CF.solve_factored_horizon_branch_to_match` / `CF.solve_factored_xup_to_match`
+calls already perform internally before touching the homogeneous ODE; this
+function exists only to fail before either leg starts, rather than after one
+leg has already spent RHS work while the other is invalid.
+"""
+function assert_real_inner_exterior_preparations_ready(
+    spectral::CF.HomogeneousSpectralContext{T},
+    horizon_contour,
+    horizon_ingoing,
+    infinity_contour::CF.ComplexContourContext{T},
+    infinity_outgoing::CF.FactoredEndpointPreparation{T},
+) where {T<:AbstractFloat}
+    horizon_contour.contour_id == CF.REAL_INNER_HORIZON_CONTOUR_ID || error(
+        "exterior horizon-ingoing contour identity changed"
+    )
+    horizon_ingoing.branch === CF.HORIZON_INGOING || error(
+        "exterior horizon-ingoing preparation branch slot is not canonical"
+    )
+    horizon_ingoing.assessment.adequate || error(
+        "exterior horizon-ingoing preparation is not adequate"
+    )
+    infinity_outgoing.branch === CF.INFINITY_OUTGOING || error(
+        "exterior infinity-outgoing preparation branch slot is not canonical"
+    )
+    CF.assert_factored_preflights_adequate(infinity_outgoing)
+    return nothing
+end
+
+function real_inner_coordinate_identity_receipt(
+    evidence::CoordinateIdentityEvidence
+)
+    return Dict{String,Any}(
+        "passed" => true,
+        "sample_count" => evidence.sample_count,
+        "maximum_absolute_residual" =>
+            string(evidence.maximum_absolute_residual),
+        "maximum_relative_residual" =>
+            string(evidence.maximum_relative_residual),
+        "absolute_tolerance" => string(evidence.absolute_tolerance),
+        "relative_tolerance" => string(evidence.relative_tolerance),
+        "maximum_absolute_residual_over_tolerance" =>
+            string(evidence.maximum_absolute_residual_over_tolerance),
+        "maximum_relative_residual_over_tolerance" =>
+            string(evidence.maximum_relative_residual_over_tolerance),
+    )
+end
+
+function real_inner_horizon_ingoing_limitation(
+    candidate, maximum_horizon_distance
+)
+    geometry = candidate.geometry
+    geometry_valid = all(isfinite, (
+            geometry.rho,
+            real(geometry.radius),
+            imag(geometry.radius),
+            geometry.horizon_distance,
+            geometry.imaginary_radius_abs,
+        )) &&
+        geometry.rho < 0 && geometry.exterior && geometry.on_real_axis &&
+        geometry.approaches_horizon && geometry.within_maximum_distance &&
+        geometry.horizon_distance <= maximum_horizon_distance
+    geometry_valid || return CF.ENDPOINT_GEOMETRY_LIMITED
+    assessment = candidate.ingoing_assessment
+    evaluation = candidate.ingoing_evaluation
+    assessment === nothing && return CF.ENDPOINT_GEOMETRY_LIMITED
+    evaluation === nothing && return CF.ENDPOINT_GEOMETRY_LIMITED
+    candidate.ingoing_adequate == assessment.adequate || error(
+        "real-inner horizon ingoing adequacy evidence disagrees"
+    )
+    return CF.asymptotic_endpoint_limitation(assessment)
+end
+
+function real_inner_horizon_attempt_receipt(
+    candidate,
+    canonical_rho::String,
+    attempted_endpoint_order::Int,
+    required_digits,
+    limitation::String,
+)
+    geometry = candidate.geometry
+    assessment = candidate.ingoing_assessment
+    evaluation = candidate.ingoing_evaluation
+    no_series = assessment === nothing || evaluation === nothing
+    best_prefix_order = no_series ? nothing : evaluation.order
+    last_term_ratio = no_series ? one(required_digits) :
+        assessment.maximum_last_term_ratio
+    predicted_digits = no_series ? -one(required_digits) :
+        assessment.predicted_reliable_digits
+    truncation_loss = no_series ? zero(required_digits) :
+        assessment.maximum_truncation_digits_lost
+    recurrence_loss = no_series ? zero(required_digits) :
+        assessment.maximum_recurrence_digits_lost
+    evaluation_loss = no_series ? zero(required_digits) :
+        assessment.maximum_series_evaluation_digits_lost
+    return Dict{String,Any}(
+        "rho" => canonical_rho,
+        "radius" => progress_complex(geometry.radius),
+        "horizon_distance" => string(geometry.horizon_distance),
+        "expansion_variable_magnitude" => string(geometry.horizon_distance),
+        "exterior" => geometry.exterior,
+        "on_real_axis" => geometry.on_real_axis,
+        "approaches_horizon" => geometry.approaches_horizon,
+        "within_maximum_distance" => geometry.within_maximum_distance,
+        "attempted_endpoint_order" => attempted_endpoint_order,
+        "best_prefix_order" => best_prefix_order,
+        "last_term_ratio" => string(last_term_ratio),
+        "predicted_reliable_digits" => string(predicted_digits),
+        "required_reliable_digits" => string(required_digits),
+        "adequate" => limitation == CF.ENDPOINT_ADEQUATE,
+        "maximum_truncation_digits_lost" => string(truncation_loss),
+        "maximum_recurrence_digits_lost" => string(recurrence_loss),
+        "maximum_series_evaluation_digits_lost" => string(evaluation_loss),
+        "candidate_limitation" => limitation,
+    )
+end
+
+function canonical_real_inner_horizon_match_radius_text(request, match_radius)
+    role = string(required(request, "readout_role"))
+    field = if role in FIXED_ROOT_SURVEY_BACKGROUND_ROLES
+        "readout_radius"
+    elseif role in FIXED_ROOT_SURVEY_COORDINATE_ROLES
+        "support_lower"
+    else
+        error("real-inner horizon receipt has an unknown fixed-root role")
+    end
+    canonical = string(required(request, field))
+    parse(typeof(match_radius), canonical) == match_radius || error(
+        "real-inner horizon match radius escaped its authenticated request"
+    )
+    return canonical
+end
+
+function real_inner_horizon_endpoint_receipt(
+    request,
+    contour,
+    coordinate_identity,
+    canonical_schedule,
+    attempts,
+    outcome;
+    selected_candidate=nothing,
+)
+    policy = required(request, "fixed_root_endpoint_recovery_policy")
+    selected_evaluation = selected_candidate === nothing ? nothing :
+        selected_candidate.ingoing_evaluation
+    truncation_values = [
+        parse(BigFloat, string(required(
+            attempt, "maximum_truncation_digits_lost"
+        ))) for attempt in attempts
+    ]
+    maximum_truncation = string(required(
+        attempts[argmax(truncation_values)],
+        "maximum_truncation_digits_lost",
+    ))
+    selected_rho = nothing
+    if selected_candidate !== nothing
+        typed_schedule = parse.(typeof(contour.rho_min), canonical_schedule)
+        selected_index = findfirst(
+            ==(selected_candidate.geometry.rho), typed_schedule
+        )
+        selected_index === nothing && error(
+            "selected real-inner horizon rho escaped the policy schedule"
+        )
+        selected_rho = canonical_schedule[selected_index]
+    end
+    return Dict{String,Any}(
+        "schema" => "windows-solver.exterior-endpoint-recovery-receipt/2",
+        "endpoint_branch" => "horizon-ingoing",
+        "contour_identity" => contour.contour_id,
+        "recovery_policy_identity" => string(required(policy, "identity")),
+        "recovery_policy_sha256" =>
+            string(required(policy, "policy_sha256")),
+        # Preserve the authenticated request spelling.  Re-serialising a
+        # BigFloat emits its binary approximation and breaks the exact Python
+        # request/receipt identity check for non-integer support radii.
+        "match_radius" => canonical_real_inner_horizon_match_radius_text(
+            request, contour.match_radius
+        ),
+        "rstar_match" => string(contour.rstar_match),
+        "rho_floor" => string(required(
+            policy, "horizon_endpoint_rho_floor"
+        )),
+        "rho_schedule" => canonical_schedule,
+        "coordinate_identity" =>
+            real_inner_coordinate_identity_receipt(coordinate_identity),
+        "attempts" => attempts,
+        "selected_rho" => selected_rho,
+        "selected_endpoint_order" => selected_candidate === nothing ?
+            nothing : selected_candidate.attempted_endpoint_order,
+        "selected_best_prefix_order" => selected_evaluation === nothing ?
+            nothing : selected_evaluation.order,
+        "candidate_limitation" => outcome,
+        "aggregate_limitation" => outcome,
+        "maximum_truncation_digits_lost" => maximum_truncation,
+        "factored_homogeneous_rhs_evaluations_before_decision" => 0,
+    )
+end
+
+"""
+    recover_fixed_root_real_inner_horizon_endpoint(
+        T, request, spectral, match_radius, required_digits
+    )
+
+Own the fixed-root exterior Xin admission gate.  The authenticated request
+schedule is inspected order-by-order and shallow-to-deep; the first adequate
+horizon-ingoing endpoint is prepared and no homogeneous RHS is entered here.
+"""
+function recover_fixed_root_real_inner_horizon_endpoint(
+    ::Type{T},
+    request,
+    spectral,
+    match_radius::T,
+    required_digits::T,
+    ;
+    factored_homogeneous_rhs_counter=Ref(0),
+    contour_builder=build_worker_real_inner_horizon_contour,
+    geometry_builder=CF.horizon_endpoint_geometry_candidates,
+    candidate_builder=CF.horizon_endpoint_candidates,
+    endpoint_preparer=CF.prepare_real_inner_horizon_endpoint,
+    candidate_emitter=emit_horizon_endpoint_candidate,
+    limitation_classifier=real_inner_horizon_ingoing_limitation,
+) where {T<:AbstractFloat}
+    factored_homogeneous_rhs_counter[] == 0 || error(
+        "real-inner horizon admission began after homogeneous RHS work"
+    )
+    policy, orders, schedule, _infinity_schedule =
+        fixed_root_endpoint_recovery_schedules(T, request)
+    canonical_schedule = String[
+        string(value) for value in required(
+            policy, "horizon_geometry_schedule"
+        )
+    ]
+    schedule == parse.(T, canonical_schedule) || error(
+        "fixed-root horizon schedule changed during parsing"
+    )
+    floor = parse(T, string(required(
+        policy, "horizon_endpoint_rho_floor"
+    )))
+    rho_inner_min = parse(T, string(required(
+        policy, "horizon_rho_inner_min"
+    )))
+    floor == rho_inner_min == parse_real(
+        T, request, "horizon_rho_inner_min"
+    ) || error("real-inner horizon floor binding is inconsistent")
+    last(schedule) == floor || error(
+        "real-inner horizon schedule does not terminate at its floor"
+    )
+    maximum_horizon_distance = parse(T, string(required(
+        policy, "horizon_maximum_endpoint_distance"
+    )))
+    maximum_horizon_distance == parse_real(
+        T, request, "horizon_maximum_endpoint_distance"
+    ) || error("real-inner horizon distance binding is inconsistent")
+
+    built = contour_builder(
+        T,
+        request,
+        spectral,
+        match_radius,
+        "fixed-root-real-inner-horizon-endpoint";
+        retain_coordinate_identity=true,
+    )
+    factored_homogeneous_rhs_counter[] == 0 || error(
+        "homogeneous RHS executed during real-inner contour admission"
+    )
+    contour = built.contour
+    contour.rho_min == floor || error(
+        "real-inner horizon contour does not terminate at the policy floor"
+    )
+    contour.tangent == complex(one(T), zero(T)) || error(
+        "real-inner horizon contour tangent is not 1 + 0im"
+    )
+    attempts = Any[]
+    limitations = String[]
+    for endpoint_order in orders
+        prefix_orders = CF.horizon_endpoint_prefix_orders(endpoint_order)
+        for geometry_index in eachindex(schedule)
+            geometry = last(geometry_builder(
+                spectral,
+                contour;
+                rho_candidates=schedule[1:geometry_index],
+                maximum_horizon_distance=maximum_horizon_distance,
+            ))
+            candidate = only(candidate_builder(
+                spectral,
+                contour,
+                [geometry],
+                required_digits;
+                maximum_horizon_distance=maximum_horizon_distance,
+                endpoint_orders=prefix_orders,
+                attempted_endpoint_order=endpoint_order,
+            ))
+            factored_homogeneous_rhs_counter[] == 0 || error(
+                "homogeneous RHS executed during real-inner endpoint assessment"
+            )
+            limitation = limitation_classifier(
+                candidate, maximum_horizon_distance
+            )
+            attempt = real_inner_horizon_attempt_receipt(
+                candidate,
+                canonical_schedule[geometry_index],
+                endpoint_order,
+                required_digits,
+                limitation,
+            )
+            push!(attempts, attempt)
+            push!(limitations, limitation)
+            candidate_emitter(candidate)
+            progress_emit(
+                "exterior_endpoint_recovery_attempt";
+                payload=Dict{String,Any}(
+                    "endpoint_branch" => "horizon-ingoing",
+                    "attempted_order" => endpoint_order,
+                    "attempted_geometry" =>
+                        canonical_schedule[geometry_index],
+                    "limiting_resource" => limitation,
+                    "selected_intervention" =>
+                        limitation == CF.ENDPOINT_ADEQUATE ?
+                        "ENTER_HOMOGENEOUS_ODE" :
+                        limitation == CF.ENDPOINT_ARITHMETIC_LIMITED ?
+                        "PROMOTE_ARITHMETIC_TIER_IF_AGGREGATE_ALLOWS" :
+                        "CONTINUE_AUTHENTICATED_LADDER",
+                    "result" => limitation == CF.ENDPOINT_ADEQUATE ?
+                        "ADEQUATE" : "RETRY",
+                    "last_term_ratio" => attempt["last_term_ratio"],
+                    "predicted_reliable_digits" =>
+                        attempt["predicted_reliable_digits"],
+                    "required_reliable_digits" =>
+                        attempt["required_reliable_digits"],
+                ),
+            )
+            if limitation == CF.ENDPOINT_ADEQUATE
+                preparation = endpoint_preparer(
+                    spectral,
+                    contour,
+                    candidate,
+                    CF.HORIZON_INGOING,
+                    required_digits,
+                )
+                factored_homogeneous_rhs_counter[] == 0 || error(
+                    "homogeneous RHS executed during real-inner endpoint preparation"
+                )
+                receipt = real_inner_horizon_endpoint_receipt(
+                    request,
+                    contour,
+                    built.coordinate_identity,
+                    canonical_schedule,
+                    attempts,
+                    limitation;
+                    selected_candidate=candidate,
+                )
+                return (
+                    outcome=limitation,
+                    contour=contour,
+                    preparation=preparation,
+                    receipt=receipt,
+                )
+            elseif limitation == CF.ENDPOINT_ARITHMETIC_LIMITED
+                receipt = real_inner_horizon_endpoint_receipt(
+                    request,
+                    contour,
+                    built.coordinate_identity,
+                    canonical_schedule,
+                    attempts,
+                    limitation,
+                )
+                return (
+                    outcome=limitation,
+                    contour=contour,
+                    preparation=nothing,
+                    receipt=receipt,
+                )
+            end
+        end
+    end
+    outcome = any(==(CF.ENDPOINT_SERIES_ORDER_LIMITED), limitations) ?
+        CF.ENDPOINT_SERIES_ORDER_LIMITED : CF.ENDPOINT_GEOMETRY_LIMITED
+    receipt = real_inner_horizon_endpoint_receipt(
+        request,
+        contour,
+        built.coordinate_identity,
+        canonical_schedule,
+        attempts,
+        outcome,
+    )
+    return (
+        outcome=outcome,
+        contour=contour,
+        preparation=nothing,
+        receipt=receipt,
+    )
+end
+
+"""
+    fixed_root_exterior_horizon_recovery_geometry(T, request)
+
+Return the shallow-first geometry candidate ladder for the exterior
+horizon-ingoing endpoint, deepened to its declared floor.
+
+The real-inner contour's own solved range is bounded by
+`horizon_rho_inner_min`, so its candidate geometry must be drawn from
+`horizon_endpoint_rho_candidates` (the same request fields the standalone
+horizon-admittance mechanism already uses), not from
+`fixed_root_endpoint_recovery_policy.horizon_geometry_schedule` -- that
+schedule was sized for the joined contour's own, much deeper, solved range
+and can fall outside the real-inner contour's bound.
+"""
+function fixed_root_exterior_horizon_recovery_geometry(
+    ::Type{T}, request
+) where {T<:AbstractFloat}
+    candidates = horizon_endpoint_rho_candidates(T, request)
+    floor = horizon_endpoint_rho_floor(T, request)
+    while true
+        deeper = CF.deepen_horizon_endpoint_rho_candidates(candidates, floor)
+        deeper === nothing && break
+        candidates = deeper
+    end
+    return candidates
+end
+
+"""
+    prepare_real_inner_exterior_horizon_ingoing(request, spectral, contour,
+                                                 order, geometry,
+                                                 required_digits)
+
+Prepare the exterior determinant's horizon-ingoing endpoint on the real-inner
+contour already proven to approach `r_plus` (`build_worker_real_inner_horizon_contour`),
+using the same `CF.horizon_endpoint_geometry_candidates` /
+`CF.horizon_endpoint_candidates` / `CF.prepare_real_inner_horizon_endpoint`
+sequence `evaluate_horizon_determinant` already relies on for the standalone
+horizon-admittance mechanism -- just evaluated for a single `(order, geometry)`
+pair, since this function is called once per attempt from inside
+`CF.recover_single_factored_endpoint`'s generic order/geometry recovery
+driver. That driver only reads `preparation.assessment`, so it accepts a
+`CF.RealInnerHorizonEndpoint` returned here exactly as it accepts the joined
+contour's `CF.FactoredEndpointPreparation`.
+"""
+function prepare_real_inner_exterior_horizon_ingoing(
+    request,
+    spectral::CF.HomogeneousSpectralContext{T},
+    contour,
+    order::Int,
+    geometry::T,
+    required_digits::T,
+) where {T<:AbstractFloat}
+    maximum_horizon_distance = parse_real(
+        T, request, "horizon_maximum_endpoint_distance"
+    )
+    geometry_candidates = CF.horizon_endpoint_geometry_candidates(
+        spectral, contour;
+        rho_candidates=T[geometry],
+        maximum_horizon_distance=maximum_horizon_distance,
+    )
+    candidates = CF.horizon_endpoint_candidates(
+        spectral, contour, geometry_candidates, required_digits;
+        endpoint_orders=Int[order],
+    )
+    candidate = only(candidates)
+    return CF.prepare_real_inner_horizon_endpoint(
+        spectral, contour, candidate, CF.HORIZON_INGOING, required_digits
     )
 end
 
@@ -4344,32 +4900,17 @@ function recover_fixed_root_exterior_endpoints(
     horizon_match_radius::T, infinity_match_radius::T,
     required_digits::T,
 ) where {T<:AbstractFloat}
-    policy, orders, horizon_schedule, infinity_schedule =
+    policy, orders, _horizon_schedule, infinity_schedule =
         fixed_root_endpoint_recovery_schedules(T, request)
     policy_identity = string(required(policy, "identity"))
     rhs_counter = Ref(0)
 
-    horizon_cap = build_worker_contour_context(
-        T, request, spectral, horizon_match_radius,
-        "fixed-root-horizon-endpoint-cap",
-    )
-    horizon_recovery = CF.recover_single_factored_endpoint(
-        "horizon-ingoing", orders, horizon_schedule, policy_identity,
-        (order, geometry) -> begin
-            contour = geometry == horizon_cap.rho_in ? horizon_cap :
-                CF.build_contour_context(
-                    spectral,
-                    horizon_match_radius,
-                    horizon_cap.rstar_match,
-                    geometry,
-                    horizon_cap.rho_out,
-                    horizon_cap.radius_from_rho,
-                )
-            preparation = CF.prepare_factored_horizon_ingoing(
-                spectral, contour, required_digits; order=order
-            )
-            return preparation, contour
-        end;
+    horizon_recovery = recover_fixed_root_real_inner_horizon_endpoint(
+        T,
+        request,
+        spectral,
+        horizon_match_radius,
+        required_digits,
         factored_homogeneous_rhs_counter=rhs_counter,
     )
 
@@ -4395,16 +4936,15 @@ function recover_fixed_root_exterior_endpoints(
         end;
         factored_homogeneous_rhs_counter=rhs_counter,
     )
-    emit_exterior_endpoint_recovery(horizon_recovery)
     emit_exterior_endpoint_recovery(infinity_recovery)
-    recoveries = (horizon_recovery, infinity_recovery)
     aggregate = CF.aggregate_endpoint_limitations(
-        recovery.outcome for recovery in recoveries
+        (horizon_recovery.outcome, infinity_recovery.outcome)
+    )
+    receipts = exterior_endpoint_recovery_receipts(
+        request, horizon_recovery.receipt, infinity_recovery, aggregate
     )
     progress_emit("exterior_endpoint_recovery_decided"; payload=Dict(
-        "endpoint_branches" => [
-            recovery.endpoint_branch for recovery in recoveries
-        ],
+        "endpoint_branches" => ["horizon-ingoing", "infinity-outgoing"],
         "limiting_resource" => aggregate,
         "selected_intervention" => aggregate == CF.ENDPOINT_ADEQUATE ?
             "ENTER_HOMOGENEOUS_ODE" : aggregate ==
@@ -4418,14 +4958,11 @@ function recover_fixed_root_exterior_endpoints(
         "factored_homogeneous_rhs_evaluations" => rhs_counter[],
     ))
     aggregate == CF.ENDPOINT_ADEQUATE || throw(
-        exterior_endpoint_recovery_failure(request, recoveries, aggregate)
-    )
-    receipts = exterior_endpoint_recovery_receipts(
-        request, recoveries, aggregate
+        exterior_endpoint_recovery_failure(request, receipts, aggregate)
     )
     return (
-        horizon_recovery.terminal.payload,
-        horizon_recovery.terminal.preparation,
+        horizon_recovery.contour,
+        horizon_recovery.preparation,
         infinity_recovery.terminal.payload,
         infinity_recovery.terminal.preparation,
         receipts,
@@ -4480,11 +5017,16 @@ function evaluate_exterior_determinant(
             rhs_counter,
         )
     elseif exterior_certificate_required
-        horizon_contour = build_worker_contour_context(
+        horizon_contour = build_worker_real_inner_horizon_contour(
             T, request, spectral, lower, "Xin"
         )
-        horizon_preparation = CF.prepare_factored_horizon_ingoing(
-            spectral, horizon_contour, required_digits
+        horizon_preparation = prepare_real_inner_exterior_horizon_ingoing(
+            request,
+            spectral,
+            horizon_contour,
+            spectral.endpoint_order,
+            first(fixed_root_exterior_horizon_recovery_geometry(T, request)),
+            required_digits,
         )
         outer, preparation, comparison, comparison_preparation =
         select_worker_outer_endpoint_pair(
@@ -4500,11 +5042,16 @@ function evaluate_exterior_determinant(
             comparison, comparison_preparation, Ref(0),
         )
     else
-        horizon_contour = build_worker_contour_context(
+        horizon_contour = build_worker_real_inner_horizon_contour(
             T, request, spectral, lower, "Xin"
         )
-        horizon_preparation = CF.prepare_factored_horizon_ingoing(
-            spectral, horizon_contour, required_digits
+        horizon_preparation = prepare_real_inner_exterior_horizon_ingoing(
+            request,
+            spectral,
+            horizon_contour,
+            spectral.endpoint_order,
+            first(fixed_root_exterior_horizon_recovery_geometry(T, request)),
+            required_digits,
         )
         contour = build_worker_contour_context(
             T, request, spectral, readout, "Xup"
@@ -4524,7 +5071,7 @@ function evaluate_exterior_determinant(
     # Authenticate both distinct match-radius preparations before testing
     # either assessment. An inadequate branch exits before readiness,
     # observers, or any factored homogeneous RHS evaluation.
-    CF.assert_factored_exterior_preparations_ready(
+    assert_real_inner_exterior_preparations_ready(
         spectral,
         lower_contour,
         horizon_ingoing,
@@ -4549,10 +5096,11 @@ function evaluate_exterior_determinant(
         factored_homogeneous_rhs_counter=factored_homogeneous_rhs_counter,
     )
     xin_propagated = progress_operation("Xin") do
-        CF.solve_factored_xin_to_match(
+        CF.solve_factored_horizon_branch_to_match(
             spectral,
             lower_contour,
             horizon_ingoing;
+            ode_leg="Xin_inner_to_match",
             common_solve_options...,
         )
     end
@@ -4580,7 +5128,7 @@ function evaluate_exterior_determinant(
     emit_factored_solution(xup_propagated)
     comparison_xup_propagated === nothing ||
         emit_factored_solution(comparison_xup_propagated)
-    xin_match = CF.reconstruct_factored_match_state(
+    xin_match = reconstruct_real_inner_horizon_match_state(
         xin_propagated, spectral, lower_contour
     )
     xup_match = CF.reconstruct_factored_match_state(
@@ -8925,8 +9473,8 @@ function validate_fixed_root_endpoint_recovery_policy(request)
         )
     base_order = parse_integer(recovery, "base_endpoint_order")
     maximum_order = parse_integer(recovery, "generated_maximum_order")
-    base_order == parse_integer(request, "endpoint_series_order") &&
-        maximum_order == 4 * base_order || error(
+    base_order == 28 && maximum_order == 112 &&
+        base_order == parse_integer(request, "endpoint_series_order") || error(
             "fixed-root endpoint order bounds are invalid"
         )
     raw_orders = required(recovery, "endpoint_order_schedule")
@@ -8952,14 +9500,30 @@ function validate_fixed_root_endpoint_recovery_policy(request)
     )
     horizon_values = BigFloat[parse(BigFloat, string(value)) for value in horizon]
     infinity_values = BigFloat[parse(BigFloat, string(value)) for value in infinity]
-    !isempty(horizon_values) && all(value -> value < 0, horizon_values) &&
-        issorted(abs.(horizon_values)) &&
-        length(unique(horizon_values)) == length(horizon_values) &&
+    canonical_horizon = BigFloat[
+        -10, -25, -50, -75, -100, -150, -225, -337.5, -400,
+    ]
+    string.(horizon) == [
+        "-10", "-25", "-50", "-75", "-100", "-150", "-225",
+        "-337.5", "-400",
+    ] && horizon_values == canonical_horizon &&
         last(horizon_values) == parse_real(BigFloat, request, "rho_in") ||
         error("fixed-root horizon geometry schedule is invalid")
-    !isempty(infinity_values) && all(value -> value > 0, infinity_values) &&
-        issorted(infinity_values) &&
-        length(unique(infinity_values)) == length(infinity_values) &&
+    string(required(recovery, "horizon_rho_inner_min")) == "-400" &&
+        string(required(recovery, "horizon_endpoint_rho_floor")) == "-400" &&
+        string(required(recovery, "horizon_maximum_endpoint_distance")) ==
+            "0.1" &&
+        string(required(recovery, "horizon_rho_inner_min")) ==
+            string(required(request, "horizon_rho_inner_min")) &&
+        string(required(recovery, "horizon_endpoint_rho_floor")) ==
+            string(required(request, "horizon_endpoint_rho_floor")) &&
+        string(required(recovery, "horizon_maximum_endpoint_distance")) ==
+            string(required(request, "horizon_maximum_endpoint_distance")) ||
+        error("fixed-root real-inner horizon bounds are invalid")
+    string.(infinity) == collect(FIXED_ROOT_INFINITY_GEOMETRY_SCHEDULE) &&
+        infinity_values == parse.(
+            BigFloat, collect(FIXED_ROOT_INFINITY_GEOMETRY_SCHEDULE)
+        ) &&
         last(infinity_values) == parse_real(BigFloat, request, "rho_out") ||
         error("fixed-root infinity geometry schedule is invalid")
     projection = required(request, "fixed_root_reliability_projection")

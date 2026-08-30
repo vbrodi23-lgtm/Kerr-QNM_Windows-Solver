@@ -156,14 +156,27 @@ FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_SCHEMA = (
     "windows-solver.fixed-root-endpoint-recovery-policy/1"
 )
 FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_IDENTITY = (
-    "cause-aware-fixed-root-exterior-endpoint-recovery/v1"
+    "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2"
 )
 FIXED_ROOT_CONTROL_PROFILE = "fixed-root-deep-v1"
 FIXED_ROOT_ENDPOINT_ORDER_RULE = "bounded-doubling-prefix/v1"
-FIXED_ROOT_HORIZON_GEOMETRY_RULE = "bounded-negative-rho-depth/v1"
+FIXED_ROOT_ENDPOINT_BASE_ORDER = 28
+FIXED_ROOT_ENDPOINT_MAXIMUM_ORDER = 112
+FIXED_ROOT_HORIZON_GEOMETRY_RULE = "bounded-real-inner-tortoise-depth/v1"
 FIXED_ROOT_INFINITY_GEOMETRY_RULE = "bounded-positive-rho-depth/v1"
 EXTERIOR_ENDPOINT_RECOVERY_RECEIPT_SCHEMA = (
     "windows-solver.exterior-endpoint-recovery-receipt/1"
+)
+EXTERIOR_REAL_INNER_ENDPOINT_RECOVERY_RECEIPT_SCHEMA = (
+    "windows-solver.exterior-endpoint-recovery-receipt/2"
+)
+REAL_INNER_HORIZON_CONTOUR_IDENTITY = "real-inner-tortoise-contour/v1"
+FIXED_ROOT_HORIZON_GEOMETRY_SCHEDULE = (
+    "-10", "-25", "-50", "-75", "-100", "-150", "-225", "-337.5",
+    "-400",
+)
+FIXED_ROOT_INFINITY_GEOMETRY_SCHEDULE = (
+    "100", "250", "500", "1000", "2000", "5000", "10000", "20000",
 )
 ENDPOINT_ADEQUATE = "adequate/v1"
 ENDPOINT_SERIES_ORDER_LIMITED = "insufficient-series-order/v1"
@@ -276,9 +289,9 @@ def _fixed_root_endpoint_recovery_policy(
     """Authenticate the complete bounded same-tier endpoint ladder."""
 
     base_order = policy.get("endpoint_series_order")
-    if type(base_order) is not int or base_order <= 0:
+    if base_order != FIXED_ROOT_ENDPOINT_BASE_ORDER:
         raise ValueError("fixed-root endpoint base order is invalid")
-    maximum_order = 4 * base_order
+    maximum_order = FIXED_ROOT_ENDPOINT_MAXIMUM_ORDER
     binding: dict[str, object] = {
         "schema": FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_SCHEMA,
         "identity": FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_IDENTITY,
@@ -289,12 +302,16 @@ def _fixed_root_endpoint_recovery_policy(
             base_order, maximum_order
         ),
         "horizon_geometry_rule": FIXED_ROOT_HORIZON_GEOMETRY_RULE,
-        "horizon_geometry_schedule": ["-5000", "-10000", "-20000"],
+        "horizon_geometry_schedule": list(
+            FIXED_ROOT_HORIZON_GEOMETRY_SCHEDULE
+        ),
+        "horizon_rho_inner_min": "-400",
+        "horizon_endpoint_rho_floor": "-400",
+        "horizon_maximum_endpoint_distance": "0.1",
         "infinity_geometry_rule": FIXED_ROOT_INFINITY_GEOMETRY_RULE,
-        "infinity_geometry_schedule": [
-            "100", "250", "500", "1000", "2000", "5000",
-            "10000", "20000",
-        ],
+        "infinity_geometry_schedule": list(
+            FIXED_ROOT_INFINITY_GEOMETRY_SCHEDULE
+        ),
         "fixed_root_reliability_target_abs": reliability_projection[
             "fixed_root_reliability_target_abs"
         ],
@@ -1974,6 +1991,7 @@ def _valid_exterior_endpoint_control_diagnostics(
             diagnostics.get("endpoint_receipts"),
             policy,
             expected_aggregate=expected[0],
+            spin=request_binding.get("spin"),
         )
     except (TypeError, ValueError, JuliaResponseBackendError):
         return False
@@ -2873,6 +2891,8 @@ def _validated_fixed_root_endpoint_recovery_policy(
         "schema", "identity", "endpoint_order_rule", "base_endpoint_order",
         "generated_maximum_order", "endpoint_order_schedule",
         "horizon_geometry_rule", "horizon_geometry_schedule",
+        "horizon_rho_inner_min", "horizon_endpoint_rho_floor",
+        "horizon_maximum_endpoint_distance",
         "infinity_geometry_rule", "infinity_geometry_schedule",
         "fixed_root_reliability_target_abs", "fixed_root_reliability_rule",
         "required_digit_guard", "precision_digits", "semantic_precision_tier",
@@ -2894,6 +2914,8 @@ def _validated_fixed_root_endpoint_recovery_policy(
     if (
         type(base) is not int or type(maximum) is not int
         or not isinstance(orders, list)
+        or base != FIXED_ROOT_ENDPOINT_BASE_ORDER
+        or maximum != FIXED_ROOT_ENDPOINT_MAXIMUM_ORDER
         or maximum != 4 * base
         or any(type(order) is not int for order in orders)
         or orders != _endpoint_order_schedule(base, maximum)
@@ -2913,17 +2935,25 @@ def _validated_fixed_root_endpoint_recovery_policy(
     except TypeError as error:
         raise ValueError("fixed-root endpoint geometry schedule is invalid") from error
     if (
-        not isinstance(horizon, list) or not horizon_values
-        or any(item >= 0 for item in horizon_values)
-        or [abs(item) for item in horizon_values]
-        != sorted(abs(item) for item in horizon_values)
-        or len(set(horizon_values)) != len(horizon_values)
-        or not isinstance(infinity, list) or not infinity_values
-        or any(item <= 0 for item in infinity_values)
-        or infinity_values != sorted(infinity_values)
-        or len(set(infinity_values)) != len(infinity_values)
+        not isinstance(horizon, list)
+        or horizon != list(FIXED_ROOT_HORIZON_GEOMETRY_SCHEDULE)
+        or horizon_values != [
+            Decimal(item) for item in FIXED_ROOT_HORIZON_GEOMETRY_SCHEDULE
+        ]
+        or any(item in horizon for item in ("-5000", "-10000", "-20000"))
+        or not isinstance(infinity, list)
+        or infinity != list(FIXED_ROOT_INFINITY_GEOMETRY_SCHEDULE)
+        or infinity_values != [
+            Decimal(item) for item in FIXED_ROOT_INFINITY_GEOMETRY_SCHEDULE
+        ]
     ):
         raise ValueError("fixed-root endpoint geometry schedule is invalid")
+    if (
+        value["horizon_rho_inner_min"] != "-400"
+        or value["horizon_endpoint_rho_floor"] != "-400"
+        or value["horizon_maximum_endpoint_distance"] != "0.1"
+    ):
+        raise ValueError("fixed-root real-inner horizon bounds are invalid")
     digits = value["precision_digits"]
     if (
         digits not in (40, 80)
@@ -2958,6 +2988,287 @@ _ENDPOINT_RECEIPT_FIELDS = {
     "aggregate_limitation", "factored_homogeneous_rhs_evaluations",
     "attempts",
 }
+
+_REAL_INNER_COORDINATE_IDENTITY_FIELDS = {
+    "passed", "sample_count", "maximum_absolute_residual",
+    "maximum_relative_residual", "absolute_tolerance",
+    "relative_tolerance", "maximum_absolute_residual_over_tolerance",
+    "maximum_relative_residual_over_tolerance",
+}
+_REAL_INNER_HORIZON_ATTEMPT_FIELDS = {
+    "rho", "radius", "horizon_distance", "expansion_variable_magnitude",
+    "exterior", "on_real_axis", "approaches_horizon",
+    "within_maximum_distance", "attempted_endpoint_order",
+    "best_prefix_order", "last_term_ratio", "predicted_reliable_digits",
+    "required_reliable_digits", "adequate",
+    "maximum_truncation_digits_lost",
+    "maximum_recurrence_digits_lost",
+    "maximum_series_evaluation_digits_lost", "candidate_limitation",
+}
+_REAL_INNER_HORIZON_RECEIPT_FIELDS = {
+    "schema", "endpoint_branch", "contour_identity",
+    "recovery_policy_identity", "recovery_policy_sha256", "match_radius",
+    "rstar_match", "rho_floor", "rho_schedule", "coordinate_identity",
+    "attempts", "selected_rho", "selected_endpoint_order",
+    "selected_best_prefix_order", "candidate_limitation",
+    "aggregate_limitation", "maximum_truncation_digits_lost",
+    "factored_homogeneous_rhs_evaluations_before_decision",
+}
+
+
+def _validated_real_inner_horizon_endpoint_receipt(
+    value: object,
+    policy: Mapping[str, object],
+    *,
+    spin: object | None,
+    expected_match_radius: object | None,
+) -> tuple[dict[str, object], str]:
+    """Authenticate worker evidence for the real-inner Xin endpoint."""
+
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != _REAL_INNER_HORIZON_RECEIPT_FIELDS
+    ):
+        raise ValueError("real-inner horizon endpoint receipt fields are invalid")
+    if (
+        value["schema"] != EXTERIOR_REAL_INNER_ENDPOINT_RECOVERY_RECEIPT_SCHEMA
+        or value["endpoint_branch"] != "horizon-ingoing"
+        or value["contour_identity"] != REAL_INNER_HORIZON_CONTOUR_IDENTITY
+        or value["recovery_policy_identity"] != policy["identity"]
+        or value["recovery_policy_sha256"] != policy["policy_sha256"]
+        or value["rho_floor"] != policy["horizon_endpoint_rho_floor"]
+        or value["rho_schedule"] != policy["horizon_geometry_schedule"]
+        or value["factored_homogeneous_rhs_evaluations_before_decision"] != 0
+    ):
+        raise ValueError("real-inner horizon endpoint receipt binding is invalid")
+    if any(
+        legacy in value["rho_schedule"]
+        for legacy in ("-5000", "-10000", "-20000")
+    ):
+        raise ValueError("legacy joined-contour horizon geometry is forbidden")
+    match_radius = _finite_decimal_text(
+        value["match_radius"], "real-inner horizon match radius", nonnegative=True
+    )
+    _finite_decimal_text(value["rstar_match"], "real-inner horizon rstar match")
+    if match_radius <= 0:
+        raise ValueError("real-inner horizon match radius is invalid")
+    if expected_match_radius is not None and match_radius != _finite_decimal_text(
+        expected_match_radius, "expected real-inner horizon match radius",
+        nonnegative=True,
+    ):
+        raise ValueError("real-inner horizon receipt used the wrong match radius")
+
+    coordinate = value["coordinate_identity"]
+    if (
+        not isinstance(coordinate, Mapping)
+        or set(coordinate) != _REAL_INNER_COORDINATE_IDENTITY_FIELDS
+        or coordinate["passed"] is not True
+        or coordinate["sample_count"] != 9
+    ):
+        raise ValueError("real-inner coordinate identity evidence is invalid")
+    coordinate_metrics = {
+        name: _finite_decimal_text(
+            coordinate[name], f"coordinate identity {name}", nonnegative=True
+        )
+        for name in _REAL_INNER_COORDINATE_IDENTITY_FIELDS
+        if name not in {"passed", "sample_count"}
+    }
+    if (
+        coordinate_metrics["absolute_tolerance"] <= 0
+        or coordinate_metrics["relative_tolerance"] <= 0
+        or coordinate_metrics["maximum_absolute_residual"]
+        > coordinate_metrics["absolute_tolerance"]
+        or coordinate_metrics["maximum_relative_residual"]
+        > coordinate_metrics["relative_tolerance"]
+        or coordinate_metrics[
+            "maximum_absolute_residual_over_tolerance"
+        ] > 1
+        or coordinate_metrics[
+            "maximum_relative_residual_over_tolerance"
+        ] > 1
+    ):
+        raise ValueError("real-inner coordinate identity gate did not pass")
+
+    rplus: Decimal | None = None
+    if spin is not None:
+        spin_value = _finite_decimal_text(spin, "real-inner horizon spin")
+        if abs(spin_value) >= 1:
+            raise ValueError("real-inner horizon spin is invalid")
+        with localcontext() as context:
+            context.prec = 128
+            rplus = Decimal(1) + (Decimal(1) - spin_value * spin_value).sqrt()
+        if match_radius <= rplus:
+            raise ValueError("real-inner horizon match radius is not exterior")
+
+    attempts = value["attempts"]
+    if not isinstance(attempts, list) or not attempts:
+        raise ValueError("real-inner horizon endpoint attempts are absent")
+    orders = policy["endpoint_order_schedule"]
+    schedule = policy["horizon_geometry_schedule"]
+    maximum_distance = _finite_decimal_text(
+        policy["horizon_maximum_endpoint_distance"],
+        "real-inner maximum horizon distance", nonnegative=True,
+    )
+    expected_order_index = 0
+    expected_geometry_index = 0
+    previous_distance: Decimal | None = None
+    limitations: list[str] = []
+    maximum_truncation = Decimal(0)
+    adequate_indices: list[int] = []
+    for index, attempt in enumerate(attempts):
+        if (
+            not isinstance(attempt, Mapping)
+            or set(attempt) != _REAL_INNER_HORIZON_ATTEMPT_FIELDS
+            or expected_order_index >= len(orders)
+            or expected_geometry_index >= len(schedule)
+            or attempt["attempted_endpoint_order"] != orders[expected_order_index]
+            or attempt["rho"] != schedule[expected_geometry_index]
+        ):
+            raise ValueError("real-inner horizon endpoint trajectory is invalid")
+        rho = _finite_decimal_text(attempt["rho"], "real-inner horizon rho")
+        if rho >= 0:
+            raise ValueError("real-inner horizon rho must be negative")
+        radius = attempt["radius"]
+        if not isinstance(radius, Mapping) or set(radius) != {"real", "imaginary"}:
+            raise ValueError("real-inner horizon radius fields are invalid")
+        radius_real = _finite_decimal_text(
+            radius["real"], "real-inner horizon radius real"
+        )
+        radius_imaginary = _finite_decimal_text(
+            radius["imaginary"], "real-inner horizon radius imaginary"
+        )
+        distance = _finite_decimal_text(
+            attempt["horizon_distance"], "real-inner horizon distance",
+            nonnegative=True,
+        )
+        expansion = _finite_decimal_text(
+            attempt["expansion_variable_magnitude"],
+            "real-inner horizon expansion magnitude", nonnegative=True,
+        )
+        predicted = _finite_decimal_text(
+            attempt["predicted_reliable_digits"],
+            "real-inner horizon predicted digits",
+        )
+        required_digits = _finite_decimal_text(
+            attempt["required_reliable_digits"],
+            "real-inner horizon required digits", nonnegative=True,
+        )
+        last_term = _finite_decimal_text(
+            attempt["last_term_ratio"], "real-inner horizon last-term ratio",
+            nonnegative=True,
+        )
+        truncation = _finite_decimal_text(
+            attempt["maximum_truncation_digits_lost"],
+            "real-inner horizon truncation loss", nonnegative=True,
+        )
+        recurrence = _finite_decimal_text(
+            attempt["maximum_recurrence_digits_lost"],
+            "real-inner horizon recurrence loss", nonnegative=True,
+        )
+        evaluation = _finite_decimal_text(
+            attempt["maximum_series_evaluation_digits_lost"],
+            "real-inner horizon evaluation loss", nonnegative=True,
+        )
+        if expansion != distance:
+            raise ValueError("real-inner horizon expansion magnitude moved")
+        if rplus is not None:
+            with localcontext() as context:
+                context.prec = 128
+                expected_distance = (
+                    (radius_real - rplus) ** 2 + radius_imaginary ** 2
+                ).sqrt()
+                tolerance = max(expected_distance, Decimal(1)).scaleb(-12)
+            if abs(distance - expected_distance) > tolerance:
+                raise ValueError("real-inner horizon distance is inconsistent")
+        approach_expected = previous_distance is None or distance < previous_distance
+        geometry_valid = (
+            radius_imaginary == 0
+            and (rplus is None or radius_real > rplus)
+            and attempt["exterior"] is True
+            and attempt["on_real_axis"] is True
+            and attempt["approaches_horizon"] is approach_expected
+            and approach_expected
+            and attempt["within_maximum_distance"] is (distance <= maximum_distance)
+            and distance <= maximum_distance
+        )
+        best_prefix = attempt["best_prefix_order"]
+        if best_prefix is not None and (
+            type(best_prefix) is not int
+            or best_prefix < 4
+            or best_prefix > attempt["attempted_endpoint_order"]
+        ):
+            raise ValueError("real-inner horizon best-prefix order is invalid")
+        adequate = (
+            geometry_valid
+            and best_prefix is not None
+            and predicted >= required_digits
+        )
+        if type(attempt["adequate"]) is not bool or attempt["adequate"] is not adequate:
+            raise ValueError("real-inner horizon endpoint adequacy is invalid")
+        if adequate:
+            limitation = ENDPOINT_ADEQUATE
+            adequate_indices.append(index)
+        elif not geometry_valid or best_prefix is None or last_term >= 1:
+            limitation = ENDPOINT_GEOMETRY_LIMITED
+        elif recurrence + evaluation >= truncation:
+            limitation = ENDPOINT_ARITHMETIC_LIMITED
+        else:
+            limitation = ENDPOINT_SERIES_ORDER_LIMITED
+        if attempt["candidate_limitation"] != limitation:
+            raise ValueError("real-inner endpoint limitation disagrees with evidence")
+        limitations.append(limitation)
+        maximum_truncation = max(maximum_truncation, truncation)
+
+        terminal = index == len(attempts) - 1
+        if adequate and not terminal:
+            raise ValueError("real-inner recovery inspected beyond first adequacy")
+        if not terminal:
+            expected_geometry_index += 1
+            if expected_geometry_index == len(schedule):
+                expected_order_index += 1
+                expected_geometry_index = 0
+                previous_distance = None
+            else:
+                previous_distance = distance
+
+    outcome = value["candidate_limitation"]
+    terminal_attempt = attempts[-1]
+    if adequate_indices:
+        if adequate_indices != [len(attempts) - 1] or outcome != ENDPOINT_ADEQUATE:
+            raise ValueError("real-inner horizon selection is not first-adequate")
+        if (
+            value["selected_rho"] != terminal_attempt["rho"]
+            or value["selected_endpoint_order"]
+            != terminal_attempt["attempted_endpoint_order"]
+            or value["selected_best_prefix_order"]
+            != terminal_attempt["best_prefix_order"]
+        ):
+            raise ValueError("real-inner horizon selected endpoint is inconsistent")
+    else:
+        if any(
+            value[name] is not None
+            for name in (
+                "selected_rho", "selected_endpoint_order",
+                "selected_best_prefix_order",
+            )
+        ):
+            raise ValueError("inadequate real-inner receipt selected an endpoint")
+        if limitations[-1] == ENDPOINT_ARITHMETIC_LIMITED:
+            expected_outcome = ENDPOINT_ARITHMETIC_LIMITED
+        elif len(attempts) != len(orders) * len(schedule):
+            raise ValueError("real-inner horizon recovery stopped before exhaustion")
+        elif any(item == ENDPOINT_SERIES_ORDER_LIMITED for item in limitations):
+            expected_outcome = ENDPOINT_SERIES_ORDER_LIMITED
+        else:
+            expected_outcome = ENDPOINT_GEOMETRY_LIMITED
+        if outcome != expected_outcome:
+            raise ValueError("real-inner horizon terminal cause is invalid")
+    if _finite_decimal_text(
+        value["maximum_truncation_digits_lost"],
+        "real-inner horizon maximum truncation loss", nonnegative=True,
+    ) != maximum_truncation:
+        raise ValueError("real-inner horizon truncation summary is invalid")
+    return json.loads(canonical_json_bytes(dict(value))), str(outcome)
 
 
 def _recomputed_endpoint_limitation(attempt: Mapping[str, object]) -> str:
@@ -3121,15 +3432,24 @@ def _validated_exterior_endpoint_recovery_evidence(
     policy: Mapping[str, object],
     *,
     expected_aggregate: str | None = None,
+    spin: object | None = None,
+    expected_horizon_match_radius: object | None = None,
 ) -> tuple[list[dict[str, object]], str]:
     if not isinstance(value, list) or len(value) != 2:
         raise ValueError("exterior determinant requires two endpoint receipts")
     validated: list[dict[str, object]] = []
     limitations: list[str] = []
-    for raw, branch in zip(value, ("horizon-ingoing", "infinity-outgoing")):
-        receipt, limitation = _validated_endpoint_recovery_receipt(
-            raw, policy, endpoint_branch=branch
-        )
+    horizon, horizon_limitation = _validated_real_inner_horizon_endpoint_receipt(
+        value[0], policy, spin=spin,
+        expected_match_radius=expected_horizon_match_radius,
+    )
+    infinity, infinity_limitation = _validated_endpoint_recovery_receipt(
+        value[1], policy, endpoint_branch="infinity-outgoing"
+    )
+    for receipt, limitation in (
+        (horizon, horizon_limitation),
+        (infinity, infinity_limitation),
+    ):
         validated.append(receipt)
         limitations.append(limitation)
     aggregate = _aggregate_endpoint_limitations(limitations)
@@ -3577,6 +3897,49 @@ class JuliaResponseAdapter:
             ):
                 raise JuliaResponseBackendError(
                     f"M02 Julia {label} receipt digest does not match the installed runtime"
+                )
+        # The worker's own hash being valid does not prove its authority
+        # resources are staged: a bootstrap repair that only needed to
+        # restore a missing/corrupted resource never republishes an
+        # already-valid m02_worker.jl, so a reader that trusted the worker
+        # hash alone could launch it mid-repair and fail on the first
+        # authority read. Validate every resource the worker depends on
+        # here, using the same same-dir-then-parent-dir resolution the
+        # worker itself uses, before this adapter is considered ready.
+        worker_contract = julia.get("worker_contract")
+        for contract_key, resource_filename, resource_label in (
+            (
+                "fixed_root_authority_sha256",
+                "fixed_root_reliability_projection_authority_v1.json",
+                "fixed-root reliability projection authority",
+            ),
+            (
+                "promoted_calibration_sha256",
+                "promoted_control_empirical_calibration_v1.json",
+                "promoted control empirical calibration",
+            ),
+        ):
+            same_dir_resource = worker.parent / resource_filename
+            resource_path = (
+                same_dir_resource
+                if same_dir_resource.is_file()
+                else worker.parent.parent / resource_filename
+            )
+            observed_resource_sha256 = _sha256(
+                _regular_file(resource_path, f"M02 Julia {resource_label} resource")
+            )
+            declared_resource_sha256 = (
+                worker_contract.get(contract_key)
+                if isinstance(worker_contract, Mapping)
+                else None
+            )
+            if declared_resource_sha256 is not None and (
+                not isinstance(declared_resource_sha256, str)
+                or declared_resource_sha256 != observed_resource_sha256
+            ):
+                raise JuliaResponseBackendError(
+                    f"M02 Julia {resource_label} resource digest does not match "
+                    "the installed runtime"
                 )
         declared_arguments = julia.get("arguments", [])
         if (
@@ -4718,6 +5081,12 @@ class JuliaPrecisionRootBackend:
         fixed_root_policy, reliability_projection = (
             self._fixed_root_survey_policy(job)
         )
+        # Tight-control comparison requests may refine ODE/coordinate controls,
+        # but the authenticated real-inner ladder is immutable at 28 -> 56 ->
+        # 112.  Endpoint-order escalation is not a comparator control.
+        fixed_root_policy["endpoint_series_order"] = (
+            FIXED_ROOT_ENDPOINT_BASE_ORDER
+        )
         endpoint_recovery_policy = _fixed_root_endpoint_recovery_policy(
             fixed_root_policy,
             reliability_projection,
@@ -4830,6 +5199,14 @@ class JuliaPrecisionRootBackend:
             != request["policy"]["endpoint_series_order"]
             or recovery_policy["horizon_geometry_schedule"][-1]
             != request["policy"]["rho_in"]
+            or any(
+                recovery_policy[field] != request["policy"][field]
+                for field in (
+                    "horizon_rho_inner_min",
+                    "horizon_endpoint_rho_floor",
+                    "horizon_maximum_endpoint_distance",
+                )
+            )
             or recovery_policy["infinity_geometry_schedule"][-1]
             != request["policy"]["rho_out"]
             or recovery_policy["precision_digits"] != self.digits
@@ -5031,6 +5408,12 @@ class JuliaPrecisionRootBackend:
                     telemetry["endpoint_receipts"],
                     recovery_policy,
                     expected_aggregate=ENDPOINT_ADEQUATE,
+                    spin=request.get("spin"),
+                    expected_horizon_match_radius=(
+                        policy["readout_radius"]
+                        if role in _FIXED_ROOT_SURVEY_BACKGROUND_ROLES
+                        else requested["support"]["lower"]
+                    ),
                 )
             except ValueError as error:
                 raise JuliaResponseBackendError(

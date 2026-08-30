@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -46,17 +47,76 @@ def _job():
     )
 
 
-def _conditioning() -> FixedRootSurveyConditioning:
+def _conditioning(job) -> FixedRootSurveyConditioning:
     required = "16.698970004336018804786261105275506973231810118538"
-    receipts = []
-    for branch, geometry, schedule in (
-        ("horizon-ingoing", "-5000", ["-5000", "-10000", "-20000"]),
-        ("infinity-outgoing", "100", ["100", "250", "500", "1000", "2000", "5000", "10000", "20000"]),
-    ):
-        attempt = {
-            "endpoint_branch": branch,
+    policy_identity = (
+        "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2"
+    )
+    policy_sha256 = "f" * 64
+    horizon_schedule = [
+        "-10", "-25", "-50", "-75", "-100", "-150", "-225",
+        "-337.5", "-400",
+    ]
+    rplus = 1.0 + math.sqrt(1.0 - float(job.spin) ** 2)
+    horizon_attempt = {
+            "rho": "-10",
+            "radius": {
+                "real": format(rplus + 0.01, ".17g"),
+                "imaginary": "0",
+            },
+            "horizon_distance": "0.01",
+            "expansion_variable_magnitude": "0.01",
+            "exterior": True,
+            "on_real_axis": True,
+            "approaches_horizon": True,
+            "within_maximum_distance": True,
             "attempted_endpoint_order": 28,
-            "attempted_geometry": geometry,
+            "best_prefix_order": 28,
+            "last_term_ratio": "1e-20",
+            "predicted_reliable_digits": "35",
+            "required_reliable_digits": required,
+            "adequate": True,
+            "maximum_truncation_digits_lost": "0",
+            "maximum_recurrence_digits_lost": "1",
+            "maximum_series_evaluation_digits_lost": "1",
+            "candidate_limitation": "adequate/v1",
+    }
+    receipts = [{
+        "schema": "windows-solver.exterior-endpoint-recovery-receipt/2",
+        "endpoint_branch": "horizon-ingoing",
+        "contour_identity": "real-inner-tortoise-contour/v1",
+        "recovery_policy_identity": policy_identity,
+        "recovery_policy_sha256": policy_sha256,
+        "match_radius": format(job.policy.readout_radius, ".17g"),
+        "rstar_match": "0",
+        "rho_floor": "-400",
+        "rho_schedule": horizon_schedule,
+        "coordinate_identity": {
+            "passed": True,
+            "sample_count": 9,
+            "maximum_absolute_residual": "0",
+            "maximum_relative_residual": "0",
+            "absolute_tolerance": "1e-20",
+            "relative_tolerance": "1e-20",
+            "maximum_absolute_residual_over_tolerance": "0",
+            "maximum_relative_residual_over_tolerance": "0",
+        },
+        "attempts": [horizon_attempt],
+        "selected_rho": "-10",
+        "selected_endpoint_order": 28,
+        "selected_best_prefix_order": 28,
+        "candidate_limitation": "adequate/v1",
+        "aggregate_limitation": "adequate/v1",
+        "maximum_truncation_digits_lost": "0",
+        "factored_homogeneous_rhs_evaluations_before_decision": 0,
+    }]
+    infinity_schedule = [
+        "100", "250", "500", "1000", "2000", "5000", "10000", "20000"
+    ]
+    attempt = {
+            "endpoint_branch": "infinity-outgoing",
+            "attempted_endpoint_order": 28,
+            "attempted_geometry": "100",
             "maximum_last_term_ratio": "1e-20",
             "maximum_truncation_digits_lost": "0",
             "maximum_recurrence_digits_lost": "1",
@@ -67,17 +127,17 @@ def _conditioning() -> FixedRootSurveyConditioning:
             "selected_intervention": "ENTER_HOMOGENEOUS_ODE",
             "result": "ADEQUATE",
         }
-        receipts.append({
+    receipts.append({
             "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
-            "endpoint_branch": branch,
-            "recovery_policy_identity": "cause-aware-fixed-root-exterior-endpoint-recovery/v1",
-            "recovery_policy_sha256": "f" * 64,
+            "endpoint_branch": "infinity-outgoing",
+            "recovery_policy_identity": policy_identity,
+            "recovery_policy_sha256": policy_sha256,
             "base_endpoint_order": 28,
             "generated_maximum_order": 112,
             "attempted_endpoint_orders": [28],
             "terminal_endpoint_order": 28,
-            "candidate_geometry_schedule": schedule,
-            "terminal_geometry": geometry,
+            "candidate_geometry_schedule": infinity_schedule,
+            "terminal_geometry": "100",
             "maximum_last_term_ratio": "1e-20",
             "maximum_truncation_digits_lost": "0",
             "maximum_recurrence_digits_lost": "1",
@@ -88,7 +148,7 @@ def _conditioning() -> FixedRootSurveyConditioning:
             "aggregate_limitation": "adequate/v1",
             "factored_homogeneous_rhs_evaluations": 0,
             "attempts": [attempt],
-        })
+    })
     return FixedRootSurveyConditioning({
         "schema": "windows-solver.fixed-root-survey-conditioning/3",
         "fixed_root_reliability_target_abs": "2e-11",
@@ -116,8 +176,8 @@ def _conditioning() -> FixedRootSurveyConditioning:
             "16.698970004336018804786261105275506973231810118538"
         ),
         "precision_limited": False,
-        "endpoint_recovery_policy_identity": "cause-aware-fixed-root-exterior-endpoint-recovery/v1",
-        "endpoint_recovery_policy_sha256": "f" * 64,
+        "endpoint_recovery_policy_identity": policy_identity,
+        "endpoint_recovery_policy_sha256": policy_sha256,
         "endpoint_receipts": receipts,
         "aggregate_limitation": "adequate/v1",
         "factored_homogeneous_rhs_evaluations_before_recovery_decision": 0,
@@ -165,7 +225,7 @@ def _batch(job) -> JuliaFixedRootSurveyBatch:
             complex(omega),
             complex(amplitude),
             DecimalComplex(Decimal(str(3.0 * (omega.real - root.real))), Decimal(0)),
-            _conditioning(),
+            _conditioning(job),
             identity.select_sample(index, role).to_mapping(),
         )
         for index, (role, (omega, amplitude)) in enumerate(zip(

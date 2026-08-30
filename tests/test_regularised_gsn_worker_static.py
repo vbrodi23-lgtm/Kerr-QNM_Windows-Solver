@@ -403,19 +403,25 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
         exterior = self._function_slice(
             "evaluate_exterior_determinant", "determinant"
         )
-        lower_prepare = exterior.index("CF.prepare_factored_horizon_ingoing(")
+        lower_prepare = exterior.index(
+            "prepare_real_inner_exterior_horizon_ingoing("
+        )
         outer_prepare = exterior.index("CF.prepare_factored_infinity_outgoing(")
         authenticated_gate = exterior.index(
-            "CF.assert_factored_exterior_preparations_ready("
+            "assert_real_inner_exterior_preparations_ready("
         )
         first_solve = min(
-            exterior.index("CF.solve_factored_xin_to_match("),
+            exterior.index("CF.solve_factored_horizon_branch_to_match("),
             exterior.index("CF.solve_factored_xup_to_match("),
         )
         self.assertLess(lower_prepare, authenticated_gate)
         self.assertLess(outer_prepare, authenticated_gate)
         self.assertLess(authenticated_gate, first_solve)
         self.assertNotIn("CF.assert_factored_preflights_adequate(", exterior)
+        # The horizon-ingoing leg must never fall back onto the joined,
+        # frequency-aligned contour pipeline within this function.
+        self.assertNotIn("CF.prepare_factored_horizon_ingoing(", exterior)
+        self.assertNotIn("CF.solve_factored_xin_to_match(", exterior)
 
     def test_package_owns_factored_propagation_and_scattering_math(self) -> None:
         for call in (
@@ -423,7 +429,7 @@ class RegularisedGsnWorkerSourceTests(unittest.TestCase):
             "CF.recover_verified_horizon_endpoint_pair(",
             "CF.verified_horizon_endpoints_from_recovery(",
             "CF.solve_verified_horizon_basis_to_match(",
-            "CF.solve_factored_xin_to_match(",
+            "CF.solve_factored_horizon_branch_to_match(",
             "CF.solve_factored_xup_to_match(",
             "CF.reconstruct_factored_match_state(",
             "Solutions.build_match_horizon_basis(",

@@ -3153,6 +3153,39 @@ def _outcome_authorizes_bf80(outcome: PromotedPassOutcome) -> bool:
     return _control_decision_authorizes_bf80(outcome)
 
 
+def _attempted_endpoint_orders_for_trace(
+    receipt: Mapping[str, object],
+) -> list[object]:
+    attempted_orders = receipt.get("attempted_endpoint_orders")
+    if isinstance(attempted_orders, list):
+        return list(attempted_orders)
+    attempts = receipt.get("attempts")
+    if not isinstance(attempts, list):
+        return []
+    return [
+        attempt.get("attempted_endpoint_order")
+        for attempt in attempts
+        if isinstance(attempt, Mapping)
+    ]
+
+
+def _attempted_endpoint_geometries_for_trace(
+    receipt: Mapping[str, object],
+) -> list[object]:
+    attempts = receipt.get("attempts")
+    if not isinstance(attempts, list):
+        return []
+    return [
+        (
+            attempt.get("attempted_geometry")
+            if "attempted_geometry" in attempt
+            else attempt.get("rho")
+        )
+        for attempt in attempts
+        if isinstance(attempt, Mapping)
+    ]
+
+
 def _control_trace_fields(outcome: PromotedPassOutcome) -> dict[str, object]:
     decision = outcome.calculation_artifact
     if (
@@ -3258,15 +3291,12 @@ def _control_trace_fields(outcome: PromotedPassOutcome) -> dict[str, object]:
             if isinstance(item, Mapping)
         ],
         "attempted_endpoint_orders": [
-            item.get("attempted_endpoint_orders") for item in endpoint_receipts
+            _attempted_endpoint_orders_for_trace(item)
+            for item in endpoint_receipts
             if isinstance(item, Mapping)
         ],
         "attempted_endpoint_geometries": [
-            [
-                attempt.get("attempted_geometry")
-                for attempt in item.get("attempts", [])
-                if isinstance(attempt, Mapping)
-            ]
+            _attempted_endpoint_geometries_for_trace(item)
             for item in endpoint_receipts if isinstance(item, Mapping)
         ],
         "limiting_resource": (

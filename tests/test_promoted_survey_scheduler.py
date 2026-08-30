@@ -5,6 +5,7 @@ from dataclasses import replace
 from decimal import Decimal
 import hashlib
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -127,13 +128,21 @@ def _fixture_fixed_root_request(job, digits: int, kwargs):
     contract = _requested_contract(kwargs)
     recovery_binding = {
         "schema": "windows-solver.fixed-root-endpoint-recovery-policy/1",
-        "identity": "cause-aware-fixed-root-exterior-endpoint-recovery/v1",
+        "identity": (
+            "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2"
+        ),
         "endpoint_order_rule": "bounded-doubling-prefix/v1",
         "base_endpoint_order": 28,
         "generated_maximum_order": 112,
         "endpoint_order_schedule": [28, 56, 112],
-        "horizon_geometry_rule": "bounded-negative-rho-depth/v1",
-        "horizon_geometry_schedule": ["-5000", "-10000", "-20000"],
+        "horizon_geometry_rule": "bounded-real-inner-tortoise-depth/v1",
+        "horizon_geometry_schedule": [
+            "-10", "-25", "-50", "-75", "-100", "-150", "-225",
+            "-337.5", "-400",
+        ],
+        "horizon_rho_inner_min": "-400",
+        "horizon_endpoint_rho_floor": "-400",
+        "horizon_maximum_endpoint_distance": "0.1",
         "infinity_geometry_rule": "bounded-positive-rho-depth/v1",
         "infinity_geometry_schedule": [
             "100", "250", "500", "1000", "2000", "5000", "10000", "20000"
@@ -165,10 +174,11 @@ def _fixture_fixed_root_request(job, digits: int, kwargs):
             else PrecisionTier.BIGFLOAT_80
         ),
         "semantic_precision_tier": f"bigfloat-{digits}",
+        "spin": format(job.spin, ".17g"),
         "policy": {
             "job_policy_sha256": job.policy.identity_sha256,
             "endpoint_series_order": 28,
-            "rho_in": "-20000",
+            "rho_in": "-400",
             "rho_out": "20000",
         },
         "fixed_root_endpoint_recovery_policy": recovery,
@@ -201,90 +211,148 @@ def _endpoint_control_diagnostics(request, failure_code: str):
             "ARITHMETIC_INADEQUATE",
         ),
     }[failure_code]
-    receipts = []
-    for branch, geometry_field in (
-        ("horizon-ingoing", "horizon_geometry_schedule"),
-        ("infinity-outgoing", "infinity_geometry_schedule"),
-    ):
-        geometries = policy[geometry_field]
-        orders = policy["endpoint_order_schedule"]
-        coordinates = (
-            [(order, geometries[0]) for order in orders]
+    orders = policy["endpoint_order_schedule"]
+    horizon_geometries = policy["horizon_geometry_schedule"]
+    horizon_coordinates = (
+        [(orders[0], 0)]
+        if limitation == "insufficient-arithmetic-precision/v1"
+        else [
+            (order, geometry_index)
+            for order in orders
+            for geometry_index in range(len(horizon_geometries))
+        ]
+    )
+    spin = float(request["spin"])
+    rplus = 1.0 + math.sqrt(1.0 - spin * spin)
+    truncation = (
+        "2" if limitation == "insufficient-arithmetic-precision/v1" else "10"
+    )
+    last_ratio = (
+        "1" if limitation == "insufficient-geometric-depth/v1" else "0.1"
+    )
+    horizon_attempts = []
+    for order, geometry_index in horizon_coordinates:
+        distance = 0.09 / (geometry_index + 1)
+        distance_text = format(distance, ".17g")
+        horizon_attempts.append({
+            "rho": horizon_geometries[geometry_index],
+            "radius": {
+                "real": format(rplus + distance, ".17g"),
+                "imaginary": "0",
+            },
+            "horizon_distance": distance_text,
+            "expansion_variable_magnitude": distance_text,
+            "exterior": True,
+            "on_real_axis": True,
+            "approaches_horizon": True,
+            "within_maximum_distance": True,
+            "attempted_endpoint_order": order,
+            "best_prefix_order": order,
+            "last_term_ratio": last_ratio,
+            "predicted_reliable_digits": "10",
+            "required_reliable_digits": "20",
+            "adequate": False,
+            "maximum_truncation_digits_lost": truncation,
+            "maximum_recurrence_digits_lost": "1",
+            "maximum_series_evaluation_digits_lost": "1",
+            "candidate_limitation": limitation,
+        })
+    receipts = [{
+        "schema": "windows-solver.exterior-endpoint-recovery-receipt/2",
+        "endpoint_branch": "horizon-ingoing",
+        "contour_identity": "real-inner-tortoise-contour/v1",
+        "recovery_policy_identity": policy["identity"],
+        "recovery_policy_sha256": policy["policy_sha256"],
+        "match_radius": "3",
+        "rstar_match": "0",
+        "rho_floor": policy["horizon_endpoint_rho_floor"],
+        "rho_schedule": horizon_geometries,
+        "coordinate_identity": {
+            "passed": True,
+            "sample_count": 9,
+            "maximum_absolute_residual": "0",
+            "maximum_relative_residual": "0",
+            "absolute_tolerance": "1e-20",
+            "relative_tolerance": "1e-20",
+            "maximum_absolute_residual_over_tolerance": "0",
+            "maximum_relative_residual_over_tolerance": "0",
+        },
+        "attempts": horizon_attempts,
+        "selected_rho": None,
+        "selected_endpoint_order": None,
+        "selected_best_prefix_order": None,
+        "candidate_limitation": limitation,
+        "aggregate_limitation": limitation,
+        "maximum_truncation_digits_lost": truncation,
+        "factored_homogeneous_rhs_evaluations_before_decision": 0,
+    }]
+
+    geometries = policy["infinity_geometry_schedule"]
+    coordinates = (
+        [(order, geometries[0]) for order in orders]
+        if limitation == "insufficient-series-order/v1"
+        else [(orders[0], geometry) for geometry in geometries]
+        if limitation == "insufficient-geometric-depth/v1"
+        else [(orders[0], geometries[0])]
+    )
+    infinity_attempts = []
+    for index, (order, geometry) in enumerate(coordinates):
+        terminal = index == len(coordinates) - 1
+        selected = (
+            "PROMOTE_ARITHMETIC_TIER_IF_AGGREGATE_ALLOWS"
+            if limitation == "insufficient-arithmetic-precision/v1"
+            else "NONE" if terminal
+            else "INCREASE_ENDPOINT_ORDER"
             if limitation == "insufficient-series-order/v1"
-            else [(orders[0], geometry) for geometry in geometries]
-            if limitation == "insufficient-geometric-depth/v1"
-            else [(orders[0], geometries[0])]
+            else "DEEPEN_ENDPOINT_GEOMETRY"
         )
-        attempts = []
-        for index, (order, geometry) in enumerate(coordinates):
-            terminal = index == len(coordinates) - 1
-            last_ratio = (
-                "1" if limitation == "insufficient-geometric-depth/v1" else "0.1"
-            )
-            truncation = (
-                "2" if limitation == "insufficient-arithmetic-precision/v1" else "10"
-            )
-            selected = (
-                "PROMOTE_ARITHMETIC_TIER_IF_AGGREGATE_ALLOWS"
-                if limitation == "insufficient-arithmetic-precision/v1"
-                else "NONE" if terminal
-                else "INCREASE_ENDPOINT_ORDER"
-                if limitation == "insufficient-series-order/v1"
-                else "DEEPEN_ENDPOINT_GEOMETRY"
-            )
-            result = (
-                "ARITHMETIC_INADEQUATE"
-                if limitation == "insufficient-arithmetic-precision/v1"
-                else "ORDER_EXHAUSTED"
-                if terminal and limitation == "insufficient-series-order/v1"
-                else "GEOMETRY_EXHAUSTED"
-                if terminal else "RETRY"
-            )
-            attempts.append({
-                "endpoint_branch": branch,
-                "attempted_endpoint_order": order,
-                "attempted_geometry": geometry,
-                "maximum_last_term_ratio": last_ratio,
-                "maximum_truncation_digits_lost": truncation,
-                "maximum_recurrence_digits_lost": "1",
-                "maximum_series_evaluation_digits_lost": "1",
-                "predicted_reliable_digits": "10",
-                "required_reliable_digits": "20",
-                "candidate_limitation": limitation,
-                "selected_intervention": selected,
-                "result": result,
-            })
-        terminal_attempt = attempts[-1]
-        receipts.append({
-            "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
-            "endpoint_branch": branch,
-            "recovery_policy_identity": policy["identity"],
-            "recovery_policy_sha256": policy["policy_sha256"],
-            "base_endpoint_order": policy["base_endpoint_order"],
-            "generated_maximum_order": policy["generated_maximum_order"],
-            "attempted_endpoint_orders": [
-                attempt["attempted_endpoint_order"] for attempt in attempts
-            ],
-            "terminal_endpoint_order": terminal_attempt[
-                "attempted_endpoint_order"
-            ],
-            "candidate_geometry_schedule": geometries,
-            "terminal_geometry": terminal_attempt["attempted_geometry"],
-            "maximum_last_term_ratio": terminal_attempt[
-                "maximum_last_term_ratio"
-            ],
-            "maximum_truncation_digits_lost": terminal_attempt[
-                "maximum_truncation_digits_lost"
-            ],
+        result = (
+            "ARITHMETIC_INADEQUATE"
+            if limitation == "insufficient-arithmetic-precision/v1"
+            else "ORDER_EXHAUSTED"
+            if terminal and limitation == "insufficient-series-order/v1"
+            else "GEOMETRY_EXHAUSTED"
+            if terminal else "RETRY"
+        )
+        infinity_attempts.append({
+            "endpoint_branch": "infinity-outgoing",
+            "attempted_endpoint_order": order,
+            "attempted_geometry": geometry,
+            "maximum_last_term_ratio": last_ratio,
+            "maximum_truncation_digits_lost": truncation,
             "maximum_recurrence_digits_lost": "1",
             "maximum_series_evaluation_digits_lost": "1",
             "predicted_reliable_digits": "10",
             "required_reliable_digits": "20",
             "candidate_limitation": limitation,
-            "aggregate_limitation": limitation,
-            "factored_homogeneous_rhs_evaluations": 0,
-            "attempts": attempts,
+            "selected_intervention": selected,
+            "result": result,
         })
+    terminal_attempt = infinity_attempts[-1]
+    receipts.append({
+        "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
+        "endpoint_branch": "infinity-outgoing",
+        "recovery_policy_identity": policy["identity"],
+        "recovery_policy_sha256": policy["policy_sha256"],
+        "base_endpoint_order": policy["base_endpoint_order"],
+        "generated_maximum_order": policy["generated_maximum_order"],
+        "attempted_endpoint_orders": [
+            attempt["attempted_endpoint_order"] for attempt in infinity_attempts
+        ],
+        "terminal_endpoint_order": terminal_attempt["attempted_endpoint_order"],
+        "candidate_geometry_schedule": geometries,
+        "terminal_geometry": terminal_attempt["attempted_geometry"],
+        "maximum_last_term_ratio": last_ratio,
+        "maximum_truncation_digits_lost": truncation,
+        "maximum_recurrence_digits_lost": "1",
+        "maximum_series_evaluation_digits_lost": "1",
+        "predicted_reliable_digits": "10",
+        "required_reliable_digits": "20",
+        "candidate_limitation": limitation,
+        "aggregate_limitation": limitation,
+        "factored_homogeneous_rhs_evaluations": 0,
+        "attempts": infinity_attempts,
+    })
     return {
         "reason": failure_code,
         "aggregate_limitation": limitation,
@@ -377,18 +445,70 @@ def _conditioning(
 ) -> FixedRootSurveyConditioning:
     del precision_limited
     required = "16.698970004336018804786261105275506973231810118538"
-    receipts = []
-    for branch, geometry, schedule in (
-        ("horizon-ingoing", "-5000", ["-5000", "-10000", "-20000"]),
-        (
-            "infinity-outgoing", "100",
-            ["100", "250", "500", "1000", "2000", "5000", "10000", "20000"],
-        ),
-    ):
-        attempt = {
-            "endpoint_branch": branch,
+    policy_identity = (
+        "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2"
+    )
+    policy_sha256 = "f" * 64
+    horizon_schedule = [
+        "-10", "-25", "-50", "-75", "-100", "-150", "-225",
+        "-337.5", "-400",
+    ]
+    horizon_attempt = {
+            "rho": "-10",
+            "radius": {"real": "1.51", "imaginary": "0"},
+            "horizon_distance": "0.01",
+            "expansion_variable_magnitude": "0.01",
+            "exterior": True,
+            "on_real_axis": True,
+            "approaches_horizon": True,
+            "within_maximum_distance": True,
             "attempted_endpoint_order": 28,
-            "attempted_geometry": geometry,
+            "best_prefix_order": 28,
+            "last_term_ratio": "1e-20",
+            "predicted_reliable_digits": str(digits - 5),
+            "required_reliable_digits": required,
+            "adequate": True,
+            "maximum_truncation_digits_lost": "0",
+            "maximum_recurrence_digits_lost": "1",
+            "maximum_series_evaluation_digits_lost": "1",
+            "candidate_limitation": "adequate/v1",
+    }
+    receipts = [{
+        "schema": "windows-solver.exterior-endpoint-recovery-receipt/2",
+        "endpoint_branch": "horizon-ingoing",
+        "contour_identity": "real-inner-tortoise-contour/v1",
+        "recovery_policy_identity": policy_identity,
+        "recovery_policy_sha256": policy_sha256,
+        "match_radius": "3",
+        "rstar_match": "0",
+        "rho_floor": "-400",
+        "rho_schedule": horizon_schedule,
+        "coordinate_identity": {
+            "passed": True,
+            "sample_count": 9,
+            "maximum_absolute_residual": "0",
+            "maximum_relative_residual": "0",
+            "absolute_tolerance": "1e-20",
+            "relative_tolerance": "1e-20",
+            "maximum_absolute_residual_over_tolerance": "0",
+            "maximum_relative_residual_over_tolerance": "0",
+        },
+        "attempts": [horizon_attempt],
+        "selected_rho": "-10",
+        "selected_endpoint_order": 28,
+        "selected_best_prefix_order": 28,
+        "candidate_limitation": "adequate/v1",
+        "aggregate_limitation": "adequate/v1",
+        "maximum_truncation_digits_lost": "0",
+        "factored_homogeneous_rhs_evaluations_before_decision": 0,
+    }]
+    infinity_schedule = [
+        "100", "250", "500", "1000", "2000", "5000", "10000", "20000"
+    ]
+    attempt = {
+            "endpoint_branch": "infinity-outgoing",
+            "attempted_endpoint_order": 28,
+            "attempted_geometry": "100",
             "maximum_last_term_ratio": "1e-20",
             "maximum_truncation_digits_lost": "0",
             "maximum_recurrence_digits_lost": "1",
@@ -399,19 +519,17 @@ def _conditioning(
             "selected_intervention": "ENTER_HOMOGENEOUS_ODE",
             "result": "ADEQUATE",
         }
-        receipts.append({
+    receipts.append({
             "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
-            "endpoint_branch": branch,
-            "recovery_policy_identity": (
-                "cause-aware-fixed-root-exterior-endpoint-recovery/v1"
-            ),
-            "recovery_policy_sha256": "f" * 64,
+            "endpoint_branch": "infinity-outgoing",
+            "recovery_policy_identity": policy_identity,
+            "recovery_policy_sha256": policy_sha256,
             "base_endpoint_order": 28,
             "generated_maximum_order": 112,
             "attempted_endpoint_orders": [28],
             "terminal_endpoint_order": 28,
-            "candidate_geometry_schedule": schedule,
-            "terminal_geometry": geometry,
+            "candidate_geometry_schedule": infinity_schedule,
+            "terminal_geometry": "100",
             "maximum_last_term_ratio": "1e-20",
             "maximum_truncation_digits_lost": "0",
             "maximum_recurrence_digits_lost": "1",
@@ -422,7 +540,7 @@ def _conditioning(
             "aggregate_limitation": "adequate/v1",
             "factored_homogeneous_rhs_evaluations": 0,
             "attempts": [attempt],
-        })
+    })
     return FixedRootSurveyConditioning({
         "schema": "windows-solver.fixed-root-survey-conditioning/3",
         "fixed_root_reliability_target_abs": "2e-11",
@@ -455,9 +573,9 @@ def _conditioning(
         ),
         "precision_limited": False,
         "endpoint_recovery_policy_identity": (
-            "cause-aware-fixed-root-exterior-endpoint-recovery/v1"
+            policy_identity
         ),
-        "endpoint_recovery_policy_sha256": "f" * 64,
+        "endpoint_recovery_policy_sha256": policy_sha256,
         "endpoint_receipts": receipts,
         "aggregate_limitation": "adequate/v1",
         "factored_homogeneous_rhs_evaluations_before_recovery_decision": 0,

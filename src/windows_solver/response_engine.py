@@ -64,7 +64,7 @@ from .response_uncertainty import (
     ComplexDisk,
     ZeroContainingDiskError,
     exterior_response_disk,
-    legacy_v2_horizon_response_disk,
+    normalised_horizon_chart_response_disk,
 )
 from .reviewed_determinant_error import (
     AuthenticatedDeterminantErrorBundle,
@@ -8006,9 +8006,10 @@ def _validate_promoted_horizon_checkpoint_evidence(
     expected_response: ComplexDisk | None
     expected_zero: str | None
     try:
-        expected_response = legacy_v2_horizon_response_disk(
+        expected_response = normalised_horizon_chart_response_disk(
             horizon_frequency=frequency,
             determinant_derivative=expected_derivative,
+            determinant_normalisation=HORIZON_DETERMINANT_NORMALISATION,
         )
         expected_zero = None
     except ZeroContainingDiskError as error:
@@ -8228,9 +8229,10 @@ def _validate_root_sealed_horizon_checkpoint_evidence(
     ):
         raise ValueError("root-sealed horizon derivative is not sample-derived")
     try:
-        response_disk = legacy_v2_horizon_response_disk(
+        response_disk = normalised_horizon_chart_response_disk(
             horizon_frequency=frequency,
             determinant_derivative=derivative,
+            determinant_normalisation=HORIZON_DETERMINANT_NORMALISATION,
         )
         expected_zero = None
     except ZeroContainingDiskError as error:
@@ -10585,9 +10587,10 @@ def run_promoted_horizon_response_from_seal(
         },
     }
     try:
-        response_disk = legacy_v2_horizon_response_disk(
+        response_disk = normalised_horizon_chart_response_disk(
             horizon_frequency=frequency,
             determinant_derivative=derivative,
+            determinant_normalisation=HORIZON_DETERMINANT_NORMALISATION,
         )
     except ZeroContainingDiskError as error:
         evidence["zero_containing_disk"] = error.disk_name
@@ -10881,9 +10884,10 @@ def run_promoted_horizon_component(
         "zero_containing_disk": None,
     }
     try:
-        response_disk = legacy_v2_horizon_response_disk(
+        response_disk = normalised_horizon_chart_response_disk(
             horizon_frequency=horizon_frequency_disk,
             determinant_derivative=derivative_disk,
+            determinant_normalisation=HORIZON_DETERMINANT_NORMALISATION,
         )
     except ZeroContainingDiskError as error:
         evidence["zero_containing_disk"] = error.disk_name

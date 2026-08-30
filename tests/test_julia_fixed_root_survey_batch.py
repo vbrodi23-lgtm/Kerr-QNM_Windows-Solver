@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -57,19 +58,73 @@ def _job():
     )
 
 
-def _conditioning(request) -> dict[str, object]:
+def _conditioning(request, sample=None) -> dict[str, object]:
     policy = request["policy"]
     projection = request["fixed_root_reliability_projection"]
     recovery = request["fixed_root_endpoint_recovery_policy"]
-    receipts = []
-    for branch, schedule_name in (
-        ("horizon-ingoing", "horizon_geometry_schedule"),
-        ("infinity-outgoing", "infinity_geometry_schedule"),
-    ):
-        geometry = recovery[schedule_name][0]
-        order = recovery["endpoint_order_schedule"][0]
-        attempt = {
-            "endpoint_branch": branch,
+    required_digits = "16.698970004336018804786261105275506973231810118538"
+    order = recovery["endpoint_order_schedule"][0]
+    horizon_geometry = recovery["horizon_geometry_schedule"][0]
+    spin = float(request["spin"])
+    rplus = 1.0 + math.sqrt(1.0 - spin * spin)
+    horizon_radius = rplus + 0.01
+    horizon_attempt = {
+            "rho": horizon_geometry,
+            "radius": {"real": format(horizon_radius, ".17g"), "imaginary": "0"},
+            "horizon_distance": "0.01",
+            "expansion_variable_magnitude": "0.01",
+            "exterior": True,
+            "on_real_axis": True,
+            "approaches_horizon": True,
+            "within_maximum_distance": True,
+            "attempted_endpoint_order": order,
+            "best_prefix_order": order,
+            "last_term_ratio": "1e-20",
+            "predicted_reliable_digits": "35",
+            "required_reliable_digits": required_digits,
+            "adequate": True,
+            "maximum_truncation_digits_lost": "0",
+            "maximum_recurrence_digits_lost": "1",
+            "maximum_series_evaluation_digits_lost": "1",
+            "candidate_limitation": "adequate/v1",
+    }
+    receipts = [{
+        "schema": "windows-solver.exterior-endpoint-recovery-receipt/2",
+        "endpoint_branch": "horizon-ingoing",
+        "contour_identity": "real-inner-tortoise-contour/v1",
+        "recovery_policy_identity": recovery["identity"],
+        "recovery_policy_sha256": recovery["policy_sha256"],
+        "match_radius": (
+            policy["readout_radius"]
+            if sample is None or sample["sample_role"] in
+            BINARY64_FIXED_ROOT_SAMPLE_ROLES[:5]
+            else sample["support"]["lower"]
+        ),
+        "rstar_match": "0",
+        "rho_floor": recovery["horizon_endpoint_rho_floor"],
+        "rho_schedule": recovery["horizon_geometry_schedule"],
+        "coordinate_identity": {
+            "passed": True,
+            "sample_count": 9,
+            "maximum_absolute_residual": "0",
+            "maximum_relative_residual": "0",
+            "absolute_tolerance": "1e-20",
+            "relative_tolerance": "1e-20",
+            "maximum_absolute_residual_over_tolerance": "0",
+            "maximum_relative_residual_over_tolerance": "0",
+        },
+        "attempts": [horizon_attempt],
+        "selected_rho": horizon_geometry,
+        "selected_endpoint_order": order,
+        "selected_best_prefix_order": order,
+        "candidate_limitation": "adequate/v1",
+        "aggregate_limitation": "adequate/v1",
+        "maximum_truncation_digits_lost": "0",
+        "factored_homogeneous_rhs_evaluations_before_decision": 0,
+    }]
+    geometry = recovery["infinity_geometry_schedule"][0]
+    infinity_attempt = {
+            "endpoint_branch": "infinity-outgoing",
             "attempted_endpoint_order": order,
             "attempted_geometry": geometry,
             "maximum_last_term_ratio": "1e-20",
@@ -77,35 +132,33 @@ def _conditioning(request) -> dict[str, object]:
             "maximum_recurrence_digits_lost": "1",
             "maximum_series_evaluation_digits_lost": "1",
             "predicted_reliable_digits": "35",
-            "required_reliable_digits": (
-                "16.698970004336018804786261105275506973231810118538"
-            ),
+            "required_reliable_digits": required_digits,
             "candidate_limitation": "adequate/v1",
             "selected_intervention": "ENTER_HOMOGENEOUS_ODE",
             "result": "ADEQUATE",
-        }
-        receipts.append({
+    }
+    receipts.append({
             "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
-            "endpoint_branch": branch,
+            "endpoint_branch": "infinity-outgoing",
             "recovery_policy_identity": recovery["identity"],
             "recovery_policy_sha256": recovery["policy_sha256"],
             "base_endpoint_order": recovery["base_endpoint_order"],
             "generated_maximum_order": recovery["generated_maximum_order"],
             "attempted_endpoint_orders": [order],
             "terminal_endpoint_order": order,
-            "candidate_geometry_schedule": recovery[schedule_name],
+            "candidate_geometry_schedule": recovery["infinity_geometry_schedule"],
             "terminal_geometry": geometry,
             "maximum_last_term_ratio": "1e-20",
             "maximum_truncation_digits_lost": "0",
             "maximum_recurrence_digits_lost": "1",
             "maximum_series_evaluation_digits_lost": "1",
             "predicted_reliable_digits": "35",
-            "required_reliable_digits": attempt["required_reliable_digits"],
+            "required_reliable_digits": required_digits,
             "candidate_limitation": "adequate/v1",
             "aggregate_limitation": "adequate/v1",
             "factored_homogeneous_rhs_evaluations": 0,
-            "attempts": [attempt],
-        })
+            "attempts": [infinity_attempt],
+    })
     return {
         "schema": "windows-solver.fixed-root-survey-conditioning/3",
         "fixed_root_reliability_target_abs": projection[
@@ -201,7 +254,7 @@ class _BatchAdapter:
                         "real": str(index + 1),
                         "imaginary": str(-(index + 1)),
                     },
-                    "numerical_conditioning": _conditioning(request),
+                    "numerical_conditioning": _conditioning(request, sample),
                     "determinant_error_evidence": None,
                 }
                 for index, sample in enumerate(request["samples"])
@@ -234,6 +287,210 @@ def _backend(
 
 
 class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
+    def test_v2_real_inner_endpoint_policy_is_exact_and_plan_invariant(self):
+        job = _job()
+        backend = _backend(_BatchAdapter())
+        requests = [
+            backend.preview_fixed_root_survey_request(
+                job,
+                fixed_root=job.root.omega,
+                root_seal_sha256="0" * 64,
+                branch_identity=job.root.branch_id,
+                plan=plan,
+            )
+            for plan in (
+                FixedRootSurveyPlan.CANONICAL_BACKGROUND_FIVE,
+                FixedRootSurveyPlan.MECHANISM_COMPONENT_FOUR,
+            )
+        ]
+        background, mechanism = requests
+        policy = background["fixed_root_endpoint_recovery_policy"]
+        self.assertEqual(
+            policy["identity"],
+            "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2",
+        )
+        self.assertEqual(
+            policy["horizon_geometry_rule"],
+            "bounded-real-inner-tortoise-depth/v1",
+        )
+        self.assertEqual(
+            policy["horizon_geometry_schedule"],
+            [
+                "-10", "-25", "-50", "-75", "-100", "-150", "-225",
+                "-337.5", "-400",
+            ],
+        )
+        self.assertTrue(
+            {"-5000", "-10000", "-20000"}.isdisjoint(
+                policy["horizon_geometry_schedule"]
+            )
+        )
+        self.assertEqual(policy["horizon_rho_inner_min"], "-400")
+        self.assertEqual(policy["horizon_endpoint_rho_floor"], "-400")
+        self.assertEqual(policy["horizon_maximum_endpoint_distance"], "0.1")
+        self.assertEqual(policy["endpoint_order_schedule"], [28, 56, 112])
+        self.assertEqual(
+            policy["infinity_geometry_schedule"],
+            ["100", "250", "500", "1000", "2000", "5000", "10000", "20000"],
+        )
+        self.assertEqual(
+            mechanism["fixed_root_endpoint_recovery_policy"], policy
+        )
+        refined = _backend(_BatchAdapter(), refinement=1).preview_fixed_root_survey_request(
+            job,
+            fixed_root=job.root.omega,
+            root_seal_sha256="0" * 64,
+            branch_identity=job.root.branch_id,
+            plan=FixedRootSurveyPlan.MECHANISM_COMPONENT_FOUR,
+        )
+        self.assertEqual(
+            refined["fixed_root_endpoint_recovery_policy"][
+                "endpoint_order_schedule"
+            ],
+            [28, 56, 112],
+        )
+        self.assertEqual(refined["policy"]["endpoint_series_order"], 28)
+
+        legacy = deepcopy(background)
+        legacy_policy = legacy["fixed_root_endpoint_recovery_policy"]
+        legacy_policy["identity"] = (
+            "cause-aware-fixed-root-exterior-endpoint-recovery/v1"
+        )
+        legacy_policy["horizon_geometry_rule"] = (
+            "bounded-negative-rho-depth/v1"
+        )
+        legacy_policy["horizon_geometry_schedule"] = [
+            "-5000", "-10000", "-20000"
+        ]
+        for field in (
+            "horizon_rho_inner_min",
+            "horizon_endpoint_rho_floor",
+            "horizon_maximum_endpoint_distance",
+        ):
+            legacy_policy.pop(field)
+        binding = {
+            key: value for key, value in legacy_policy.items()
+            if key != "policy_sha256"
+        }
+        legacy_policy["policy_sha256"] = hashlib.sha256(
+            canonical_json_bytes(binding)
+        ).hexdigest()
+        self.assertNotEqual(policy["policy_sha256"], legacy_policy["policy_sha256"])
+        self.assertNotEqual(
+            hashlib.sha256(canonical_json_bytes(background)).hexdigest(),
+            hashlib.sha256(canonical_json_bytes(legacy)).hexdigest(),
+        )
+
+    def test_real_inner_horizon_receipt_rejects_structural_and_causal_forgery(self):
+        job = _job()
+        request = _backend(_BatchAdapter()).preview_fixed_root_survey_request(
+            job,
+            fixed_root=job.root.omega,
+            root_seal_sha256="0" * 64,
+            branch_identity=job.root.branch_id,
+            plan=FixedRootSurveyPlan.CANONICAL_BACKGROUND_FIVE,
+        )
+        policy = request["fixed_root_endpoint_recovery_policy"]
+        baseline = _conditioning(request)["endpoint_receipts"]
+        _validated_exterior_endpoint_recovery_evidence(
+            baseline,
+            policy,
+            expected_aggregate="adequate/v1",
+            spin=request["spin"],
+            expected_horizon_match_radius=request["policy"]["readout_radius"],
+        )
+
+        def forged(mutator):
+            evidence = deepcopy(baseline)
+            mutator(evidence[0])
+            return evidence
+
+        mutations = {
+            "unknown contour": lambda receipt: receipt.__setitem__(
+                "contour_identity", "joined-complex-contour/v1"
+            ),
+            "v1 policy": lambda receipt: receipt.__setitem__(
+                "recovery_policy_identity",
+                "cause-aware-fixed-root-exterior-endpoint-recovery/v1",
+            ),
+            "wrong policy digest": lambda receipt: receipt.__setitem__(
+                "recovery_policy_sha256", "f" * 64
+            ),
+            "missing coordinate evidence": lambda receipt: receipt.pop(
+                "coordinate_identity"
+            ),
+            "failed coordinate identity": lambda receipt: receipt[
+                "coordinate_identity"
+            ].__setitem__("passed", False),
+            "rho outside schedule": lambda receipt: receipt["attempts"][0].__setitem__(
+                "rho", "-11"
+            ),
+            "nonnegative rho": lambda receipt: receipt["attempts"][0].__setitem__(
+                "rho", "10"
+            ),
+            "non-real geometry": lambda receipt: receipt["attempts"][0][
+                "radius"
+            ].__setitem__("imaginary", "0.01"),
+            "non-exterior geometry": lambda receipt: receipt["attempts"][0].update({
+                "radius": {"real": "1", "imaginary": "0"},
+                "exterior": False,
+            }),
+            "selected inadequate candidate": lambda receipt: receipt[
+                "attempts"
+            ][0].__setitem__("predicted_reliable_digits", "1"),
+            "selected higher order": lambda receipt: receipt.__setitem__(
+                "selected_endpoint_order", 56
+            ),
+            "nonzero predecision RHS": lambda receipt: receipt.__setitem__(
+                "factored_homogeneous_rhs_evaluations_before_decision", 1
+            ),
+            "legacy geometry": lambda receipt: receipt.__setitem__(
+                "rho_schedule", ["-5000", "-10000", "-20000"]
+            ),
+            "wrong match radius": lambda receipt: receipt.__setitem__(
+                "match_radius", "99"
+            ),
+        }
+        for label, mutator in mutations.items():
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                _validated_exterior_endpoint_recovery_evidence(
+                    forged(mutator),
+                    policy,
+                    expected_aggregate="adequate/v1",
+                    spin=request["spin"],
+                    expected_horizon_match_radius=request["policy"][
+                        "readout_radius"
+                    ],
+                )
+
+        spin = float(request["spin"])
+        rplus = 1.0 + math.sqrt(1.0 - spin * spin)
+
+        def inspect_beyond_first_adequate(receipt):
+            deeper = deepcopy(receipt["attempts"][0])
+            deeper.update({
+                "rho": "-25",
+                "radius": {
+                    "real": format(rplus + 0.005, ".17g"),
+                    "imaginary": "0",
+                },
+                "horizon_distance": "0.005",
+                "expansion_variable_magnitude": "0.005",
+            })
+            receipt["attempts"].append(deeper)
+            receipt["selected_rho"] = "-25"
+
+        with self.assertRaisesRegex(ValueError, "first adequacy"):
+            _validated_exterior_endpoint_recovery_evidence(
+                forged(inspect_beyond_first_adequate),
+                policy,
+                expected_aggregate="adequate/v1",
+                spin=request["spin"],
+                expected_horizon_match_radius=request["policy"][
+                    "readout_radius"
+                ],
+            )
+
     def test_mixed_arithmetic_and_order_blockers_cannot_claim_arithmetic(self):
         job = _job()
         request = _backend(_BatchAdapter()).preview_fixed_root_survey_request(
@@ -247,44 +504,27 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
         required = "16.698970004336018804786261105275506973231810118538"
         horizon_geometry = policy["horizon_geometry_schedule"][0]
         base_order = policy["endpoint_order_schedule"][0]
-        arithmetic_attempt = {
-            "endpoint_branch": "horizon-ingoing",
-            "attempted_endpoint_order": base_order,
-            "attempted_geometry": horizon_geometry,
-            "maximum_last_term_ratio": "0.1",
+        horizon = deepcopy(_conditioning(request)["endpoint_receipts"][0])
+        arithmetic_attempt = dict(horizon["attempts"][0])
+        arithmetic_attempt.update({
+            "last_term_ratio": "0.1",
             "maximum_truncation_digits_lost": "2",
             "maximum_recurrence_digits_lost": "1",
             "maximum_series_evaluation_digits_lost": "1",
             "predicted_reliable_digits": "10",
             "required_reliable_digits": required,
+            "adequate": False,
             "candidate_limitation": ENDPOINT_ARITHMETIC_LIMITED,
-            "selected_intervention": (
-                "PROMOTE_ARITHMETIC_TIER_IF_AGGREGATE_ALLOWS"
-            ),
-            "result": "ARITHMETIC_INADEQUATE",
-        }
-        horizon = {
-            "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
-            "endpoint_branch": "horizon-ingoing",
-            "recovery_policy_identity": policy["identity"],
-            "recovery_policy_sha256": policy["policy_sha256"],
-            "base_endpoint_order": policy["base_endpoint_order"],
-            "generated_maximum_order": policy["generated_maximum_order"],
-            "attempted_endpoint_orders": [base_order],
-            "terminal_endpoint_order": base_order,
-            "candidate_geometry_schedule": policy["horizon_geometry_schedule"],
-            "terminal_geometry": horizon_geometry,
-            "maximum_last_term_ratio": "0.1",
-            "maximum_truncation_digits_lost": "2",
-            "maximum_recurrence_digits_lost": "1",
-            "maximum_series_evaluation_digits_lost": "1",
-            "predicted_reliable_digits": "10",
-            "required_reliable_digits": required,
+        })
+        horizon.update({
+            "attempts": [arithmetic_attempt],
+            "selected_rho": None,
+            "selected_endpoint_order": None,
+            "selected_best_prefix_order": None,
             "candidate_limitation": ENDPOINT_ARITHMETIC_LIMITED,
             "aggregate_limitation": ENDPOINT_ARITHMETIC_LIMITED,
-            "factored_homogeneous_rhs_evaluations": 0,
-            "attempts": [arithmetic_attempt],
-        }
+            "maximum_truncation_digits_lost": "2",
+        })
         infinity_attempts = []
         for index, order in enumerate(policy["endpoint_order_schedule"]):
             terminal = index == len(policy["endpoint_order_schedule"]) - 1

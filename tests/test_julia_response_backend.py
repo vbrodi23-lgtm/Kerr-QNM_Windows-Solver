@@ -2662,9 +2662,17 @@ class JuliaResponseBackendTests(unittest.TestCase):
             "solve_xup_scattering_coefficients",
         ):
             self.assertNotIn(f"function {retired}(", worker)
-        self.assertIn("CF.prepare_factored_horizon_ingoing(", worker)
+        # The exterior determinant's horizon-ingoing leg was migrated off the
+        # joined-contour pipeline onto the same verified real-inner contour
+        # already used by the standalone horizon-admittance mechanism, so
+        # these two joined-contour calls must not reappear for that leg.
+        self.assertNotIn("CF.prepare_factored_horizon_ingoing(", worker)
+        self.assertNotIn("CF.solve_factored_xin_to_match(", worker)
+        self.assertIn("CF.prepare_real_inner_horizon_endpoint(", worker)
+        self.assertIn("CF.solve_factored_horizon_branch_to_match(", worker)
+        # The infinity-outgoing leg is unaffected and must remain on the
+        # joined-contour pipeline unchanged.
         self.assertIn("CF.prepare_factored_infinity_outgoing(", worker)
-        self.assertIn("CF.solve_factored_xin_to_match(", worker)
         self.assertIn("CF.solve_factored_xup_to_match(", worker)
 
     def test_promoted_branch_authentication_uses_a_mode_specific_enclosure(self):
@@ -3711,6 +3719,87 @@ class JuliaResponseBackendTests(unittest.TestCase):
             ):
                 JuliaResponseAdapter.from_runtime_receipt(runtime_root=runtime)
 
+    def test_runtime_adapter_rejects_a_worker_ready_but_missing_resource(self):
+        """A hash-valid worker must not be launchable while a sibling
+        authority resource is missing or corrupted.
+
+        Bootstrap may need to repair only a resource while an already
+        hash-valid m02_worker.jl is left untouched (its bytes never
+        changed, so it is never republished). A reader that trusted only
+        the worker's hash could therefore launch mid-repair and fail on
+        the worker's first authority read. from_runtime_receipt() must
+        authenticate every resource the worker depends on, not just the
+        worker itself, before returning a usable adapter.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / ".runtime"
+            project = runtime / "m02-julia-project"
+            depot = runtime / "julia-depot"
+            project.mkdir(parents=True)
+            depot.mkdir()
+            julia = runtime / "julia.exe"
+            manifest = project / "Manifest.toml"
+            project_file = project / "Project.toml"
+            worker = root / "m02_worker.jl"
+            authority = root / "fixed_root_reliability_projection_authority_v1.json"
+            calibration = root / "promoted_control_empirical_calibration_v1.json"
+            for path, data in (
+                (julia, b"julia"),
+                (manifest, b"manifest"),
+                (project_file, b"project"),
+                (worker, b"worker"),
+                (authority, b"authority"),
+                (calibration, b"calibration"),
+            ):
+                path.write_bytes(data)
+            receipt = {
+                "policy_sha256": "f" * 64,
+                "julia_runtime": {
+                    "requested": True,
+                    "version": "1.10.11",
+                    "executable": str(julia),
+                    "executable_sha256": hashlib.sha256(julia.read_bytes()).hexdigest(),
+                    "sources": [],
+                    "depot": str(depot),
+                    "project": str(project),
+                    "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                    "worker": str(worker),
+                    "worker_sha256": hashlib.sha256(worker.read_bytes()).hexdigest(),
+                    "worker_contract": {
+                        "fixed_root_authority_sha256": hashlib.sha256(
+                            authority.read_bytes()
+                        ).hexdigest(),
+                        "promoted_calibration_sha256": hashlib.sha256(
+                            calibration.read_bytes()
+                        ).hexdigest(),
+                    },
+                },
+            }
+            (runtime / "python-runtime.json").write_bytes(canonical_json_bytes(receipt))
+
+            # Baseline: both resources present and hash-matching succeeds.
+            JuliaResponseAdapter.from_runtime_receipt(runtime_root=runtime)
+
+            # Missing resource: worker hash is still valid, but its
+            # sibling authority file was removed mid-repair.
+            calibration.unlink()
+            with self.assertRaisesRegex(
+                JuliaResponseBackendError,
+                "calibration.*resource is absent",
+            ):
+                JuliaResponseAdapter.from_runtime_receipt(runtime_root=runtime)
+
+            # Corrupted resource: present, but its bytes no longer match
+            # the contract hash recorded in the receipt.
+            calibration.write_bytes(b"calibration")
+            authority.write_bytes(b"tampered")
+            with self.assertRaisesRegex(
+                JuliaResponseBackendError,
+                "authority.*resource digest does not match",
+            ):
+                JuliaResponseAdapter.from_runtime_receipt(runtime_root=runtime)
+
     def test_subprocess_response_is_bound_to_exact_request_digest(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -4299,6 +4388,14 @@ class JuliaResponseBackendTests(unittest.TestCase):
                 (project / "Project.toml", b"project"),
                 (project / "Manifest.toml", b"manifest"),
                 (worker, b"persistent worker"),
+                (
+                    source_root / "fixed_root_reliability_projection_authority_v1.json",
+                    b"authority",
+                ),
+                (
+                    source_root / "promoted_control_empirical_calibration_v1.json",
+                    b"calibration",
+                ),
             ):
                 path.write_bytes(data)
             receipt = {

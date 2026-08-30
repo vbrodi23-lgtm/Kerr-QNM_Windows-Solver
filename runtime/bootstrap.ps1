@@ -361,6 +361,36 @@ function Get-SourceReceipt([string]$Id) {
     return $matches[0]
 }
 
+function Get-M02WorkerResourceReceipts {
+    $receipts = @()
+    $dataRoot = [IO.Path]::GetFullPath((Join-Path $PackageRoot "src\windows_solver\data")).TrimEnd([char[]]@(92, 47))
+    foreach ($Resource in $Policy.m02_worker_resources) {
+        $SourcePath = Join-Path $PackageRoot $Resource.path
+        if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+            throw "Required M02 worker resource is absent: $SourcePath"
+        }
+        $resolvedSourcePath = [IO.Path]::GetFullPath($SourcePath)
+        if (-not $resolvedSourcePath.StartsWith($dataRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "M02 worker resource is outside the packaged data root: $resolvedSourcePath"
+        }
+        $receipts += [ordered]@{
+            id = [string]$Resource.id
+            checkout_path = $resolvedSourcePath
+            file_name = Split-Path -Leaf $resolvedSourcePath
+            sha256 = Get-Sha256 $resolvedSourcePath
+        }
+    }
+    return @($receipts)
+}
+
+function Get-M02WorkerResourceReceipt([string]$Id) {
+    $matches = @($M02WorkerResourceReceipts | Where-Object { $_.id -eq $Id })
+    if ($matches.Count -ne 1) {
+        throw "M02 worker resource policy must contain exactly one resource with ID ${Id}."
+    }
+    return $matches[0]
+}
+
 function Get-TreeSha256([string]$Root) {
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
         throw "Required source directory is absent: $Root"
@@ -590,6 +620,28 @@ function Install-PersistentSourceFile($Source, [string]$Destination, [string]$La
     }
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Destination) | Out-Null
     Copy-Item -LiteralPath $Source.checkout_path -Destination $Destination -Force
+    if (-not (Test-Path -LiteralPath $Destination -PathType Leaf) `
+        -or (Get-Sha256 $Destination) -ne $Source.sha256) {
+        throw "Persistent $Label copy failed contract validation: $Destination"
+    }
+}
+
+function Install-PersistentContractResource($Source, [string]$Destination, [string]$Label) {
+    # Unlike Install-PersistentSourceFile, this never removes the parent
+    # directory: it is used for members of a shared, immutable,
+    # content-addressed directory (the M02 worker script and its authority
+    # resources), where a sibling file may be actively read by a running
+    # worker and must not disappear while this member is repaired.
+    $ParentDirectory = Split-Path -Parent $Destination
+    New-Item -ItemType Directory -Force -Path $ParentDirectory | Out-Null
+    $TempDestination = Join-Path $ParentDirectory `
+        ".$(Split-Path -Leaf $Destination).$([Guid]::NewGuid().ToString('N')).tmp"
+    Copy-Item -LiteralPath $Source.checkout_path -Destination $TempDestination -Force
+    if ((Get-Sha256 $TempDestination) -ne $Source.sha256) {
+        Remove-Item -LiteralPath $TempDestination -Force
+        throw "$Label copy did not match source hash: $($Source.checkout_path)"
+    }
+    Move-Item -LiteralPath $TempDestination -Destination $Destination -Force
     if (-not (Test-Path -LiteralPath $Destination -PathType Leaf) `
         -or (Get-Sha256 $Destination) -ne $Source.sha256) {
         throw "Persistent $Label copy failed contract validation: $Destination"
@@ -1221,9 +1273,14 @@ if ($WithM02) {
     $M02DependencySha256 = Get-ObjectSha256 $M02DependencyContract
     $M02DependencyId = "m02-deps-" + $M02DependencySha256.Substring(0, 24)
 
+    $M02WorkerResourceReceipts = Get-M02WorkerResourceReceipts
+    $FixedRootAuthorityResource = Get-M02WorkerResourceReceipt "fixed-root-reliability-projection-authority"
+    $PromotedCalibrationResource = Get-M02WorkerResourceReceipt "promoted-control-empirical-calibration"
     $M02WorkerContract = [ordered]@{
         schema_version = 1
         worker_sha256 = $WorkerSource.sha256
+        fixed_root_authority_sha256 = $FixedRootAuthorityResource.sha256
+        promoted_calibration_sha256 = $PromotedCalibrationResource.sha256
     }
     $M02WorkerSha256 = Get-ObjectSha256 $M02WorkerContract
     $M02WorkerId = "m02-worker-" + $M02WorkerSha256.Substring(0, 24)
@@ -1310,6 +1367,25 @@ if ($WithM02) {
             }
         }
     }
+    # Authority resources must be staged and validated before the worker
+    # script is published: from_runtime_receipt() and similar readiness
+    # checks on the Python side validate the worker's hash but not these
+    # JSON siblings, so a concurrent campaign reading an existing receipt
+    # that already names this $M02WorkerId could observe a hash-valid
+    # worker and launch it while a resource is still missing. Publishing
+    # m02_worker.jl last closes that window.
+    $M02WorkerRoot = Join-Path (Join-Path $RuntimeRoot "m02-workers") $M02WorkerId
+    foreach ($Resource in $M02WorkerResourceReceipts) {
+        $Destination = Join-Path $M02WorkerRoot $Resource.file_name
+        if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+            if ((Get-Sha256 $Destination) -ne $Resource.sha256) {
+                throw "Immutable M02 worker resource is corrupted: $Destination"
+            }
+            continue
+        }
+        Install-PersistentContractResource $Resource $Destination "M02 worker authority resource"
+    }
+
     if (-not (Test-PersistentSourceFile $WorkerSource $PersistentWorkerPath)) {
         if (($null -ne $PriorWorkerId -and $PriorWorkerId -ne $M02WorkerId) `
             -or ($null -ne $PriorWorkerSha256 -and $PriorWorkerSha256 -ne $WorkerSource.sha256)) {
@@ -1318,7 +1394,7 @@ if ($WithM02) {
         else {
             Write-Step "Installing M02 worker source contract $M02WorkerId"
         }
-        Install-PersistentSourceFile $WorkerSource $PersistentWorkerPath "M02 worker source"
+        Install-PersistentContractResource $WorkerSource $PersistentWorkerPath "M02 worker source"
     }
     if (-not (Test-PersistentSourceFile $ProducerSource $PersistentProducerPath)) {
         Write-Step "Installing GSN producer source contract $M02GsnCacheId"

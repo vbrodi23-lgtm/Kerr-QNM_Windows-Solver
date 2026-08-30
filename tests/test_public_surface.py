@@ -398,6 +398,339 @@ class PublicSurfaceTests(unittest.TestCase):
         )
         self.assertNotIn("Expand-Archive", julia_install)
 
+    def test_m02_bootstrap_deploys_worker_data_json_files(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
+            encoding="utf-8"
+        )
+        data_root = root / "src" / "windows_solver" / "data"
+
+        self.assertTrue(
+            (data_root / "fixed_root_reliability_projection_authority_v1.json").is_file(),
+            "fixed_root_reliability_projection_authority_v1.json must exist in package data",
+        )
+        self.assertTrue(
+            (data_root / "promoted_control_empirical_calibration_v1.json").is_file(),
+            "promoted_control_empirical_calibration_v1.json must exist in package data",
+        )
+
+        # The two authority resources must be declared in the runtime policy
+        # (outside the Julia scientific_sources root, since they live in
+        # src/windows_solver/data rather than .../data/julia), not hardcoded
+        # as bare filenames scattered through bootstrap.ps1.
+        policy = json.loads(
+            (root / "runtime" / "runtime_policy.json").read_text(encoding="utf-8")
+        )
+        worker_resources = {
+            resource["id"]: resource["path"]
+            for resource in policy["m02_worker_resources"]
+        }
+        self.assertEqual(
+            worker_resources,
+            {
+                "fixed-root-reliability-projection-authority": (
+                    "src/windows_solver/data/"
+                    "fixed_root_reliability_projection_authority_v1.json"
+                ),
+                "promoted-control-empirical-calibration": (
+                    "src/windows_solver/data/"
+                    "promoted_control_empirical_calibration_v1.json"
+                ),
+            },
+        )
+
+        # The receipt-building helper must scope resources to the packaged
+        # data root and hash each one.
+        receipts_start = bootstrap.index("function Get-M02WorkerResourceReceipts")
+        receipts_end = bootstrap.index("\n}", receipts_start) + len("\n}")
+        receipts_block = bootstrap[receipts_start:receipts_end]
+        self.assertIn("Policy.m02_worker_resources", receipts_block)
+        self.assertIn("outside the packaged data root", receipts_block)
+        self.assertIn("Get-Sha256", receipts_block)
+
+        # Authority file hashes must be bound into the worker contract so that a
+        # content change (without a filename rename) selects a new $M02WorkerId
+        # and stages the resources at an immutable contract-specific path.
+        contract_start = bootstrap.index("    $M02WorkerContract = [ordered]@{")
+        contract_end = bootstrap.index("\n    $M02WorkerSha256", contract_start)
+        contract_block = bootstrap[contract_start:contract_end]
+        self.assertIn("fixed_root_authority_sha256", contract_block)
+        self.assertIn("promoted_calibration_sha256", contract_block)
+
+        # The bootstrap must deploy both resources into the contract-specific
+        # worker directory so the worker resolves them via @__DIR__/<filename>,
+        # via the same non-destructive, hash-verified atomic installer used to
+        # repair the worker script, and must fail closed rather than silently
+        # overwrite an already-installed resource whose bytes no longer match
+        # the contract.
+        deploy_start = bootstrap.index(
+            '    $M02WorkerRoot = Join-Path (Join-Path $RuntimeRoot "m02-workers") $M02WorkerId'
+        )
+        deploy_end = bootstrap.index("\n    $DependencyRejectionReason", deploy_start)
+        deploy_block = bootstrap[deploy_start:deploy_end]
+
+        self.assertIn("foreach ($Resource in $M02WorkerResourceReceipts)", deploy_block)
+        self.assertIn("Immutable M02 worker resource is corrupted:", deploy_block)
+        self.assertIn("Install-PersistentContractResource", deploy_block)
+        # Resources must land inside the versioned worker dir, not the shared parent.
+        self.assertIn(r"$M02WorkerId", deploy_block)
+
+        # The authority resources must be staged and validated *before*
+        # m02_worker.jl is published: a readiness check that only validates
+        # the worker's hash (e.g. from_runtime_receipt() on the Python side)
+        # must never be able to observe a hash-valid worker while a resource
+        # is still missing.
+        resource_loop_index = deploy_block.index(
+            "foreach ($Resource in $M02WorkerResourceReceipts)"
+        )
+        worker_install_index = deploy_block.index(
+            "if (-not (Test-PersistentSourceFile $WorkerSource $PersistentWorkerPath))"
+        )
+        self.assertLess(
+            resource_loop_index,
+            worker_install_index,
+            "authority resources must be staged before m02_worker.jl is published",
+        )
+
+    def test_m02_worker_repair_does_not_delete_sibling_authority_resources(
+        self,
+    ) -> None:
+        """A worker-script repair must not wipe its shared contract directory.
+
+        m02_worker.jl and the two authority JSONs now live in the same
+        immutable $M02WorkerId directory. If the worker script alone is
+        missing or corrupted, repairing it must not delete that directory
+        (which would also delete the authority JSONs an active worker
+        process is concurrently reading via @__DIR__/<filename>), and must
+        not overwrite a resource whose bytes still match the contract.
+        """
+        root = Path(__file__).resolve().parents[1]
+        bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
+            encoding="utf-8"
+        )
+
+        installer_start = bootstrap.index(
+            "function Install-PersistentContractResource"
+        )
+        installer_end = bootstrap.index("\n}", installer_start) + len("\n}")
+        installer_block = bootstrap[installer_start:installer_end]
+        self.assertNotIn("Remove-ManagedDirectory", installer_block)
+        self.assertIn("Copy-Item", installer_block)
+        self.assertIn("Move-Item", installer_block)
+        self.assertIn("Get-Sha256", installer_block)
+        self.assertIn("did not match source hash", installer_block)
+
+        # The worker script install call site must use the non-destructive
+        # installer, not Install-PersistentSourceFile (which removes its
+        # destination's entire parent directory before recreating it).
+        worker_install_start = bootstrap.index(
+            "if (-not (Test-PersistentSourceFile $WorkerSource $PersistentWorkerPath))"
+        )
+        worker_install_end = bootstrap.index("\n    }", worker_install_start)
+        worker_install_block = bootstrap[worker_install_start:worker_install_end]
+        self.assertIn(
+            "Install-PersistentContractResource $WorkerSource $PersistentWorkerPath",
+            worker_install_block,
+        )
+        self.assertNotIn("Install-PersistentSourceFile ", worker_install_block)
+
+    def test_m02_worker_authority_files_resolve_via_dir_parent(self) -> None:
+        """Staged runtime: dirname(m02_worker.jl)/.. must contain both JSON authorities."""
+        root = Path(__file__).resolve().parents[1]
+        data_root = root / "src" / "windows_solver" / "data"
+        worker_resources = [
+            "fixed_root_reliability_projection_authority_v1.json",
+            "promoted_control_empirical_calibration_v1.json",
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            m02_worker_root = Path(tmp) / "m02-workers"
+            worker_dir = m02_worker_root / "m02-worker-aabbccdd1234"
+            worker_dir.mkdir(parents=True)
+            worker_path = worker_dir / "m02_worker.jl"
+            worker_path.write_bytes(b"")
+
+            # Simulate what bootstrap does: copy authority resources into the
+            # same contract-specific directory as the worker script, so the
+            # worker resolves them via @__DIR__/<filename> (not @__DIR__/..).
+            for resource_name in worker_resources:
+                shutil.copy2(
+                    data_root / resource_name,
+                    worker_dir / resource_name,
+                )
+
+            # @__DIR__ in the Julia worker resolves to worker_dir; each
+            # authority resource must therefore be present at that same level.
+            for resource_name in worker_resources:
+                self.assertTrue(
+                    (worker_path.parent / resource_name).is_file(),
+                    f"dirname(m02_worker.jl)/{resource_name} must exist after staging",
+                )
+
+    def test_m02_worker_authority_paths_support_dual_layout(self) -> None:
+        """Worker must resolve authority JSONs in both staged and source-tree layouts.
+
+        Staged runtime places the JSONs alongside m02_worker.jl (bootstrap
+        copies them into the same $M02WorkerId directory). CI, however, runs
+        m02_worker.jl directly from src/windows_solver/data/julia/, where the
+        JSONs live one directory up. The worker source must probe @__DIR__
+        first and only fall back to @__DIR__/.. when the same-directory file
+        is absent, so neither execution context regresses.
+        """
+        root = Path(__file__).resolve().parents[1]
+        worker_source = (
+            root / "src" / "windows_solver" / "data" / "julia" / "m02_worker.jl"
+        ).read_text(encoding="utf-8")
+
+        fixed_root_start = worker_source.index(
+            "const FIXED_ROOT_RELIABILITY_PROJECTION_AUTHORITY_PATH"
+        )
+        fixed_root_end = worker_source.index("\nend", fixed_root_start) + len("\nend")
+        fixed_root_block = worker_source[fixed_root_start:fixed_root_end]
+        self.assertIn("isfile(same_dir)", fixed_root_block)
+        self.assertIn('joinpath(@__DIR__, "fixed_root_reliability_projection_authority_v1.json")', fixed_root_block)
+        self.assertIn('joinpath(@__DIR__, "..", "fixed_root_reliability_projection_authority_v1.json")', fixed_root_block)
+
+        calibration_start = worker_source.index(
+            "const PROMOTED_CONTROL_CALIBRATION_RECEIPT_PATH"
+        )
+        calibration_end = worker_source.index("\nend", calibration_start) + len("\nend")
+        calibration_block = worker_source[calibration_start:calibration_end]
+        self.assertIn("isfile(same_dir)", calibration_block)
+        self.assertIn('joinpath(@__DIR__, "promoted_control_empirical_calibration_v1.json")', calibration_block)
+        self.assertIn('joinpath(@__DIR__, "..", "promoted_control_empirical_calibration_v1.json")', calibration_block)
+
+        # Structural check for the source-tree (CI) layout: the worker script
+        # lives in .../julia/, and the authority JSONs live one level up in
+        # .../data/, i.e. exactly where the @__DIR__/.. fallback looks.
+        worker_dir = root / "src" / "windows_solver" / "data" / "julia"
+        data_root = worker_dir.parent
+        for resource_name in (
+            "fixed_root_reliability_projection_authority_v1.json",
+            "promoted_control_empirical_calibration_v1.json",
+        ):
+            self.assertFalse((worker_dir / resource_name).is_file())
+            self.assertTrue((data_root / resource_name).is_file())
+
+    def test_exterior_determinant_uses_the_verified_real_inner_horizon_contour(
+        self,
+    ) -> None:
+        """The exterior horizon-ingoing endpoint must be seeded on the same
+        real-inner contour proven to approach r_plus, not on the joined,
+        frequency-aligned contour the library's own comments warn is not
+        guaranteed to approach the horizon for damped modes.
+
+        Regression guard for the defect where every exterior mechanism's
+        horizon-ingoing endpoint was prepared on
+        build_worker_contour_context()/CF.prepare_factored_horizon_ingoing()
+        -- the same joined-contour pipeline already migrated away from for
+        the standalone horizon-admittance mechanism -- causing the
+        asymptotic series to be evaluated on a trajectory that never
+        actually approached the horizon (last_term_ratio pinned near 1
+        regardless of series order or search depth).
+        """
+        root = Path(__file__).resolve().parents[1]
+        worker = (
+            root / "src" / "windows_solver" / "data" / "julia" / "m02_worker.jl"
+        ).read_text(encoding="utf-8")
+
+        # New orchestration helpers must exist and must not reintroduce the
+        # joined-contour horizon-ingoing pipeline.
+        for helper in (
+            "function reconstruct_real_inner_horizon_match_state",
+            "function assert_real_inner_exterior_preparations_ready",
+            "function recover_fixed_root_real_inner_horizon_endpoint",
+        ):
+            self.assertIn(helper, worker)
+
+        owner_start = worker.index(
+            "function recover_fixed_root_real_inner_horizon_endpoint"
+        )
+        owner_end = worker.index("\nfunction ", owner_start + 1)
+        owner_block = worker[owner_start:owner_end]
+        self.assertIn("build_worker_real_inner_horizon_contour", owner_block)
+        self.assertIn("CF.horizon_endpoint_geometry_candidates", owner_block)
+        self.assertIn("CF.horizon_endpoint_candidates", owner_block)
+        self.assertIn("CF.prepare_real_inner_horizon_endpoint", owner_block)
+        self.assertIn("real_inner_horizon_endpoint_receipt", owner_block)
+        self.assertNotIn("build_worker_contour_context", owner_block)
+        self.assertNotIn("CF.prepare_factored_horizon_ingoing", owner_block)
+
+        recover_start = worker.index(
+            "function recover_fixed_root_exterior_endpoints"
+        )
+        recover_end = worker.index(
+            "\nfunction evaluate_exterior_determinant", recover_start
+        )
+        recover_block = worker[recover_start:recover_end]
+        self.assertIn(
+            "recover_fixed_root_real_inner_horizon_endpoint", recover_block
+        )
+        self.assertNotIn("build_worker_contour_context", recover_block)
+        self.assertNotIn("CF.prepare_factored_horizon_ingoing", recover_block)
+
+        determinant_start = worker.index(
+            "function evaluate_exterior_determinant"
+        )
+        determinant_end = worker.index(
+            "\nfunction ", determinant_start + 1
+        )
+        determinant_block = worker[determinant_start:determinant_end]
+
+        # All three branches (fixed-root survey, certificate-required, and
+        # the default certification path) must build the horizon-ingoing
+        # endpoint on the real-inner contour, never the joined one.
+        self.assertEqual(
+            determinant_block.count("build_worker_real_inner_horizon_contour"),
+            2,
+            "exterior_certificate_required and the default branch must each "
+            "build the real-inner horizon contour",
+        )
+        self.assertNotIn(
+            'build_worker_contour_context(\n            T, request, spectral, lower, "Xin"',
+            determinant_block,
+        )
+        self.assertEqual(
+            determinant_block.count(
+                "prepare_real_inner_exterior_horizon_ingoing"
+            ),
+            2,
+        )
+        self.assertNotIn(
+            "CF.prepare_factored_horizon_ingoing", determinant_block
+        )
+
+        # The horizon leg must propagate and reconstruct through the
+        # real-inner pipeline, not the joined-contour one.
+        self.assertIn(
+            "CF.solve_factored_horizon_branch_to_match", determinant_block
+        )
+        self.assertNotIn(
+            "CF.solve_factored_xin_to_match(", determinant_block
+        )
+        self.assertIn(
+            "xin_match = reconstruct_real_inner_horizon_match_state",
+            determinant_block,
+        )
+        self.assertNotIn(
+            "xin_match = CF.reconstruct_factored_match_state",
+            determinant_block,
+        )
+        # The infinity leg is unaffected by this defect and must still use
+        # the joined-contour pipeline unchanged.
+        self.assertIn("CF.solve_factored_xup_to_match", determinant_block)
+        self.assertIn(
+            "xup_match = CF.reconstruct_factored_match_state",
+            determinant_block,
+        )
+        self.assertIn(
+            "assert_real_inner_exterior_preparations_ready", determinant_block
+        )
+        self.assertNotIn(
+            "CF.assert_factored_exterior_preparations_ready",
+            determinant_block,
+        )
+
     def test_m02_bootstrap_configures_utf8_console_before_julia(self) -> None:
         root = Path(__file__).resolve().parents[1]
         bootstrap = (root / "runtime" / "bootstrap.ps1").read_text(
@@ -1652,16 +1985,22 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "insufficient-arithmetic-precision/v1",
             "insufficient-geometric-depth/v1",
             "cause-aware-fixed-root-exterior-endpoint-recovery/v1",
+            "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2",
             "bounded-doubling-prefix/v1",
             "bounded-negative-rho-depth/v1",
+            "bounded-real-inner-tortoise-depth/v1",
             "bounded-positive-rho-depth/v1",
             "windows-solver.fixed-root-v2-forensic-history/1",
+            "windows-solver.fixed-root-endpoint-forensic-history/2",
+            "windows-solver.exterior-endpoint-recovery-receipt/2",
             "forensic_fixed_root_v2_history",
             "_contains_fixed_root_v2_artifact",
             "_migrate_fixed_root_v2_forensic_history",
             "promoted-control-empirical-calibration/v1",
             "fixed-root-reliability-projection-authority/v1",
             "data/fixed_root_reliability_projection_authority_v1.json",
+            "fixed_root_reliability_projection_authority_v1.json",
+            "promoted_control_empirical_calibration_v1.json",
             "minus-log10-target-plus-required-digit-guard/v1",
             "julia-control-diagnostics/v1",
             "supervisor-timeout/v1",
@@ -1725,7 +2064,6 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             # the identifier tokens keeps the guard tight without
             # renaming symbols that document the forensic boundary.
             "_stale_horizon_v2_receipt",
-            "legacy_v2_horizon_response_disk",
             "forensic_v2_scientific_computation_identity_sha256",
             "_forensic_v2_root_seed",
             "_V2_HORIZON_OPERATION",

@@ -114,6 +114,20 @@ def _is_sha256(value: object) -> bool:
     return isinstance(value, str) and _HEX_64.fullmatch(value) is not None
 
 
+def migrate_fixed_root_endpoint_policy_checkpoint(
+    checkpoint: Mapping[str, object],
+) -> dict[str, object]:
+    """Apply the schema-11 forensic endpoint migration with zero numerics.
+
+    The existing schema validator owns the single migration implementation.
+    This recovery-facing adapter makes that boundary explicit: it preserves
+    the authenticated legacy stage as ``FORENSIC_ONLY`` and returns the pending
+    BF40 queue state without invoking roots, determinants, ODEs, or samples.
+    """
+
+    return validate_schema11_checkpoint(checkpoint)
+
+
 def _checkpoint_scientific_sha256(checkpoint: Mapping[str, object]) -> str:
     scientific = copy.deepcopy(dict(checkpoint))
     scientific["report_status_receipt"] = None
@@ -236,7 +250,7 @@ def _checkpoint_bound_promoted_recovery_material(
 ) -> tuple[dict[str, object], dict[str, str], dict[str, str]]:
     """Authenticate the historical queue as routing evidence, not calculations."""
 
-    value = validate_schema11_checkpoint(checkpoint)
+    value = migrate_fixed_root_endpoint_policy_checkpoint(checkpoint)
     plan_leaf_ids = tuple(leaf.leaf_id for leaf in plan.leaves)
     if len(plan_leaf_ids) != 212 or selected_leaf_ids != plan_leaf_ids:
         raise ValueError(
@@ -1044,7 +1058,7 @@ def recover_campaign(
             )
             continue
         try:
-            checkpoint = validate_schema11_checkpoint(value)
+            checkpoint = migrate_fixed_root_endpoint_policy_checkpoint(value)
         except ValueError as error:
             raise ValueError(
                 f"explicit source checkpoint is corrupt: {path}: {error}"
@@ -1357,10 +1371,10 @@ def recover_campaign(
         },
     }
     candidate_checkpoint["recovery_receipts"].append(recovery_entry)
-    validate_schema11_checkpoint(candidate_checkpoint)
+    migrate_fixed_root_endpoint_policy_checkpoint(candidate_checkpoint)
     if checkpoint_finalizer is not None:
         scientific_sha256 = _checkpoint_scientific_sha256(candidate_checkpoint)
-        candidate_checkpoint = validate_schema11_checkpoint(
+        candidate_checkpoint = migrate_fixed_root_endpoint_policy_checkpoint(
             checkpoint_finalizer(candidate_checkpoint, output)
         )
         if _checkpoint_scientific_sha256(candidate_checkpoint) != scientific_sha256:
@@ -1438,7 +1452,7 @@ def validate_recovery_checkpoint(
         raise ValueError(f"recovery checkpoint is corrupt: {path}: {error}") from error
     if not isinstance(value, Mapping):
         raise ValueError("recovery checkpoint must be an object")
-    checkpoint = validate_schema11_checkpoint(value)
+    checkpoint = migrate_fixed_root_endpoint_policy_checkpoint(value)
     if (
         checkpoint["campaign_id"] != selection.campaign_id
         or checkpoint["selection_id"] != selection.selection_id
@@ -1498,6 +1512,7 @@ __all__ = [
     "RecoverySelection",
     "RecoverySummary",
     "checkpoint_bound_promoted_recovery_selection",
+    "migrate_fixed_root_endpoint_policy_checkpoint",
     "recover_campaign",
     "validate_checkpoint_bound_promoted_recovery_selection",
     "validate_recovery_checkpoint",

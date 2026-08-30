@@ -33,6 +33,12 @@ def _runtime_receipt(root: Path) -> Path:
     depot.mkdir(exist_ok=True)
     julia.write_text("julia", encoding="ascii")
     worker.write_text("worker", encoding="ascii")
+    (root / "fixed_root_reliability_projection_authority_v1.json").write_text(
+        "authority", encoding="ascii"
+    )
+    (root / "promoted_control_empirical_calibration_v1.json").write_text(
+        "calibration", encoding="ascii"
+    )
     (project / "Project.toml").write_text("project", encoding="ascii")
     (project / "Manifest.toml").write_text("manifest", encoding="ascii")
     runtime = root / "runtime"
