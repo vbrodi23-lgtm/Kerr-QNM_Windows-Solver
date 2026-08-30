@@ -4549,6 +4549,22 @@ function real_inner_horizon_attempt_receipt(
     )
 end
 
+function canonical_real_inner_horizon_match_radius_text(request, match_radius)
+    role = string(required(request, "readout_role"))
+    field = if role in FIXED_ROOT_SURVEY_BACKGROUND_ROLES
+        "readout_radius"
+    elseif role in FIXED_ROOT_SURVEY_COORDINATE_ROLES
+        "support_lower"
+    else
+        error("real-inner horizon receipt has an unknown fixed-root role")
+    end
+    canonical = string(required(request, field))
+    parse(typeof(match_radius), canonical) == match_radius || error(
+        "real-inner horizon match radius escaped its authenticated request"
+    )
+    return canonical
+end
+
 function real_inner_horizon_endpoint_receipt(
     request,
     contour,
@@ -4588,7 +4604,12 @@ function real_inner_horizon_endpoint_receipt(
         "recovery_policy_identity" => string(required(policy, "identity")),
         "recovery_policy_sha256" =>
             string(required(policy, "policy_sha256")),
-        "match_radius" => string(contour.match_radius),
+        # Preserve the authenticated request spelling.  Re-serialising a
+        # BigFloat emits its binary approximation and breaks the exact Python
+        # request/receipt identity check for non-integer support radii.
+        "match_radius" => canonical_real_inner_horizon_match_radius_text(
+            request, contour.match_radius
+        ),
         "rstar_match" => string(contour.rstar_match),
         "rho_floor" => string(required(
             policy, "horizon_endpoint_rho_floor"

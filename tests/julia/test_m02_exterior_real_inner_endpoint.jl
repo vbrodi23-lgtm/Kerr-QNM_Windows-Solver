@@ -32,6 +32,10 @@ control_failure_context(::EndpointFailureFixtureRequest) = Dict{String,Any}()
 
 function fixture_request()
     return Dict{String,Any}(
+        "readout_role" => "DC_PLUS_EPSILON",
+        # This decimal rounds to 2.5 as Float64.  The receipt must retain the
+        # authenticated text rather than serialise the rounded binary value.
+        "support_lower" => "2.4999999999999999",
         "horizon_rho_inner_min" => "-400",
         "horizon_maximum_endpoint_distance" => "0.1",
         "fixed_root_endpoint_recovery_policy" => Dict{String,Any}(
@@ -188,6 +192,7 @@ end
         @test result.receipt[
             "factored_homogeneous_rhs_evaluations_before_decision"
         ] == 0
+        @test result.receipt["match_radius"] == "2.4999999999999999"
     end
 
     @testset "a=0.99 alpha representative selects rho=-25" begin
