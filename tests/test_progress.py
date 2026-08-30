@@ -11,6 +11,7 @@ from threading import Thread
 import unittest
 from unittest.mock import patch
 
+from windows_solver.campaign_survey import _attempted_endpoint_orders_for_trace
 from windows_solver.campaign_reports import CampaignReportModel
 from windows_solver.progress import (
     PROGRESS_SCHEMA,
@@ -34,6 +35,28 @@ class RecordingObserver:
 
 
 class ProgressBusTests(unittest.TestCase):
+
+    def test_mixed_endpoint_receipts_project_valid_attempted_order_traces(self):
+        horizon = {
+            "schema": "windows-solver.exterior-endpoint-recovery-receipt/2",
+            "attempts": [
+                {"attempted_endpoint_order": 28},
+                {"attempted_endpoint_order": 56},
+            ],
+        }
+        infinity = {
+            "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
+            "attempted_endpoint_orders": [28],
+            "attempts": [{"attempted_endpoint_order": 28}],
+        }
+
+        attempted_orders = [
+            _attempted_endpoint_orders_for_trace(receipt)
+            for receipt in (horizon, infinity)
+        ]
+        with progress_scope(attempted_endpoint_orders=attempted_orders):
+            pass
+        self.assertEqual(attempted_orders, [[28, 56], [28]])
 
     def test_campaign_run_and_resume_default_to_normal_progress(self):
         parser = build_parser()
