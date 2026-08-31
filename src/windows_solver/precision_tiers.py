@@ -107,6 +107,32 @@ class PrecisionTierPresentation:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class SemanticPrecisionPresentation:
+    """Canonical semantic precision metadata for new scientific contracts.
+
+    Unlike :class:`PrecisionTierPresentation`, this record has no historical
+    ``precision_digits`` integer.  New programme layers must bind the semantic
+    ID directly so that BigFloat-40 cannot be confused with binary64 or with a
+    legacy boundary value.
+    """
+
+    precision_tier: str
+    arithmetic: str
+    working_precision_bits: int
+    nominal_decimal_digits: int | float
+    presentation_label: str
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "arithmetic": self.arithmetic,
+            "nominal_decimal_digits": self.nominal_decimal_digits,
+            "precision_tier": self.precision_tier,
+            "presentation_label": self.presentation_label,
+            "working_precision_bits": self.working_precision_bits,
+        }
+
+
 _PRESENTATIONS = {
     64: PrecisionTierPresentation(
         precision_tier="binary64",
@@ -143,3 +169,39 @@ def precision_tier_presentation(value: object) -> PrecisionTierPresentation:
         raise ValueError(
             "legacy precision tier must be 64, 80, or 120"
         ) from error
+
+
+def semantic_precision_presentation(
+    value: PrecisionTier | str,
+) -> SemanticPrecisionPresentation:
+    """Return the canonical presentation for a semantic precision ID."""
+
+    tier = precision_tier(value)
+    digits = nominal_decimal_digits(tier)
+    if tier is PrecisionTier.BINARY64:
+        arithmetic = "IEEE-754 binary64"
+        label = "binary64 (~15.95 dec)"
+    else:
+        arithmetic = "Julia BigFloat"
+        label = f"BigFloat {digits} dec"
+    return SemanticPrecisionPresentation(
+        precision_tier=tier.value,
+        arithmetic=arithmetic,
+        working_precision_bits=working_precision_bits(tier),
+        nominal_decimal_digits=digits,
+        presentation_label=label,
+    )
+
+
+__all__ = [
+    "PrecisionTier",
+    "PrecisionTierPresentation",
+    "SemanticPrecisionPresentation",
+    "next_precision_tier",
+    "nominal_decimal_digits",
+    "precision_tier",
+    "precision_tier_from_legacy",
+    "precision_tier_presentation",
+    "semantic_precision_presentation",
+    "working_precision_bits",
+]

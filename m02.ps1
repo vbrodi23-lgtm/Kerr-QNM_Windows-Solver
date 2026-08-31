@@ -570,3 +570,42 @@ finally {
 
 Write-Host "M02 requested pass finished; checkpoint is structurally valid:" -ForegroundColor Green
 Write-Host "    $CheckpointPath"
+
+# M02 owns only the zero-work readiness reduction.  When terminal admission is
+# complete it authenticates the handoff, emits M03_READY, and invokes the same
+# public m03.ps1 entry point used by a human.  No M03 numerical work is embedded
+# in this wrapper.
+$M03HandoffPath = Join-Path $PackageRoot "m02-output\m02-m03-handoff.json"
+$TransitionOutput = @(
+    Invoke-M02Command -Arguments @(
+        "m03-transition",
+        $SelectionPath,
+        "--checkpoint", $CheckpointPath,
+        "--handoff", $M03HandoffPath
+    )
+)
+$TransitionText = ($TransitionOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+if (-not [string]::IsNullOrWhiteSpace($TransitionText)) {
+    $Transition = $TransitionText | ConvertFrom-Json
+    if ($Transition.m03_ready -eq $true) {
+        Write-Host "M03_READY" -ForegroundColor Green
+        $M03Parameters = @{
+            Handoff = $M03HandoffPath
+            PortableRuntime = [bool]$PortableRuntime
+            Progress = $Progress
+        }
+        if ($SkipBootstrap) {
+            $M03Parameters.SkipBootstrap = $true
+        }
+        if ($RebuildRuntime) {
+            $M03Parameters.RebuildRuntime = $true
+        }
+        if (-not [string]::IsNullOrWhiteSpace($RuntimeRoot)) {
+            $M03Parameters.RuntimeRoot = $RuntimeRoot
+        }
+        & (Join-Path $PackageRoot "m03.ps1") @M03Parameters
+        if ($LASTEXITCODE -ne 0) {
+            throw "Automatic M02 to M03 transition failed with exit code $LASTEXITCODE."
+        }
+    }
+}

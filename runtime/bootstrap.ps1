@@ -17,6 +17,7 @@ Python came from.
 param(
     [switch]$WithNumericalKernel,
     [switch]$WithM02,
+    [switch]$WithM03,
     [switch]$Force,
     [switch]$SkipSmokeTest,
     [switch]$PowerShell51Smoke,
@@ -1015,6 +1016,9 @@ foreach ($package in $Policy.numerical_kernel.packages) {
     $NumericalEnvironmentParts += "$safeName-$safeVersion"
 }
 $NumericalEnvironmentId = $NumericalEnvironmentParts -join "-"
+if ($WithM03) {
+    $WithM02 = $true
+}
 if ($WithM02) {
     $WithNumericalKernel = $true
 }
@@ -1567,6 +1571,73 @@ Pkg.precompile()
         contract_id = $M02ContractId
         scientific_source_contract_id = $M02ContractId
     }
+
+    if ($WithM03) {
+        # M03 is a distinct staged Julia project under the existing solver
+        # runtime.  It reuses the authenticated Julia executable, scientific
+        # package sources and depot; it does not establish another runtime
+        # authority.
+        $M03WorkerSource = Join-Path $JuliaDataRoot "m03_worker.jl"
+        $M03ProjectSource = Join-Path $JuliaDataRoot "m03_project\Project.toml"
+        $M03ManifestSeedSource = Join-Path $JuliaDataRoot "m03_project\Manifest.seed.toml"
+        foreach ($RequiredM03Source in @($M03WorkerSource, $M03ProjectSource, $M03ManifestSeedSource)) {
+            if (-not (Test-Path -LiteralPath $RequiredM03Source -PathType Leaf)) {
+                throw "M03 runtime source is absent: $RequiredM03Source"
+            }
+        }
+        $M03Contract = [ordered]@{
+            schema = "windows-solver.m03-runtime-contract/1"
+            worker_sha256 = Get-Sha256 $M03WorkerSource
+            project_sha256 = Get-Sha256 $M03ProjectSource
+            manifest_seed_sha256 = Get-Sha256 $M03ManifestSeedSource
+            julia_version = $JuliaVersion
+            m02_dependency_contract_sha256 = $M02DependencySha256
+        }
+        $M03ContractSha256 = Get-ObjectSha256 $M03Contract
+        $M03Root = Join-Path $RuntimeRoot "m03-environments\$M03ContractSha256"
+        $M03Project = Join-Path $M03Root "project"
+        $M03Worker = Join-Path $M03Root "m03_worker.jl"
+        if (-not (Test-Path -LiteralPath $M03Project -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $M03Project | Out-Null
+        }
+        foreach ($M03Copy in @(
+            @($M03ProjectSource, (Join-Path $M03Project "Project.toml")),
+            @((Join-Path $JuliaProject "Manifest.toml"), (Join-Path $M03Project "Manifest.toml")),
+            @($M03WorkerSource, $M03Worker)
+        )) {
+            $M03Source = [string]$M03Copy[0]
+            $M03Destination = [string]$M03Copy[1]
+            if (Test-Path -LiteralPath $M03Destination -PathType Leaf) {
+                if ((Get-Sha256 $M03Destination) -ne (Get-Sha256 $M03Source)) {
+                    throw "Immutable M03 runtime resource is corrupted: $M03Destination"
+                }
+            }
+            else {
+                Copy-Item -LiteralPath $M03Source -Destination $M03Destination
+            }
+        }
+        Set-M02JuliaEnvironment
+        Invoke-Julia @(
+            "--startup-file=no",
+            "--history-file=no",
+            "--project=$M03Project",
+            $M03Worker,
+            "--probe"
+        )
+        $JuliaReceipt["m03"] = [ordered]@{
+            schema = "windows-solver.m03-runtime-receipt/1"
+            contract = $M03Contract
+            contract_sha256 = $M03ContractSha256
+            worker = [IO.Path]::GetFullPath($M03Worker)
+            worker_sha256 = Get-Sha256 $M03Worker
+            project = [IO.Path]::GetFullPath($M03Project)
+            project_sha256 = Get-Sha256 (Join-Path $M03Project "Project.toml")
+            manifest_sha256 = Get-Sha256 (Join-Path $M03Project "Manifest.toml")
+            depot = [IO.Path]::GetFullPath($JuliaDepot)
+            source_root = [IO.Path]::GetFullPath($M02DependencySourceRoot)
+        }
+        Write-Step "M03 persistent Julia worker and project are staged"
+    }
 }
 
 # -------------------------------------------------------------------- receipt
@@ -1625,4 +1696,9 @@ if (-not $WithM02) {
     Write-Host ""
     Write-Host "The physical M02 campaign additionally needs Julia 1.10.11:"
     Write-Host "    .\runtime\bootstrap.ps1 -WithM02"
+}
+elseif (-not $WithM03) {
+    Write-Host ""
+    Write-Host "The M03 spectral-state engine additionally needs its staged Julia project:"
+    Write-Host "    .\runtime\bootstrap.ps1 -WithM03"
 }

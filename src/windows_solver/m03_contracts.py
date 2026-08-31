@@ -1,4 +1,4 @@
-"""Fail-closed TASK-012 contracts for M03 spectral-field work.
+"""Fail-closed contracts for the M03 Kerr spectral-state programme.
 
 This module adapts already-admitted spectral payloads.  It does not execute a
 solver, compute a field, or admit an M03 scientific provider.
@@ -17,7 +17,9 @@ from typing import Mapping, TypeVar
 
 from .precision_tiers import (
     PrecisionTierPresentation,
+    SemanticPrecisionPresentation,
     precision_tier_presentation,
+    semantic_precision_presentation,
 )
 
 
@@ -490,7 +492,7 @@ class M02LineageAnchor(_FactoryOnlyContract):
     backend_identity_sha256: str | None
     policy_sha256: str | None
     sampling_coordinate: Mapping[str, object] | None
-    precision_tier: PrecisionTierPresentation
+    precision_tier: SemanticPrecisionPresentation
     reconciliation_state: str
     identity_sha256: str
 
@@ -685,7 +687,7 @@ class M03CacheIdentity(_FactoryOnlyContract):
         normalization_id: str,
         pairing_id: str,
         backend_revisions: Mapping[str, object],
-        precision_tier: PrecisionTierPresentation,
+        precision_tier: SemanticPrecisionPresentation,
         validation_policy: Mapping[str, object],
         m02_lineage: M02LineageAnchor | None,
     ) -> "M03CacheIdentity":
@@ -693,11 +695,11 @@ class M03CacheIdentity(_FactoryOnlyContract):
             raise TypeError("M03 cache identity requires an M03RootSeed")
         if not isinstance(artifact_kind, M03ArtifactKind):
             raise TypeError("M03 cache artifact kind is invalid")
-        if not isinstance(precision_tier, PrecisionTierPresentation):
+        if not isinstance(precision_tier, SemanticPrecisionPresentation):
             raise TypeError("M03 cache precision tier is invalid")
         try:
-            canonical_precision = precision_tier_presentation(
-                precision_tier.legacy_tier_value
+            canonical_precision = semantic_precision_presentation(
+                precision_tier.precision_tier
             )
         except ValueError as error:
             raise ValueError("M03 cache requires a canonical precision tier") from error
@@ -801,8 +803,8 @@ _MATH_REVIEW_BLOCKERS = {
         "overlap region, convention map, and error model"
     ),
     M03ArtifactKind.PROVIDER_ADMISSION: (
-        "UPSTREAM_EVIDENCE_REQUIRED: TASK-012 defines contracts but cannot "
-        "admit the M03 provider"
+        "UPSTREAM_EVIDENCE_REQUIRED: only checkpoint reduction and provider "
+        "admission may admit the M03 provider"
     ),
 }
 
@@ -821,7 +823,7 @@ _REQUIRED_VALIDATION_FIELDS = {
             "edge_count",
             "overlap_guards",
             "continuation_invariants",
-            "exact_node_polish",
+            "fixed_root_validation",
         }
     ),
 }
@@ -970,8 +972,9 @@ def _validate_produced_payload(
             validation["continuation_invariants"],
             "genealogy continuation invariants",
         )
-        polish = _mapping(
-            validation["exact_node_polish"], "genealogy exact-node polish"
+        fixed_root = _mapping(
+            validation["fixed_root_validation"],
+            "genealogy fixed-root validation",
         )
         _exact_fields(overlap, frozenset({"minimum"}), "genealogy overlap guards")
         _exact_fields(
@@ -980,20 +983,26 @@ def _validate_produced_payload(
             "genealogy continuation invariants",
         )
         _exact_fields(
-            polish,
-            frozenset({"maximum_residual_abs"}),
-            "genealogy exact-node polish",
+            fixed_root,
+            frozenset({"maximum_residual_abs", "maximum_root_movement_abs"}),
+            "genealogy fixed-root validation",
         )
         observed_overlap = _finite(overlap["minimum"], "observed overlap")
-        observed_polish = _finite(
-            polish["maximum_residual_abs"], "observed exact-node residual"
+        observed_residual = _finite(
+            fixed_root["maximum_residual_abs"],
+            "observed fixed-root residual",
+        )
+        observed_movement = _finite(
+            fixed_root["maximum_root_movement_abs"],
+            "observed root movement",
         )
         if (
             not 0.0 <= observed_overlap <= 1.0
             or observed_overlap < minimum_overlap
             or invariants["branch_resolved"] is not True
-            or observed_polish < 0.0
-            or observed_polish > maximum_polish
+            or observed_residual < 0.0
+            or observed_residual > maximum_polish
+            or observed_movement != 0.0
         ):
             raise ValueError(
                 "genealogy evidence does not satisfy validation policy"
@@ -1022,7 +1031,7 @@ def build_m03_envelope(
         raise TypeError("M03 evidence state is invalid")
     payload = _mapping(payload, "M03 artifact payload")
     if evidence_state is M03EvidenceState.ADMITTED:
-        raise ValueError("TASK-012 cannot admit an M03 artifact")
+        raise ValueError("artifact production cannot perform M03 admission")
     blocker = _MATH_REVIEW_BLOCKERS.get(kind)
     if evidence_state is M03EvidenceState.PRODUCED:
         if blocker is not None:
