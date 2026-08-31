@@ -1044,7 +1044,7 @@ _FIXED_ROOT_SURVEY_CONTROL_STAGE: Mapping[str, tuple[str, ...]] = (
             "determinant-chart",
             "homogeneous-propagation",
         ),
-        "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE": (
+        "EXTERIOR_ENDPOINT_RECOVERY_EXHAUSTED": (
             "asymptotic-preflight",
         ),
         "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED": (

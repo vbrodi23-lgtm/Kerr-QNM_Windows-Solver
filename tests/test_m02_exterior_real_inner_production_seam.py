@@ -39,7 +39,7 @@ from windows_solver.response_engine import (
 
 
 REAL_INNER_POLICY = (
-    "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2"
+    "cause-aware-real-inner-order-geometry-fixed-root-exterior-endpoint-recovery/v3"
 )
 MECHANISMS = (
     "exterior-alpha-half",

@@ -102,7 +102,7 @@ _PROMOTED_RUNTIME_IDENTITY_FILES = (
 )
 
 _REAL_INNER_HORIZON_POLICY_IDENTITY = (
-    "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2"
+    "cause-aware-real-inner-order-geometry-fixed-root-exterior-endpoint-recovery/v3"
 )
 _REAL_INNER_HORIZON_SCHEDULE = (
     "-10", "-25", "-50", "-75", "-100", "-150", "-225", "-337.5",

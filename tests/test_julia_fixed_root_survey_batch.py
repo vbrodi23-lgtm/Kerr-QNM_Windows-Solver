@@ -136,9 +136,10 @@ def _conditioning(request, sample=None) -> dict[str, object]:
             "candidate_limitation": "adequate/v1",
             "selected_intervention": "ENTER_HOMOGENEOUS_ODE",
             "result": "ADEQUATE",
+            "terminal": True,
     }
     receipts.append({
-            "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
+            "schema": "windows-solver.exterior-endpoint-recovery-receipt/3",
             "endpoint_branch": "infinity-outgoing",
             "recovery_policy_identity": recovery["identity"],
             "recovery_policy_sha256": recovery["policy_sha256"],
@@ -287,7 +288,7 @@ def _backend(
 
 
 class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
-    def test_v2_real_inner_endpoint_policy_is_exact_and_plan_invariant(self):
+    def test_v3_order_geometry_endpoint_policy_is_exact_and_plan_invariant(self):
         job = _job()
         backend = _backend(_BatchAdapter())
         requests = [
@@ -306,8 +307,12 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
         background, mechanism = requests
         policy = background["fixed_root_endpoint_recovery_policy"]
         self.assertEqual(
+            policy["schema"],
+            "windows-solver.fixed-root-endpoint-recovery-policy/2",
+        )
+        self.assertEqual(
             policy["identity"],
-            "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2",
+            "cause-aware-real-inner-order-geometry-fixed-root-exterior-endpoint-recovery/v3",
         )
         self.assertEqual(
             policy["horizon_geometry_rule"],
@@ -329,6 +334,10 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
         self.assertEqual(policy["horizon_endpoint_rho_floor"], "-400")
         self.assertEqual(policy["horizon_maximum_endpoint_distance"], "0.1")
         self.assertEqual(policy["endpoint_order_schedule"], [28, 56, 112])
+        self.assertEqual(
+            policy["endpoint_transition_rule"],
+            "bounded-order-then-geometry-grid/v1",
+        )
         self.assertEqual(
             policy["infinity_geometry_schedule"],
             ["100", "250", "500", "1000", "2000", "5000", "10000", "20000"],
@@ -463,6 +472,133 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
                     ],
                 )
 
+    def test_infinity_receipt_authenticates_the_full_order_geometry_grid(self):
+        job = _job()
+        request = _backend(_BatchAdapter()).preview_fixed_root_survey_request(
+            job,
+            fixed_root=job.root.omega,
+            root_seal_sha256="0" * 64,
+            branch_identity=job.root.branch_id,
+            plan=FixedRootSurveyPlan.CANONICAL_BACKGROUND_FIVE,
+        )
+        policy = request["fixed_root_endpoint_recovery_policy"]
+        evidence = deepcopy(_conditioning(request)["endpoint_receipts"])
+        required = "16.698970004336018804786261105275506973231810118538"
+        coordinates = [
+            (28, "100"), (56, "100"), (112, "100"), (28, "250")
+        ]
+        attempts = []
+        for index, (order, geometry) in enumerate(coordinates):
+            terminal = index == len(coordinates) - 1
+            attempts.append({
+                "endpoint_branch": "infinity-outgoing",
+                "attempted_endpoint_order": order,
+                "attempted_geometry": geometry,
+                "maximum_last_term_ratio": "1e-20",
+                "maximum_truncation_digits_lost": "5",
+                "maximum_recurrence_digits_lost": "1",
+                "maximum_series_evaluation_digits_lost": "1",
+                "predicted_reliable_digits": "35" if terminal else "10",
+                "required_reliable_digits": required,
+                "candidate_limitation": (
+                    "adequate/v1" if terminal else ENDPOINT_SERIES_ORDER_LIMITED
+                ),
+                "selected_intervention": (
+                    "ENTER_HOMOGENEOUS_ODE" if terminal
+                    else "DEEPEN_ENDPOINT_GEOMETRY" if order == 112
+                    else "INCREASE_ENDPOINT_ORDER"
+                ),
+                "result": "ADEQUATE" if terminal else "RETRY",
+                "terminal": terminal,
+            })
+        infinity = evidence[1]
+        infinity.update({
+            "attempted_endpoint_orders": [item[0] for item in coordinates],
+            "terminal_endpoint_order": 28,
+            "terminal_geometry": "250",
+            "maximum_last_term_ratio": "1e-20",
+            "maximum_truncation_digits_lost": "5",
+            "maximum_recurrence_digits_lost": "1",
+            "maximum_series_evaluation_digits_lost": "1",
+            "predicted_reliable_digits": "35",
+            "required_reliable_digits": required,
+            "candidate_limitation": "adequate/v1",
+            "aggregate_limitation": "adequate/v1",
+            "attempts": attempts,
+        })
+        evidence[0]["aggregate_limitation"] = "adequate/v1"
+        _validated_exterior_endpoint_recovery_evidence(
+            evidence,
+            policy,
+            expected_aggregate="adequate/v1",
+            spin=request["spin"],
+            expected_horizon_match_radius=request["policy"]["readout_radius"],
+        )
+
+        def rejected(label, mutator):
+            forged = deepcopy(evidence)
+            mutator(forged[1])
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                _validated_exterior_endpoint_recovery_evidence(
+                    forged,
+                    policy,
+                    expected_aggregate="adequate/v1",
+                    spin=request["spin"],
+                    expected_horizon_match_radius=request["policy"][
+                        "readout_radius"
+                    ],
+                )
+
+        def premature(receipt):
+            receipt["attempts"] = receipt["attempts"][:3]
+            receipt["attempts"][-1].update({
+                "selected_intervention": "NONE",
+                "result": "ORDER_EXHAUSTED",
+                "terminal": True,
+            })
+            receipt["attempted_endpoint_orders"] = [28, 56, 112]
+            receipt["terminal_endpoint_order"] = 112
+            receipt["terminal_geometry"] = "100"
+            receipt["predicted_reliable_digits"] = "10"
+            receipt["candidate_limitation"] = ENDPOINT_SERIES_ORDER_LIMITED
+            receipt["aggregate_limitation"] = ENDPOINT_SERIES_ORDER_LIMITED
+
+        rejected("old premature terminal", premature)
+        rejected(
+            "advance geometry before order exhaustion",
+            lambda receipt: receipt["attempts"][0].update({
+                "selected_intervention": "DEEPEN_ENDPOINT_GEOMETRY"
+            }),
+        )
+        rejected(
+            "duplicate candidate",
+            lambda receipt: receipt["attempts"].insert(
+                1, deepcopy(receipt["attempts"][0])
+            ),
+        )
+        rejected(
+            "incorrect terminal flag",
+            lambda receipt: receipt["attempts"][0].update({"terminal": True}),
+        )
+        rejected(
+            "incorrect terminal geometry",
+            lambda receipt: receipt.update({"terminal_geometry": "100"}),
+        )
+        rejected(
+            "incorrect summary maximum",
+            lambda receipt: receipt.update({
+                "maximum_truncation_digits_lost": "4"
+            }),
+        )
+        rejected(
+            "old policy identity",
+            lambda receipt: receipt.update({
+                "recovery_policy_identity": (
+                    "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2"
+                )
+            }),
+        )
+
         spin = float(request["spin"])
         rplus = 1.0 + math.sqrt(1.0 - spin * spin)
 
@@ -526,12 +662,17 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
             "maximum_truncation_digits_lost": "2",
         })
         infinity_attempts = []
-        for index, order in enumerate(policy["endpoint_order_schedule"]):
-            terminal = index == len(policy["endpoint_order_schedule"]) - 1
+        coordinates = [
+            (order, geometry)
+            for geometry in policy["infinity_geometry_schedule"]
+            for order in policy["endpoint_order_schedule"]
+        ]
+        for index, (order, geometry) in enumerate(coordinates):
+            terminal = index == len(coordinates) - 1
             infinity_attempts.append({
                 "endpoint_branch": "infinity-outgoing",
                 "attempted_endpoint_order": order,
-                "attempted_geometry": policy["infinity_geometry_schedule"][0],
+                "attempted_geometry": geometry,
                 "maximum_last_term_ratio": "0.1",
                 "maximum_truncation_digits_lost": "5",
                 "maximum_recurrence_digits_lost": "1",
@@ -540,21 +681,25 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
                 "required_reliable_digits": required,
                 "candidate_limitation": ENDPOINT_SERIES_ORDER_LIMITED,
                 "selected_intervention": (
-                    "NONE" if terminal else "INCREASE_ENDPOINT_ORDER"
+                    "NONE" if terminal
+                    else "INCREASE_ENDPOINT_ORDER"
+                    if order != policy["endpoint_order_schedule"][-1]
+                    else "DEEPEN_ENDPOINT_GEOMETRY"
                 ),
-                "result": "ORDER_EXHAUSTED" if terminal else "RETRY",
+                "result": "RECOVERY_EXHAUSTED" if terminal else "RETRY",
+                "terminal": terminal,
             })
         infinity = {
-            "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
+            "schema": "windows-solver.exterior-endpoint-recovery-receipt/3",
             "endpoint_branch": "infinity-outgoing",
             "recovery_policy_identity": policy["identity"],
             "recovery_policy_sha256": policy["policy_sha256"],
             "base_endpoint_order": policy["base_endpoint_order"],
             "generated_maximum_order": policy["generated_maximum_order"],
-            "attempted_endpoint_orders": policy["endpoint_order_schedule"],
+            "attempted_endpoint_orders": [item[0] for item in coordinates],
             "terminal_endpoint_order": policy["endpoint_order_schedule"][-1],
             "candidate_geometry_schedule": policy["infinity_geometry_schedule"],
-            "terminal_geometry": policy["infinity_geometry_schedule"][0],
+            "terminal_geometry": policy["infinity_geometry_schedule"][-1],
             "maximum_last_term_ratio": "0.1",
             "maximum_truncation_digits_lost": "5",
             "maximum_recurrence_digits_lost": "1",

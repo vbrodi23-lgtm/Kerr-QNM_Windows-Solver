@@ -92,9 +92,10 @@ function deterministic_endpoint_receipts(
         "candidate_limitation" => limitation,
         "selected_intervention" => intervention,
         "result" => result,
+        "terminal" => true,
     )
     infinity_receipt = Dict{String,Any}(
-        "schema" => "windows-solver.exterior-endpoint-recovery-receipt/1",
+        "schema" => "windows-solver.exterior-endpoint-recovery-receipt/3",
         "endpoint_branch" => "infinity-outgoing",
         "recovery_policy_identity" => required(policy, "identity"),
         "recovery_policy_sha256" => required(policy, "policy_sha256"),

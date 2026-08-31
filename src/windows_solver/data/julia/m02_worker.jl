@@ -29,10 +29,12 @@ const CANONICAL_EXTERIOR_BACKGROUND_IDENTITY =
 const FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA =
     "windows-solver.fixed-root-survey-conditioning/3"
 const FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_SCHEMA =
-    "windows-solver.fixed-root-endpoint-recovery-policy/1"
+    "windows-solver.fixed-root-endpoint-recovery-policy/2"
 const FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_IDENTITY =
-    "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2"
+    "cause-aware-real-inner-order-geometry-fixed-root-exterior-endpoint-recovery/v3"
 const FIXED_ROOT_ENDPOINT_ORDER_RULE = "bounded-doubling-prefix/v1"
+const FIXED_ROOT_ENDPOINT_TRANSITION_RULE =
+    "bounded-order-then-geometry-grid/v1"
 const FIXED_ROOT_HORIZON_GEOMETRY_RULE =
     "bounded-real-inner-tortoise-depth/v1"
 const FIXED_ROOT_INFINITY_GEOMETRY_RULE = "bounded-positive-rho-depth/v1"
@@ -171,6 +173,7 @@ const FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_FIELDS = Set((
     "schema",
     "identity",
     "endpoint_order_rule",
+    "endpoint_transition_rule",
     "base_endpoint_order",
     "generated_maximum_order",
     "endpoint_order_schedule",
@@ -4267,7 +4270,7 @@ function canonical_infinity_endpoint_recovery_receipt(
 )
     policy = required(request, "fixed_root_endpoint_recovery_policy")
     recovery.endpoint_branch == "infinity-outgoing" || error(
-        "the v1 endpoint receipt is retained only for infinity-outgoing"
+        "the order-geometry endpoint receipt is only for infinity-outgoing"
     )
     receipt = CF.canonical_single_endpoint_recovery_evidence(
         recovery; aggregate_limitation=aggregate
@@ -4317,8 +4320,8 @@ function exterior_endpoint_recovery_failure(
     failure_code, intervention, result = if aggregate ==
             CF.ENDPOINT_SERIES_ORDER_LIMITED
         (
-            "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE",
-            "ENDPOINT_ORDER_RECOVERY_EXHAUSTED",
+            "EXTERIOR_ENDPOINT_RECOVERY_EXHAUSTED",
+            "ENDPOINT_ORDER_GEOMETRY_RECOVERY_EXHAUSTED",
             "UNRESOLVED",
         )
     elseif aggregate == CF.ENDPOINT_GEOMETRY_LIMITED
@@ -9462,6 +9465,10 @@ function validate_fixed_root_endpoint_recovery_policy(request)
     string(required(recovery, "endpoint_order_rule")) ==
         FIXED_ROOT_ENDPOINT_ORDER_RULE || error(
             "fixed-root endpoint order rule is invalid"
+        )
+    string(required(recovery, "endpoint_transition_rule")) ==
+        FIXED_ROOT_ENDPOINT_TRANSITION_RULE || error(
+            "fixed-root endpoint transition rule is invalid"
         )
     string(required(recovery, "horizon_geometry_rule")) ==
         FIXED_ROOT_HORIZON_GEOMETRY_RULE || error(

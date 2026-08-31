@@ -50,7 +50,7 @@ def _job():
 def _conditioning(job) -> FixedRootSurveyConditioning:
     required = "16.698970004336018804786261105275506973231810118538"
     policy_identity = (
-        "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2"
+        "cause-aware-real-inner-order-geometry-fixed-root-exterior-endpoint-recovery/v3"
     )
     policy_sha256 = "f" * 64
     horizon_schedule = [
@@ -126,9 +126,10 @@ def _conditioning(job) -> FixedRootSurveyConditioning:
             "candidate_limitation": "adequate/v1",
             "selected_intervention": "ENTER_HOMOGENEOUS_ODE",
             "result": "ADEQUATE",
+            "terminal": True,
         }
     receipts.append({
-            "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
+            "schema": "windows-solver.exterior-endpoint-recovery-receipt/3",
             "endpoint_branch": "infinity-outgoing",
             "recovery_policy_identity": policy_identity,
             "recovery_policy_sha256": policy_sha256,

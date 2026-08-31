@@ -64,6 +64,7 @@ export select_horizon_endpoint_best_prefix
 export horizon_endpoint_prefix_orders
 export recover_verified_horizon_endpoint_pair
 export SingleEndpointRecoveryCandidate, SingleEndpointRecovery
+export single_endpoint_recovery_transition
 export recover_single_factored_endpoint, aggregate_endpoint_limitations
 export canonical_single_endpoint_recovery_evidence
 export verified_horizon_endpoints_from_recovery
@@ -2868,6 +2869,68 @@ struct SingleEndpointRecovery{T<:AbstractFloat}
     factored_homogeneous_rhs_evaluations::Int
 end
 
+"""Return the only permitted next state for one endpoint recovery attempt."""
+function single_endpoint_recovery_transition(
+    limitation::AbstractString,
+    order_index::Int,
+    order_count::Int,
+    geometry_index::Int,
+    geometry_count::Int,
+)
+    1 <= order_index <= order_count || throw(ArgumentError(
+        "single-endpoint recovery order index is invalid"
+    ))
+    1 <= geometry_index <= geometry_count || throw(ArgumentError(
+        "single-endpoint recovery geometry index is invalid"
+    ))
+    if limitation == ENDPOINT_ADEQUATE
+        return (
+            intervention="ENTER_HOMOGENEOUS_ODE", result="ADEQUATE",
+            terminal=true, next_order_index=order_index,
+            next_geometry_index=geometry_index,
+        )
+    elseif limitation == ENDPOINT_ARITHMETIC_LIMITED
+        return (
+            intervention="PROMOTE_ARITHMETIC_TIER_IF_AGGREGATE_ALLOWS",
+            result="ARITHMETIC_INADEQUATE", terminal=true,
+            next_order_index=order_index, next_geometry_index=geometry_index,
+        )
+    elseif limitation == ENDPOINT_SERIES_ORDER_LIMITED
+        if order_index < order_count
+            return (
+                intervention="INCREASE_ENDPOINT_ORDER", result="RETRY",
+                terminal=false, next_order_index=order_index + 1,
+                next_geometry_index=geometry_index,
+            )
+        elseif geometry_index < geometry_count
+            return (
+                intervention="DEEPEN_ENDPOINT_GEOMETRY", result="RETRY",
+                terminal=false, next_order_index=1,
+                next_geometry_index=geometry_index + 1,
+            )
+        end
+        return (
+            intervention="NONE", result="RECOVERY_EXHAUSTED",
+            terminal=true, next_order_index=order_index,
+            next_geometry_index=geometry_index,
+        )
+    elseif limitation == ENDPOINT_GEOMETRY_LIMITED
+        if geometry_index < geometry_count
+            return (
+                intervention="DEEPEN_ENDPOINT_GEOMETRY", result="RETRY",
+                terminal=false, next_order_index=1,
+                next_geometry_index=geometry_index + 1,
+            )
+        end
+        return (
+            intervention="NONE", result="GEOMETRY_EXHAUSTED",
+            terminal=true, next_order_index=order_index,
+            next_geometry_index=geometry_index,
+        )
+    end
+    throw(ArgumentError("unknown endpoint limitation"))
+end
+
 """
     recover_single_factored_endpoint(branch, orders, geometries, policy, prepare)
 
@@ -2909,38 +2972,22 @@ function recover_single_factored_endpoint(
             "homogeneous RHS executed during endpoint recovery"
         ))
         limitation = asymptotic_endpoint_limitation(preparation.assessment)
-        intervention, result, terminal = if limitation == ENDPOINT_ADEQUATE
-            ("ENTER_HOMOGENEOUS_ODE", "ADEQUATE", true)
-        elseif limitation == ENDPOINT_SERIES_ORDER_LIMITED
-            order_index < length(endpoint_orders) ?
-                ("INCREASE_ENDPOINT_ORDER", "RETRY", false) :
-                ("NONE", "ORDER_EXHAUSTED", true)
-        elseif limitation == ENDPOINT_GEOMETRY_LIMITED
-            geometry_index < length(geometry_schedule) ?
-                ("DEEPEN_ENDPOINT_GEOMETRY", "RETRY", false) :
-                ("NONE", "GEOMETRY_EXHAUSTED", true)
-        elseif limitation == ENDPOINT_ARITHMETIC_LIMITED
-            ("PROMOTE_ARITHMETIC_TIER_IF_AGGREGATE_ALLOWS",
-             "ARITHMETIC_INADEQUATE", true)
-        else
-            throw(ArgumentError("unknown endpoint limitation"))
-        end
+        transition = single_endpoint_recovery_transition(
+            limitation, order_index, length(endpoint_orders),
+            geometry_index, length(geometry_schedule),
+        )
         candidate = SingleEndpointRecoveryCandidate{T}(
             String(endpoint_branch), order, geometry, preparation, payload,
-            limitation, intervention, result,
+            limitation, transition.intervention, transition.result,
         )
         push!(candidates, candidate)
-        terminal && return SingleEndpointRecovery{T}(
+        transition.terminal && return SingleEndpointRecovery{T}(
             String(endpoint_branch), String(policy_identity),
             copy(endpoint_orders), copy(geometry_schedule), candidates,
             candidate, limitation, factored_homogeneous_rhs_counter[],
         )
-        if limitation == ENDPOINT_SERIES_ORDER_LIMITED
-            order_index += 1
-        else
-            geometry_index += 1
-            order_index = 1
-        end
+        order_index = transition.next_order_index
+        geometry_index = transition.next_geometry_index
     end
 end
 
@@ -2961,7 +3008,7 @@ function aggregate_endpoint_limitations(limitations)
     throw(ArgumentError("endpoint limitation aggregate is inconsistent"))
 end
 
-function _single_endpoint_attempt_evidence(candidate)
+function _single_endpoint_attempt_evidence(candidate; terminal::Bool)
     assessment = candidate.preparation.assessment
     return Dict{String,Any}(
         "endpoint_branch" => candidate.endpoint_branch,
@@ -2980,6 +3027,7 @@ function _single_endpoint_attempt_evidence(candidate)
         "candidate_limitation" => candidate.limitation,
         "selected_intervention" => candidate.selected_intervention,
         "result" => candidate.result,
+        "terminal" => terminal,
     )
 end
 
@@ -2988,11 +3036,14 @@ function canonical_single_endpoint_recovery_evidence(
     recovery::SingleEndpointRecovery;
     aggregate_limitation::AbstractString=recovery.outcome,
 )
-    attempts = [_single_endpoint_attempt_evidence(candidate)
-                for candidate in recovery.candidates]
+    attempts = [
+        _single_endpoint_attempt_evidence(
+            candidate; terminal=index == length(recovery.candidates)
+        ) for (index, candidate) in enumerate(recovery.candidates)
+    ]
     terminal = recovery.terminal.preparation.assessment
     return Dict{String,Any}(
-        "schema" => "windows-solver.exterior-endpoint-recovery-receipt/1",
+        "schema" => "windows-solver.exterior-endpoint-recovery-receipt/3",
         "endpoint_branch" => recovery.endpoint_branch,
         "recovery_policy_identity" => recovery.policy_identity,
         "base_endpoint_order" => first(recovery.endpoint_orders),

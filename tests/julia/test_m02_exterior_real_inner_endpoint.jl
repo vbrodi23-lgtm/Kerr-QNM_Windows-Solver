@@ -40,7 +40,7 @@ function fixture_request()
         "horizon_maximum_endpoint_distance" => "0.1",
         "fixed_root_endpoint_recovery_policy" => Dict{String,Any}(
             "identity" =>
-                "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2",
+                "cause-aware-real-inner-order-geometry-fixed-root-exterior-endpoint-recovery/v3",
             "policy_sha256" => repeat("a", 64),
             "endpoint_order_schedule" => [28, 56, 112],
             "horizon_geometry_schedule" => copy(TEST_RHO_SCHEDULE),
@@ -177,6 +177,73 @@ function deterministic_recovery(
 end
 
 @testset "M02 fixed-root real-inner exterior endpoint" begin
+    @testset "order and geometry transition grid is complete" begin
+        order_count = 3
+        geometry_count = 2
+        order_index = 1
+        geometry_index = 1
+        trajectory = Tuple{Int,Int,String,String,Bool}[]
+        while true
+            limitation = (
+                order_index == 1 && geometry_index == 2 ?
+                CF.ENDPOINT_ADEQUATE : CF.ENDPOINT_SERIES_ORDER_LIMITED
+            )
+            transition = CF.single_endpoint_recovery_transition(
+                limitation, order_index, order_count,
+                geometry_index, geometry_count,
+            )
+            push!(trajectory, (
+                order_index, geometry_index, transition.intervention,
+                transition.result, transition.terminal,
+            ))
+            transition.terminal && break
+            order_index = transition.next_order_index
+            geometry_index = transition.next_geometry_index
+        end
+        @test trajectory == [
+            (1, 1, "INCREASE_ENDPOINT_ORDER", "RETRY", false),
+            (2, 1, "INCREASE_ENDPOINT_ORDER", "RETRY", false),
+            (3, 1, "DEEPEN_ENDPOINT_GEOMETRY", "RETRY", false),
+            (1, 2, "ENTER_HOMOGENEOUS_ODE", "ADEQUATE", true),
+        ]
+
+        order_index = 1
+        geometry_index = 1
+        exhausted = Tuple{Int,Int,String,String,Bool}[]
+        while true
+            transition = CF.single_endpoint_recovery_transition(
+                CF.ENDPOINT_SERIES_ORDER_LIMITED,
+                order_index, order_count, geometry_index, geometry_count,
+            )
+            push!(exhausted, (
+                order_index, geometry_index, transition.intervention,
+                transition.result, transition.terminal,
+            ))
+            transition.terminal && break
+            order_index = transition.next_order_index
+            geometry_index = transition.next_geometry_index
+        end
+        @test exhausted == [
+            (1, 1, "INCREASE_ENDPOINT_ORDER", "RETRY", false),
+            (2, 1, "INCREASE_ENDPOINT_ORDER", "RETRY", false),
+            (3, 1, "DEEPEN_ENDPOINT_GEOMETRY", "RETRY", false),
+            (1, 2, "INCREASE_ENDPOINT_ORDER", "RETRY", false),
+            (2, 2, "INCREASE_ENDPOINT_ORDER", "RETRY", false),
+            (3, 2, "NONE", "RECOVERY_EXHAUSTED", true),
+        ]
+
+        geometry = CF.single_endpoint_recovery_transition(
+            CF.ENDPOINT_GEOMETRY_LIMITED, 2, 3, 1, 2,
+        )
+        @test geometry.next_order_index == 1
+        @test geometry.next_geometry_index == 2
+        arithmetic = CF.single_endpoint_recovery_transition(
+            CF.ENDPOINT_ARITHMETIC_LIMITED, 1, 3, 1, 2,
+        )
+        @test arithmetic.terminal
+        @test arithmetic.result == "ARITHMETIC_INADEQUATE"
+    end
+
     @testset "a=0.95 representative selects rho=-10" begin
         result, prepared, inspected = deterministic_recovery(
             (rho, order) -> CF.ENDPOINT_ADEQUATE
@@ -228,7 +295,7 @@ end
         )
         @test failure isa NumericalControlFailure
         @test failure.details["failure_code"] ==
-            "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE"
+            "EXTERIOR_ENDPOINT_RECOVERY_EXHAUSTED"
         @test failure.details["stage"] == "asymptotic-preflight"
         @test failure.details["retryable"] == false
         @test failure.details["diagnostics"][

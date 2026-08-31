@@ -153,19 +153,20 @@ FIXED_ROOT_RELIABILITY_PROJECTION_SCHEMA = (
     "windows-solver.fixed-root-reliability-projection/2"
 )
 FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_SCHEMA = (
-    "windows-solver.fixed-root-endpoint-recovery-policy/1"
+    "windows-solver.fixed-root-endpoint-recovery-policy/2"
 )
 FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_IDENTITY = (
-    "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2"
+    "cause-aware-real-inner-order-geometry-fixed-root-exterior-endpoint-recovery/v3"
 )
 FIXED_ROOT_CONTROL_PROFILE = "fixed-root-deep-v1"
 FIXED_ROOT_ENDPOINT_ORDER_RULE = "bounded-doubling-prefix/v1"
+FIXED_ROOT_ENDPOINT_TRANSITION_RULE = "bounded-order-then-geometry-grid/v1"
 FIXED_ROOT_ENDPOINT_BASE_ORDER = 28
 FIXED_ROOT_ENDPOINT_MAXIMUM_ORDER = 112
 FIXED_ROOT_HORIZON_GEOMETRY_RULE = "bounded-real-inner-tortoise-depth/v1"
 FIXED_ROOT_INFINITY_GEOMETRY_RULE = "bounded-positive-rho-depth/v1"
 EXTERIOR_ENDPOINT_RECOVERY_RECEIPT_SCHEMA = (
-    "windows-solver.exterior-endpoint-recovery-receipt/1"
+    "windows-solver.exterior-endpoint-recovery-receipt/3"
 )
 EXTERIOR_REAL_INNER_ENDPOINT_RECOVERY_RECEIPT_SCHEMA = (
     "windows-solver.exterior-endpoint-recovery-receipt/2"
@@ -183,7 +184,7 @@ ENDPOINT_SERIES_ORDER_LIMITED = "insufficient-series-order/v1"
 ENDPOINT_ARITHMETIC_LIMITED = "insufficient-arithmetic-precision/v1"
 ENDPOINT_GEOMETRY_LIMITED = "insufficient-geometric-depth/v1"
 EXTERIOR_ENDPOINT_CONTROL_CODES = frozenset({
-    "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE",
+    "EXTERIOR_ENDPOINT_RECOVERY_EXHAUSTED",
     "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED",
     "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
 })
@@ -296,6 +297,7 @@ def _fixed_root_endpoint_recovery_policy(
         "schema": FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_SCHEMA,
         "identity": FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_IDENTITY,
         "endpoint_order_rule": FIXED_ROOT_ENDPOINT_ORDER_RULE,
+        "endpoint_transition_rule": FIXED_ROOT_ENDPOINT_TRANSITION_RULE,
         "base_endpoint_order": base_order,
         "generated_maximum_order": maximum_order,
         "endpoint_order_schedule": _endpoint_order_schedule(
@@ -1954,9 +1956,9 @@ def _valid_exterior_endpoint_control_diagnostics(
         "factored_homogeneous_rhs_evaluations",
     }
     expected = {
-        "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE": (
+        "EXTERIOR_ENDPOINT_RECOVERY_EXHAUSTED": (
             ENDPOINT_SERIES_ORDER_LIMITED,
-            "ENDPOINT_ORDER_RECOVERY_EXHAUSTED",
+            "ENDPOINT_ORDER_GEOMETRY_RECOVERY_EXHAUSTED",
             "UNRESOLVED",
         ),
         "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED": (
@@ -2888,7 +2890,8 @@ def _validated_fixed_root_endpoint_recovery_policy(
     value: object,
 ) -> dict[str, object]:
     fields = {
-        "schema", "identity", "endpoint_order_rule", "base_endpoint_order",
+        "schema", "identity", "endpoint_order_rule", "endpoint_transition_rule",
+        "base_endpoint_order",
         "generated_maximum_order", "endpoint_order_schedule",
         "horizon_geometry_rule", "horizon_geometry_schedule",
         "horizon_rho_inner_min", "horizon_endpoint_rho_floor",
@@ -2904,6 +2907,8 @@ def _validated_fixed_root_endpoint_recovery_policy(
         value["schema"] != FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_SCHEMA
         or value["identity"] != FIXED_ROOT_ENDPOINT_RECOVERY_POLICY_IDENTITY
         or value["endpoint_order_rule"] != FIXED_ROOT_ENDPOINT_ORDER_RULE
+        or value["endpoint_transition_rule"]
+        != FIXED_ROOT_ENDPOINT_TRANSITION_RULE
         or value["horizon_geometry_rule"] != FIXED_ROOT_HORIZON_GEOMETRY_RULE
         or value["infinity_geometry_rule"] != FIXED_ROOT_INFINITY_GEOMETRY_RULE
     ):
@@ -2974,7 +2979,7 @@ _ENDPOINT_ATTEMPT_FIELDS = {
     "maximum_recurrence_digits_lost",
     "maximum_series_evaluation_digits_lost", "predicted_reliable_digits",
     "required_reliable_digits", "candidate_limitation",
-    "selected_intervention", "result",
+    "selected_intervention", "result", "terminal",
 }
 _ENDPOINT_RECEIPT_FIELDS = {
     "schema", "endpoint_branch", "recovery_policy_identity",
@@ -3382,12 +3387,14 @@ def _validated_endpoint_recovery_receipt(
                 "ARITHMETIC_INADEQUATE", True,
             )
         elif limitation == ENDPOINT_SERIES_ORDER_LIMITED:
-            exhausted = order_index == len(orders) - 1
-            expected = (
-                "NONE" if exhausted else "INCREASE_ENDPOINT_ORDER",
-                "ORDER_EXHAUSTED" if exhausted else "RETRY",
-                exhausted,
-            )
+            order_exhausted = order_index == len(orders) - 1
+            geometry_exhausted = geometry_index == len(geometries) - 1
+            if not order_exhausted:
+                expected = ("INCREASE_ENDPOINT_ORDER", "RETRY", False)
+            elif not geometry_exhausted:
+                expected = ("DEEPEN_ENDPOINT_GEOMETRY", "RETRY", False)
+            else:
+                expected = ("NONE", "RECOVERY_EXHAUSTED", True)
         else:
             exhausted = geometry_index == len(geometries) - 1
             expected = (
@@ -3398,11 +3405,16 @@ def _validated_endpoint_recovery_receipt(
         if (
             attempt["selected_intervention"] != expected[0]
             or attempt["result"] != expected[1]
+            or type(attempt["terminal"]) is not bool
+            or attempt["terminal"] is not terminal
             or terminal is not expected[2]
         ):
             raise ValueError("exterior endpoint recovery intervention is invalid")
         if not terminal:
-            if limitation == ENDPOINT_SERIES_ORDER_LIMITED:
+            if (
+                limitation == ENDPOINT_SERIES_ORDER_LIMITED
+                and order_index < len(orders) - 1
+            ):
                 order_index += 1
             else:
                 geometry_index += 1

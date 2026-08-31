@@ -677,7 +677,7 @@ class OperationControlTests(unittest.TestCase):
                 "FINITE_DIFFERENCE_NOISE_LIMIT",
                 "DETERMINANT_UNCERTAINTY_TOO_LARGE",
             }) | {
-                "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE",
+                "EXTERIOR_ENDPOINT_RECOVERY_EXHAUSTED",
                 "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED",
                 "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
             },
@@ -690,7 +690,7 @@ class OperationControlTests(unittest.TestCase):
         }
         self.assertEqual(
             fixed_codes - {
-                "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE",
+                "EXTERIOR_ENDPOINT_RECOVERY_EXHAUSTED",
                 "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED",
                 "EXTERIOR_ENDPOINT_ARITHMETIC_INADEQUATE",
             },
