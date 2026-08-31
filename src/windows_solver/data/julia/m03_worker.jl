@@ -94,7 +94,10 @@ end
 function production_blockers(policy)
     conventions = required(policy, "conventions")
     blockers = String[]
-    for name in ("co_mode", "residue", "branch_classification")
+    thresholds = required(policy, "validation_thresholds")
+    required(thresholds, "review_state") == "FROZEN" ||
+        push!(blockers, "validation_thresholds:" * string(required(thresholds, "required_decision")))
+    for name in ("right_state", "co_mode", "residue", "branch_classification")
         convention = required(conventions, name)
         required(convention, "review_state") == "FROZEN" ||
             push!(blockers, name * ":" * string(required(convention, "required_decision")))

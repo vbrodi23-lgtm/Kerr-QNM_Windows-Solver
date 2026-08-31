@@ -116,14 +116,32 @@ def validate_m03_selection(value: Mapping[str, object]) -> dict[str, object]:
     ):
         raise ValueError("M03 precision policy violates the BF40/BF80 contract")
     thresholds = _mapping(value["validation_thresholds"], "M03 validation thresholds")
-    if set(thresholds) != {"right_state", "co_mode", "pairing", "residue_projector"}:
+    if set(thresholds) != {
+        "review_state",
+        "required_decision",
+        "right_state",
+        "co_mode",
+        "pairing",
+        "residue_projector",
+    }:
         raise ValueError("M03 validation threshold categories are invalid")
-    for category, entries in thresholds.items():
+    threshold_reviewed = thresholds["review_state"] == "FROZEN"
+    if thresholds["review_state"] not in {"FROZEN", "BLOCKED_HUMAN_NUMERICAL_REVIEW"}:
+        raise ValueError("M03 validation threshold review state is invalid")
+    if not isinstance(thresholds["required_decision"], str) or not thresholds["required_decision"]:
+        raise ValueError("M03 validation threshold review decision is invalid")
+    for category in ("right_state", "co_mode", "pairing", "residue_projector"):
+        entries = thresholds[category]
         entries = _mapping(entries, f"M03 {category} thresholds")
         if not entries:
             raise ValueError(f"M03 {category} thresholds are empty")
         for name, threshold in entries.items():
-            _positive_decimal_text(threshold, f"M03 threshold {category}.{name}")
+            if threshold_reviewed:
+                _positive_decimal_text(threshold, f"M03 threshold {category}.{name}")
+            elif threshold is not None:
+                raise ValueError(
+                    f"unreviewed M03 threshold {category}.{name} must be null"
+                )
     process = _mapping(value["process_policy"], "M03 process policy")
     if (
         process.get("worker_count") != 1
@@ -152,7 +170,10 @@ def production_blockers(value: Mapping[str, object]) -> tuple[str, ...]:
     selection = validate_m03_selection(value)
     conventions = selection["conventions"]
     blockers: list[str] = []
-    for name in ("co_mode", "residue", "branch_classification"):
+    thresholds = selection["validation_thresholds"]
+    if thresholds["review_state"] != "FROZEN":
+        blockers.append(f"validation_thresholds:{thresholds['required_decision']}")
+    for name in ("right_state", "co_mode", "residue", "branch_classification"):
         item = conventions[name]
         if item["review_state"] != "FROZEN":
             blockers.append(f"{name}:{item['required_decision']}")
