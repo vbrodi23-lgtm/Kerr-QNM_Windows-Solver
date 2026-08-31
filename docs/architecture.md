@@ -1711,3 +1711,136 @@ how recovery differs from execution
 how the dashboard and reports derive state
 what is required before public admission
 ```
+
+---
+
+## 41. M03 main-body wiring contract
+
+This section is normative for the M03 spectral-state engine. It preserves the
+global ownership rule: Python owns campaign control and authoritative campaign
+state; one persistent Julia engine owns the M03 scientific calculations and
+scientific artifact production. M02 spectral identities are immutable inputs.
+
+| Layer / stage | Input | Operation | Output / state | Owner |
+|---|---|---|---|---|
+| **Python control plane** |  |  |  |  |
+| Startup | `m03.ps1` / M03 selection file | Load configuration; locate the sealed M02→M03 handoff; validate runtime and environment | Valid M03 startup context | Python |
+| M02 handoff ingest | Sealed `m02-m03-handoff.json` derived from completed M02 terminal and admission evidence | Read and authenticate 48 root seeds; verify schema, hashes, root identities, `ω`, `A`, lineage and provenance | Immutable 48-root M03 seed set | Python |
+| Plan build | 48 authenticated root seeds + M03 selection/policy | Deduplicate by root identity; map modes and branches; classify Primary / Control / Deep; assign initial precision policy; construct dependencies | 48-node execution plan over 11 branches | Python |
+| Checkpoint init / resume | Execution plan + existing checkpoint if present | Create or recover the node table, status table, evidence registry and settings lock | Authoritative M03 checkpoint | Python |
+| Julia engine launch | Execution plan + runtime settings | Start one persistent Julia numerical worker; establish JSON-RPC/stdio IPC; pass paths and settings | Live Julia numerical engine | Python → Julia |
+| Runtime orchestration | Julia events and receipts | Monitor progress, logs, worker health and backpressure; authenticate receipts and commit authoritative checkpoint transitions | Status, dashboard, receipts and checkpoint state | Python |
+| **IPC boundary** |  |  |  |  |
+| Request channel | One authenticated node request | Send exact root identity, `(ℓ,m,n)`, spin, `ω`, `A`, background identity, role, precision policy and output path | Julia receives immutable node specification | Python → Julia |
+| Response channel | Julia stage and node events | Return progress, evidence, status, artifact references and a terminal receipt while echoing authoritative request identities | Python control state updated after authentication | Julia → Python |
+| **Julia numerical core — per node** |  |  |  |  |
+| Node ingest | One M02 root seed | Read exact mode key, branch/polarization, spin, `ω`, `A`, lineage, role and provenance | Frozen numerical node identity | Julia |
+| Kerr background setup | Frozen spin + `ω` + `A` | Construct Kerr quantities: `r₊`, `r₋`, `Ω_H`, `κ`, `p_H`, tortoise/maps and numerical caches | Reusable background object | Julia |
+| Right-state construction | Background + fixed `ω`,`A` | Compute angular `S(θ)` and radial QNM field `R(r)` at the already-authenticated eigenvalue; enforce QNM boundary conditions and normalization | Right spectral state | Julia |
+| Right-state validation | Right state | Residual, endpoint/boundary, Wronskian, resolution and representation checks | Accepted / promote / unresolved | Julia |
+| Co-mode construction | Same frozen pole/background | Solve the canonical transpose/dual spectral problem; compute dual angular and radial state; apply the declared normalization | Canonical co-mode state | Julia |
+| Co-mode validation | Co-mode state | Dual residual, boundary, normalization and consistency checks | Accepted / promote / unresolved | Julia |
+| Pairing / denominator | Right state + co-mode + M02 derivative evidence where valid | Compute `dₙ = <αₙ, ∂ωF(ωₙ)vₙ>`; reuse authenticated M02 `Dω` only where mathematical identity is proved | Simple-pole denominator + evidence | Julia |
+| Simple-pole gate | Pairing + local spectral evidence | Verify non-zero pairing, an isolated pole and one-dimensional right/dual kernels | `SIMPLE_POLE` or explicit unresolved state | Julia |
+| Residue / projector | Right state + co-mode + denominator | Compute the normalization-invariant local pole object `Πₙ = vₙ ⊗ αₙ / dₙ` | Residue / spectral projector | Julia |
+| Carrier/representation binding | GSN numerical carrier + spectral state | Bind the numerical GSN state to the physical Teukolsky representation with an authenticated transform receipt | Physical Teukolsky spectral state | Julia |
+| Node finalization | All accepted node components | Assemble node metadata, fields, co-mode, pairing, residue/projector, precision, evidence and provenance | Complete `SpectralState` object | Julia |
+| Durable node write | Finalized node | Atomically write field payloads, metadata and evidence before reduction | Persistent node artifact | Julia |
+| Node checkpoint | Sealed Julia terminal receipt + durable node artifact | Authenticate echoed identities, receipt and artifact hashes; mark the node completed, promoted or unresolved | Resume-safe authoritative checkpoint transition | Python |
+| **Precision policy** |  |  |  |  |
+| Primary / Control node start | Direct-spin state | Start promoted field calculation at BF40 | BF40 candidate state | Julia |
+| Deep node start | Ultra-near-extremal state | Start directly at BF80 | BF80 candidate state | Julia |
+| Precision promotion | Failed stability or accuracy gate | Promote BF40→BF80 when residuals, pairing, Wronskian, representation or resolution evidence is insufficient | Higher-precision repeat of the same node identity | Julia |
+| BF80 insufficiency | Failed BF80 validation gate | Preserve evidence and terminate the node as `UNRESOLVED`; do not silently escalate to BF120 | Explicit scientific unresolved state | Julia |
+| Binary64 | Metadata / planning only | May be used for indexing, control and cheap algebra; never accepted as the canonical M03 scientific field tier | No Binary64 spectral-state admission | Python / Julia |
+| **Node-to-node continuation** |  |  |  |  |
+| Branch gather | Nodes sharing an authenticated M02 continuation identity | Preserve authenticated `chain_position` order; use raw spin sorting only as a consistency check | Ordered branch node list | Python |
+| First node on branch | M02 root seed with no completed M03 predecessor | Construct state from frozen M02 `ω`,`A` using generic field initialization | First authenticated spectral state | Julia |
+| Next-node initialization | Previous completed M03 node + next frozen M02 root | Reuse previous right-field/co-mode shapes, basis information, normalization orientation and numerical settings as initial guesses; **do not reuse or modify its eigenvalue** | Warm-start candidate for next root | Julia |
+| Fixed-root continuation solve | Warm start + next node's frozen `ω`,`A` | Deform the previous state to the next Kerr background while keeping the M02 pole identity fixed | Right/co-mode state for the next node | Julia |
+| Continuation consistency | Previous node + current node | Measure field overlap, smoothness, branch continuity, normalization transport and anomaly diagnostics | Authenticated predecessor→successor link | Julia |
+| Branch anomaly gate | Continuation diagnostics | Flag branch ambiguity, loss of overlap, near-degeneracy or possible DM/ZDM transition | Continue / promote precision / `UNRESOLVED` | Julia |
+| Repeat | Accepted current node | Current node becomes the warm start for the next node in the same branch | Sequential continuation through the branch | Julia |
+| **Branch reduction — 11 branches** |  |  |  |  |
+| Branch analysis | All terminal states in one mode branch | Analyse convergence, drift, smoothness, pairing/residue evolution and near-extremal behaviour | Branch metrics | Julia |
+| Branch classification | Branch metrics + M02 lineage | Classify DM / ZDM / ambiguous / unresolved where evidence permits | Branch classification | Julia |
+| Branch summary | Ordered node states + metrics | Assemble genealogy, node references, classifications, diagnostics and evidence links | `BranchSummary` artifact | Julia |
+| Branch finalization | Branch summary | Atomically persist the branch object and evidence | Durable branch record | Julia |
+| **Work queues** |  |  |  |  |
+| Priority queue | Planned runnable nodes | Select the next node whose predecessor and dependencies are satisfied | Next runnable node | Python |
+| Running set | In-flight node | Track the single active calculation | Running state | Python |
+| Blocked queue | Dependency not yet satisfied | Wait for the predecessor or required evidence | Blocked state | Python |
+| Review-blocked queue | Scientific or manual review required | Hold without corrupting campaign progress | Review-required state | Python |
+| Completed set | Terminal nodes | Exclude authenticated completed nodes from numerical replay | Zero-work reusable state | Python |
+| **Persistent storage** |  |  |  |  |
+| Node store | One node | Store right/co-mode fields, pairing, residue/projector, evidence and metadata | One durable spectral-state record | Julia |
+| Evidence store | Every validation stage | Store residuals, Wronskians, convergence, promotion and threshold evidence | Auditable evidence bundle | Julia |
+| Checkpoint store | Campaign state + authenticated Julia receipts | Store node table, statuses, settings lock, counters and artifact paths | Authoritative resume state | Python |
+| Branch store | Completed branches | Store genealogy, metrics and classifications | 11 branch summaries | Julia |
+| Log store | Runtime and scientific events | Keep protocol stdout machine-readable; route human diagnostics through stderr and Python projections | Operational diagnostics | Julia / Python |
+| Artifact store | Large numerical payloads | Store field coefficients/samples, representation data and caches in content-addressed form | Binary scientific payloads with authenticated manifests | Julia |
+| **Campaign reduction / completion** |  |  |  |  |
+| Node campaign domain | Frozen M02 handoff | Plan `28 Primary + 8 Control + 12 Deep` | **48 spectral-state nodes** | Python |
+| Branch domain | 48 nodes grouped by authenticated continuation identity | Ordered continuation and reduction | **11 authenticated branches** | Julia |
+| Numerical workload | Each node | Right-state solve + co-mode solve; residue/projector is derived from retained states | Approximately 96 major field solves before precision promotions | Julia |
+| Final checkpoint | 48 terminal node receipts + 11 branch records | Authenticate terminal artifacts and freeze the state table and hashes | Terminal M03 checkpoint | Python |
+| Checkpoint-only reduction | Terminal checkpoint | Validate inventory, conservation, branch coverage and evidence with zero root, angular, radial or co-mode solves and zero Julia launches | Verified terminal M03 package + completion receipt | Python |
+| Provider admission | Verified terminal package + frozen admission policy | Verify that produced evidence satisfies the governing contract; only this path may mark evidence `ADMITTED` | Admitted M03 provider package + admission receipt | Python |
+
+### 41.1 Node-to-node mechanical flow
+
+```text
+M02 frozen root₁
+      │
+      ▼
+[right₁ + co-mode₁ + residue₁]
+      │
+      │ use fields as warm-start shapes only
+      │
+      ▼
+M02 frozen root₂ ──► [right₂ + co-mode₂ + residue₂]
+      │
+      │
+      ▼
+M02 frozen root₃ ──► [right₃ + co-mode₃ + residue₃]
+      │
+     ...
+      │
+      ▼
+M02 frozen rootₙ ──► [rightₙ + co-modeₙ + residueₙ]
+      │
+      ▼
+[ordered branch genealogy + DM/ZDM/ambiguous/unresolved classification]
+```
+
+> **Critical rule:** The previous M03 node supplies the next node's **field
+> initial guess**. The next node's `ω`, `A`, spin and root identity always come
+> from frozen M02. Continuation must never become a new QNM root solve.
+
+### 41.2 Mechanical ownership
+
+Python owns:
+
+- startup;
+- M02 handoff authentication and reduction;
+- plan construction and runnable-node selection;
+- process orchestration and restart;
+- authoritative checkpoint administration;
+- checkpoint-only terminal reduction;
+- provider admission and reporting.
+
+One persistent Julia engine owns:
+
+- all 48 spectral-state node calculations;
+- right-state construction;
+- co-mode construction;
+- simple-pole pairing;
+- residue/projector construction;
+- node-to-node field continuation;
+- branch analysis, reduction and classification;
+- scientific artifact writes and sealed scientific receipts.
+
+This keeps the M03 production body mechanically simple: Python establishes and
+authenticates the campaign, then schedules one active node at a time through one
+persistent Julia scientific engine. Python admits only authenticated Julia
+receipts and retained artifacts into the 48-node / 11-branch terminal package.
