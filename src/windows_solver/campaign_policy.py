@@ -2278,6 +2278,13 @@ _FIXED_ROOT_ENDPOINT_RECOVERY_LEGACY_IDENTITY = (
 _FIXED_ROOT_ENDPOINT_RECOVERY_REAL_INNER_IDENTITY = (
     "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2"
 )
+_FIXED_ROOT_ENDPOINT_RECOVERY_TWO_DIMENSIONAL_IDENTITY = (
+    "cause-aware-real-inner-order-geometry-fixed-root-exterior-endpoint-recovery/v3"
+)
+_FIXED_ROOT_ENDPOINT_RECOVERY_TWO_DIMENSIONAL_SCHEMA = (
+    "windows-solver.fixed-root-endpoint-recovery-policy/2"
+)
+_FIXED_ROOT_ENDPOINT_TRANSITION_RULE = "bounded-order-then-geometry-grid/v1"
 _FIXED_ROOT_REAL_INNER_HORIZON_SCHEDULE = [
     "-10", "-25", "-50", "-75", "-100", "-150", "-225", "-337.5",
     "-400",
@@ -2307,6 +2314,74 @@ def _fixed_root_legacy_endpoint_policy(
             if found is not None:
                 return found
     return None
+
+
+def _fixed_root_real_inner_v2_endpoint_policy(
+    value: object,
+) -> Mapping[str, object] | None:
+    if isinstance(value, Mapping):
+        if value.get("identity") == _FIXED_ROOT_ENDPOINT_RECOVERY_REAL_INNER_IDENTITY:
+            return value
+        for item in value.values():
+            found = _fixed_root_real_inner_v2_endpoint_policy(item)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _fixed_root_real_inner_v2_endpoint_policy(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _contains_premature_endpoint_order_exhaustion(value: object) -> bool:
+    """Identify v2 evidence that terminalised before unused geometry."""
+
+    if isinstance(value, Mapping):
+        if value.get("failure_code") == "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE":
+            return True
+        if value.get("reason") == "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE":
+            return True
+        if (
+            value.get("schema")
+            == "windows-solver.exterior-endpoint-recovery-receipt/1"
+            and value.get("endpoint_branch") == "infinity-outgoing"
+            and value.get("recovery_policy_identity")
+            == _FIXED_ROOT_ENDPOINT_RECOVERY_REAL_INNER_IDENTITY
+            and value.get("candidate_limitation") == "insufficient-series-order/v1"
+        ):
+            schedule = value.get("candidate_geometry_schedule")
+            attempts = value.get("attempts")
+            if (
+                isinstance(schedule, list)
+                and len(schedule) > 1
+                and isinstance(attempts, list)
+                and attempts
+                and value.get("terminal_geometry") != schedule[-1]
+                and isinstance(attempts[-1], Mapping)
+                and attempts[-1].get("result") == "ORDER_EXHAUSTED"
+            ):
+                return True
+        return any(
+            _contains_premature_endpoint_order_exhaustion(item)
+            for item in value.values()
+        )
+    if isinstance(value, list):
+        return any(_contains_premature_endpoint_order_exhaustion(item) for item in value)
+    return False
+
+
+def _contains_authenticated_value(value: object, expected: object) -> bool:
+    if value == expected:
+        return True
+    if isinstance(value, Mapping):
+        return any(
+            _contains_authenticated_value(item, expected)
+            for item in value.values()
+        )
+    if isinstance(value, list):
+        return any(_contains_authenticated_value(item, expected) for item in value)
+    return False
 
 
 def _replacement_fixed_root_endpoint_policy(
@@ -2381,8 +2456,76 @@ def _replacement_fixed_root_endpoint_policy(
     return {**replacement, "policy_sha256": _sha256(replacement)}
 
 
+def _replacement_two_dimensional_endpoint_policy(
+    source: Mapping[str, object],
+) -> dict[str, object]:
+    """Return the v3 order × geometry policy for authenticated v1/v2 input."""
+
+    identity = source.get("identity")
+    if identity == _FIXED_ROOT_ENDPOINT_RECOVERY_LEGACY_IDENTITY:
+        v2 = _replacement_fixed_root_endpoint_policy(source)
+    elif identity == _FIXED_ROOT_ENDPOINT_RECOVERY_REAL_INNER_IDENTITY:
+        binding = {
+            name: item for name, item in source.items() if name != "policy_sha256"
+        }
+        fields = {
+            "schema", "identity", "endpoint_order_rule", "base_endpoint_order",
+            "generated_maximum_order", "endpoint_order_schedule",
+            "horizon_geometry_rule", "horizon_geometry_schedule",
+            "horizon_rho_inner_min", "horizon_endpoint_rho_floor",
+            "horizon_maximum_endpoint_distance", "infinity_geometry_rule",
+            "infinity_geometry_schedule", "fixed_root_reliability_target_abs",
+            "fixed_root_reliability_rule", "required_digit_guard",
+            "precision_digits", "semantic_precision_tier",
+        }
+        digits = binding.get("precision_digits")
+        if (
+            set(binding) != fields
+            or source.get("policy_sha256") != _sha256(binding)
+            or binding.get("schema")
+            != "windows-solver.fixed-root-endpoint-recovery-policy/1"
+            or binding.get("identity")
+            != _FIXED_ROOT_ENDPOINT_RECOVERY_REAL_INNER_IDENTITY
+            or binding.get("endpoint_order_rule") != "bounded-doubling-prefix/v1"
+            or binding.get("base_endpoint_order") != 28
+            or binding.get("generated_maximum_order") != 112
+            or binding.get("endpoint_order_schedule") != [28, 56, 112]
+            or binding.get("horizon_geometry_rule")
+            != "bounded-real-inner-tortoise-depth/v1"
+            or binding.get("horizon_geometry_schedule")
+            != _FIXED_ROOT_REAL_INNER_HORIZON_SCHEDULE
+            or binding.get("horizon_rho_inner_min") != "-400"
+            or binding.get("horizon_endpoint_rho_floor") != "-400"
+            or binding.get("horizon_maximum_endpoint_distance") != "0.1"
+            or binding.get("infinity_geometry_rule")
+            != "bounded-positive-rho-depth/v1"
+            or binding.get("infinity_geometry_schedule")
+            != _FIXED_ROOT_INFINITY_SCHEDULE
+            or binding.get("fixed_root_reliability_target_abs") != "2e-11"
+            or binding.get("fixed_root_reliability_rule")
+            != "minus-log10-target-plus-required-digit-guard/v1"
+            or binding.get("required_digit_guard") != 6
+            or digits not in (40, 80)
+            or binding.get("semantic_precision_tier") != f"bigfloat-{digits}"
+        ):
+            raise ValueError("fixed-root v2 endpoint policy semantics are invalid")
+        v2 = copy.deepcopy(dict(source))
+    else:
+        raise ValueError("fixed-root endpoint migration source identity is invalid")
+
+    replacement = {
+        name: item for name, item in v2.items() if name != "policy_sha256"
+    }
+    replacement["schema"] = _FIXED_ROOT_ENDPOINT_RECOVERY_TWO_DIMENSIONAL_SCHEMA
+    replacement["identity"] = _FIXED_ROOT_ENDPOINT_RECOVERY_TWO_DIMENSIONAL_IDENTITY
+    replacement["endpoint_transition_rule"] = _FIXED_ROOT_ENDPOINT_TRANSITION_RULE
+    return {**replacement, "policy_sha256": _sha256(replacement)}
+
+
 def _migrate_fixed_root_v2_forensic_history(
     result: dict[str, object],
+    *,
+    endpoint_recovery_migration: bool = False,
 ) -> None:
     """Retire incompatible exterior authority without replaying upstream work."""
 
@@ -2391,6 +2534,9 @@ def _migrate_fixed_root_v2_forensic_history(
     forensic = result.get("forensic_fixed_root_v2_history")
     pass_ledgers = result.get("survey_pass_ledger")
     backgrounds = result.get("promoted_background_ledger")
+    evidence_ledger = result.get("evidence_ledger")
+    records = result.get("records")
+    attempts = result.get("attempts")
     if (
         not isinstance(queue, Mapping)
         or not isinstance(queue.get("entries"), list)
@@ -2399,6 +2545,9 @@ def _migrate_fixed_root_v2_forensic_history(
         or not isinstance(pass_ledgers, Mapping)
         or not isinstance(pass_ledgers.get("promoted"), dict)
         or not isinstance(backgrounds, dict)
+        or not isinstance(evidence_ledger, dict)
+        or not isinstance(records, list)
+        or not isinstance(attempts, list)
     ):
         return
     entries = queue["entries"]
@@ -2412,7 +2561,16 @@ def _migrate_fixed_root_v2_forensic_history(
         entry = entries[ordinal]
         for leaf_id in list(bucket):
             stage = bucket.get(leaf_id)
-            source_endpoint_policy = _fixed_root_legacy_endpoint_policy(stage)
+            legacy_endpoint_policy = _fixed_root_legacy_endpoint_policy(stage)
+            v2_endpoint_policy = _fixed_root_real_inner_v2_endpoint_policy(stage)
+            source_endpoint_policy = legacy_endpoint_policy
+            if (
+                endpoint_recovery_migration
+                and source_endpoint_policy is None
+                and v2_endpoint_policy is not None
+                and _contains_premature_endpoint_order_exhaustion(stage)
+            ):
+                source_endpoint_policy = v2_endpoint_policy
             if (
                 not isinstance(stage, Mapping)
                 or (
@@ -2439,19 +2597,100 @@ def _migrate_fixed_root_v2_forensic_history(
                 if not background_bucket:
                     backgrounds.pop(ordinal_key, None)
             replacement_endpoint_policy = (
-                _replacement_fixed_root_endpoint_policy(source_endpoint_policy)
+                (
+                    _replacement_two_dimensional_endpoint_policy(
+                        source_endpoint_policy
+                    )
+                    if endpoint_recovery_migration
+                    else _replacement_fixed_root_endpoint_policy(
+                        source_endpoint_policy
+                    )
+                )
                 if source_endpoint_policy is not None
                 else None
             )
+            source_identity = (
+                None
+                if source_endpoint_policy is None
+                else source_endpoint_policy.get("identity")
+            )
+            source_evidence = (
+                evidence_ledger.get(leaf_id)
+                if endpoint_recovery_migration
+                else None
+            )
+            if not (
+                isinstance(source_evidence, Mapping)
+                and (
+                    source_evidence.get("central_stage_sha256") == stage_sha256
+                    or (
+                        source_identity is not None
+                        and _contains_authenticated_value(
+                            source_evidence, source_identity
+                        )
+                    )
+                    or _contains_premature_endpoint_order_exhaustion(
+                        source_evidence
+                    )
+                )
+            ):
+                source_evidence = None
+            else:
+                evidence_ledger.pop(leaf_id)
+            source_records = [
+                copy.deepcopy(dict(record))
+                for record in records
+                if endpoint_recovery_migration
+                and isinstance(record, Mapping)
+                and record.get("leaf_id") == leaf_id
+                and (
+                    _contains_authenticated_value(record, stage_sha256)
+                    or (
+                        source_identity is not None
+                        and _contains_authenticated_value(record, source_identity)
+                    )
+                    or _contains_premature_endpoint_order_exhaustion(record)
+                )
+            ]
+            if source_records:
+                records[:] = [
+                    record for record in records if record not in source_records
+                ]
+            source_attempts = [
+                copy.deepcopy(dict(attempt))
+                for attempt in attempts
+                if endpoint_recovery_migration
+                and isinstance(attempt, Mapping)
+                and attempt.get("leaf_id") == leaf_id
+                and (
+                    (
+                        source_identity is not None
+                        and _contains_authenticated_value(attempt, source_identity)
+                    )
+                    or _contains_premature_endpoint_order_exhaustion(attempt)
+                )
+            ]
+            if source_attempts:
+                attempts[:] = [
+                    attempt for attempt in attempts if attempt not in source_attempts
+                ]
             history_content = {
                 "schema": (
-                    "windows-solver.fixed-root-endpoint-forensic-history/2"
+                    (
+                        "windows-solver.fixed-root-endpoint-forensic-history/3"
+                        if endpoint_recovery_migration
+                        else "windows-solver.fixed-root-endpoint-forensic-history/2"
+                    )
                     if replacement_endpoint_policy is not None
                     else "windows-solver.fixed-root-v2-forensic-history/1"
                 ),
                 "authority": "FORENSIC_ONLY",
                 "migration_reason": (
-                    "FIXED_ROOT_REAL_INNER_ENDPOINT_RECOVERY_REQUIRED"
+                    (
+                        "FIXED_ROOT_TWO_DIMENSIONAL_ENDPOINT_RECOVERY_REQUIRED"
+                        if endpoint_recovery_migration
+                        else "FIXED_ROOT_REAL_INNER_ENDPOINT_RECOVERY_REQUIRED"
+                    )
                     if replacement_endpoint_policy is not None
                     else "FIXED_ROOT_ENDPOINT_RECOVERY_V3_REQUIRED"
                 ),
@@ -2465,11 +2704,15 @@ def _migrate_fixed_root_v2_forensic_history(
             if replacement_endpoint_policy is not None:
                 history_content.update({
                     "source_recovery_policy_identity":
-                        _FIXED_ROOT_ENDPOINT_RECOVERY_LEGACY_IDENTITY,
+                        source_endpoint_policy["identity"],
                     "source_recovery_policy_sha256":
                         source_endpoint_policy["policy_sha256"],
                     "replacement_recovery_policy_identity":
-                        _FIXED_ROOT_ENDPOINT_RECOVERY_REAL_INNER_IDENTITY,
+                        (
+                            _FIXED_ROOT_ENDPOINT_RECOVERY_TWO_DIMENSIONAL_IDENTITY
+                            if endpoint_recovery_migration
+                            else _FIXED_ROOT_ENDPOINT_RECOVERY_REAL_INNER_IDENTITY
+                        ),
                     "replacement_recovery_policy_sha256":
                         replacement_endpoint_policy["policy_sha256"],
                     "replacement_recovery_policy":
@@ -2481,10 +2724,15 @@ def _migrate_fixed_root_v2_forensic_history(
                         "sample_calls": 0,
                     },
                 })
+                if endpoint_recovery_migration:
+                    history_content.update({
+                        "source_current_evidence": copy.deepcopy(source_evidence),
+                        "source_current_records": source_records,
+                        "source_execution_attempts": source_attempts,
+                    })
             history_content["history_sha256"] = _sha256(history_content)
             forensic[f"{ordinal}:{leaf_id}"] = history_content
             bucket.pop(leaf_id)
-            entry["minimum_requested_tier"] = "BF40"
             entry["disposition"] = PromotionQueueDisposition.PENDING.value
             entry["disposition_receipt_sha256"] = None
             entry["retained_promoted_stage_sha256"] = None
@@ -2534,6 +2782,8 @@ def _migrate_fixed_root_v2_forensic_history(
 
 def validate_schema11_checkpoint(
     value: Mapping[str, object],
+    *,
+    endpoint_recovery_migration: bool = False,
 ) -> dict[str, object]:
     if not isinstance(value, Mapping) or set(value) not in {
         frozenset(_SCHEMA11_BASE_FIELDS),
@@ -2549,7 +2799,10 @@ def validate_schema11_checkpoint(
         result["forensic_fixed_root_v2_history"] = {}
     if result["schema_version"] != CAMPAIGN_CHECKPOINT_SCHEMA_VERSION:
         raise ValueError("campaign checkpoint is not schema 11")
-    _migrate_fixed_root_v2_forensic_history(result)
+    _migrate_fixed_root_v2_forensic_history(
+        result,
+        endpoint_recovery_migration=endpoint_recovery_migration,
+    )
     if not isinstance(result["campaign_id"], str) or not result["campaign_id"]:
         raise ValueError("schema-11 campaign_id is invalid")
     if not isinstance(result["selection_id"], str) or not result["selection_id"]:
@@ -3058,7 +3311,15 @@ def validate_schema11_checkpoint(
             "replacement_recovery_policy",
             "numerical_migration_work",
         }
+        current_endpoint_fields = endpoint_fields | {
+            "source_current_evidence",
+            "source_current_records",
+            "source_execution_attempts",
+        }
         source_endpoint_policy = _fixed_root_legacy_endpoint_policy(
+            history.get("source_stage") if isinstance(history, Mapping) else None
+        )
+        v2_source_endpoint_policy = _fixed_root_real_inner_v2_endpoint_policy(
             history.get("source_stage") if isinstance(history, Mapping) else None
         )
         endpoint_valid = False
@@ -3088,7 +3349,52 @@ def validate_schema11_checkpoint(
                     "sample_calls": 0,
                 }
             )
-        if not legacy_valid and not endpoint_valid:
+        current_source_endpoint_policy = (
+            source_endpoint_policy
+            if source_endpoint_policy is not None
+            else v2_source_endpoint_policy
+        )
+        current_endpoint_valid = False
+        if common_valid and current_source_endpoint_policy is not None:
+            replacement = _replacement_two_dimensional_endpoint_policy(
+                current_source_endpoint_policy
+            )
+            current_endpoint_valid = (
+                set(history) == current_endpoint_fields
+                and (
+                    current_source_endpoint_policy.get("identity")
+                    == _FIXED_ROOT_ENDPOINT_RECOVERY_LEGACY_IDENTITY
+                    or _contains_premature_endpoint_order_exhaustion(
+                        history.get("source_stage")
+                    )
+                )
+                and history.get("schema")
+                == "windows-solver.fixed-root-endpoint-forensic-history/3"
+                and history.get("migration_reason")
+                == "FIXED_ROOT_TWO_DIMENSIONAL_ENDPOINT_RECOVERY_REQUIRED"
+                and history.get("source_recovery_policy_identity")
+                == current_source_endpoint_policy.get("identity")
+                and history.get("source_recovery_policy_sha256")
+                == current_source_endpoint_policy.get("policy_sha256")
+                and history.get("replacement_recovery_policy_identity")
+                == _FIXED_ROOT_ENDPOINT_RECOVERY_TWO_DIMENSIONAL_IDENTITY
+                and history.get("replacement_recovery_policy_sha256")
+                == replacement["policy_sha256"]
+                and history.get("replacement_recovery_policy") == replacement
+                and (
+                    history.get("source_current_evidence") is None
+                    or isinstance(history.get("source_current_evidence"), Mapping)
+                )
+                and isinstance(history.get("source_current_records"), list)
+                and isinstance(history.get("source_execution_attempts"), list)
+                and history.get("numerical_migration_work") == {
+                    "root_solves": 0,
+                    "determinant_calls": 0,
+                    "ode_calls": 0,
+                    "sample_calls": 0,
+                }
+            )
+        if not legacy_valid and not endpoint_valid and not current_endpoint_valid:
             raise ValueError("schema-11 fixed-root forensic history is invalid")
     report = result["report_status_receipt"]
     if report is not None and not isinstance(report, Mapping):

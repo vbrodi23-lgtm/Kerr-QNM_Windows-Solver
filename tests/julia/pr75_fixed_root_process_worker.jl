@@ -28,9 +28,11 @@ function deterministic_process_conditioning(
     recovery_policy = required(
         request, "fixed_root_endpoint_recovery_policy"
     )
-    endpoint_receipts = deterministic_endpoint_receipts(
-        T, request, CF.ENDPOINT_ADEQUATE
-    )
+    endpoint_receipts = if PROCESS_FIXTURE_OUTCOME == "recovery-grid"
+        deterministic_order_geometry_endpoint_receipts(T, request)
+    else
+        deterministic_endpoint_receipts(T, request, CF.ENDPOINT_ADEQUATE)
+    end
     return Dict{String,Any}(
         "schema" => FIXED_ROOT_SURVEY_CONDITIONING_SCHEMA,
         "fixed_root_reliability_target_abs" => string(required(
@@ -78,7 +80,7 @@ function production_fixed_root_survey_sample_fields(
     ::Type{T}, request, _fixed_root::Complex{T}, _omega::Complex{T},
     _amplitude::Complex{T}, _role::String, digits::Int,
 ) where {T<:AbstractFloat}
-    if PROCESS_FIXTURE_OUTCOME == "success"
+    if PROCESS_FIXTURE_OUTCOME in ("success", "recovery-grid")
         index = parse_integer(request, "sample_index")
         return Dict{String,Any}(
             "determinant" => Dict(
@@ -135,7 +137,7 @@ function process_fixture_main()
         error("PR75 process fixture reached the determinant kernel")
     LAST_ODE_SNAPSHOT[] === nothing ||
         error("PR75 process fixture reached an ODE scope")
-    expected_exit = PROCESS_FIXTURE_OUTCOME == "success" ? 0 : 21
+    expected_exit = PROCESS_FIXTURE_OUTCOME in ("success", "recovery-grid") ? 0 : 21
     all(==(expected_exit), worker_exit_codes) ||
         error("PR75 process fixture returned an unexpected worker exit code")
     return expected_exit

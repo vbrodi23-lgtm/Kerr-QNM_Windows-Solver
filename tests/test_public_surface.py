@@ -12,6 +12,28 @@ import tomllib
 import unittest
 
 class PublicSurfaceTests(unittest.TestCase):
+    def test_m02_endpoint_repair_operator_surfaces_are_explicit(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        repair = (root / "m02-repair.ps1").read_text(encoding="utf-8")
+        canary = (
+            root / "M02_Production_Leaf147_Endpoint_Recovery_v3.ps1"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("campaign-migrate-endpoint-recovery", repair)
+        self.assertIn('SurveyPass = "promoted"', repair)
+        self.assertIn("--replace-source", repair)
+        self.assertIn("Get-Sha256", repair)
+        self.assertIn("endpoint-recovery-migrated.json", repair)
+        self.assertIn("output_checkpoint_sha256", repair)
+        self.assertIn(
+            "b-prime-leaf-e6c649ba56795de2c7c4d992fc92652914622017bbd0a0443ab75de34057c1f0",
+            canary,
+        )
+        self.assertIn("windows-solver.exterior-endpoint-recovery-receipt/3", canary)
+        self.assertIn('"112:100"', canary)
+        self.assertIn('"28:250"', canary)
+        self.assertIn('SurveyPass = "full"', canary)
+
     def test_ci_installs_pinned_numerical_test_dependencies_only_as_an_extra(
         self,
     ) -> None:
@@ -1832,6 +1854,9 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "solved-leaf-cache/v1",
             "windows-solver.campaign-recovery/v1",
             "windows-solver.recovery-summary/v1",
+            "windows-solver.m02-endpoint-recovery-migration/1",
+            "windows-solver.m02-endpoint-recovery-migration-entry/1",
+            "authenticated-v2-to-v3-order-geometry-endpoint-recovery/v1",
             "windows-solver.root-readout-recovery-index/v2",
             "windows-solver.promoted-cache-supersession/v1",
             "promoted-policy-preflight/v1",
@@ -1978,6 +2003,7 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "PROMOTED_HORIZON_BOUNDED_COMPONENT_IDENTITY",
             "PROMOTED_HORIZON_BOUNDED_RESPONSE_METHOD",
             "M02_Production_222_A9999_Endpoint_Recovery_v1.ps1",
+            "M02_Production_Leaf147_Endpoint_Recovery_v3.ps1",
             "M02_Production_LightRing_A9999_Response_Recovery_v1.ps1",
             "selective-signed-root-promotion-component/v1/",
             "unavailable/v1",
@@ -1986,12 +2012,17 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "insufficient-geometric-depth/v1",
             "cause-aware-fixed-root-exterior-endpoint-recovery/v1",
             "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2",
+            "cause-aware-real-inner-order-geometry-fixed-root-exterior-endpoint-recovery/v3",
+            "bounded-order-then-geometry-grid/v1",
             "bounded-doubling-prefix/v1",
             "bounded-negative-rho-depth/v1",
             "bounded-real-inner-tortoise-depth/v1",
             "bounded-positive-rho-depth/v1",
             "windows-solver.fixed-root-v2-forensic-history/1",
             "windows-solver.fixed-root-endpoint-forensic-history/2",
+            "windows-solver.fixed-root-endpoint-forensic-history/3",
+            "windows-solver.fixed-root-endpoint-recovery-policy/2",
+            "windows-solver.exterior-endpoint-recovery-receipt/3",
             "windows-solver.exterior-endpoint-recovery-receipt/2",
             "forensic_fixed_root_v2_history",
             "_contains_fixed_root_v2_artifact",

@@ -20,6 +20,7 @@ from .contracts import canonical_json_bytes, load_study
 from .campaign_recovery import (
     RecoverySelection,
     checkpoint_bound_promoted_recovery_selection,
+    migrate_endpoint_recovery_checkpoint_file,
     recover_campaign,
     validate_recovery_checkpoint,
     validate_recovery_receipt,
@@ -347,6 +348,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkpoint", type=Path, required=True
     )
     campaign_recovery_validate.add_argument("--receipt", type=Path)
+    campaign_endpoint_migrate = commands.add_parser(
+        "campaign-migrate-endpoint-recovery",
+        help="supersede defective v2 endpoint evidence without numerical work",
+    )
+    campaign_endpoint_migrate.add_argument("selection", type=Path)
+    campaign_endpoint_migrate.add_argument(
+        "--checkpoint", type=Path, required=True
+    )
+    campaign_endpoint_migrate.add_argument(
+        "--binary64-lock", type=Path, required=True
+    )
+    campaign_endpoint_migrate.add_argument("--output", type=Path, required=True)
+    campaign_endpoint_migrate.add_argument("--receipt", type=Path, required=True)
+    campaign_endpoint_migrate.add_argument("--solved-leaf-store", type=Path)
+    campaign_endpoint_migrate.add_argument(
+        "--replace-source", action="store_true"
+    )
     campaign_lock_binary64 = commands.add_parser(
         "campaign-lock-binary64",
         help="create the deterministic schema-11 binary64 Layer-1 lock",
@@ -1397,6 +1415,93 @@ def _campaign_recovery_validate(
         "result_count": len(checkpoint["records"]),
         "checkpoint_path": str(_resolve_recovery_path(checkpoint_path)),
         "release_admissible": False,
+    }
+
+
+def _campaign_migrate_endpoint_recovery(
+    selection_path: Path,
+    checkpoint_path: Path,
+    binary64_lock_path: Path,
+    output_path: Path,
+    receipt_path: Path,
+    solved_leaf_store_path: Path | None,
+    *,
+    replace_source: bool,
+) -> tuple[int, object]:
+    from .binary64_layer_lock import (
+        load_binary64_layer_lock,
+        validate_binary64_layer_lock,
+    )
+
+    plan, selection, _descriptor = _campaign_plan_and_selection(selection_path)
+    source = _resolve_recovery_path(checkpoint_path)
+    raw_checkpoint = _load_strict_json(source, "schema-11 campaign checkpoint")
+    checkpoint = validate_schema11_checkpoint(raw_checkpoint)
+    recovery_selection = _campaign_recovery_selection(plan, selection)
+    if (
+        checkpoint["campaign_id"] != recovery_selection.campaign_id
+        or checkpoint["selection_id"] != recovery_selection.selection_id
+    ):
+        recovery_selection = checkpoint_bound_promoted_recovery_selection(
+            plan, selection, checkpoint
+        )
+    preflight_campaign_supports(plan, recovery_selection.ordered_leaf_ids)
+    leaf_mechanism_ids = _schema11_leaf_mechanism_ids(
+        plan, recovery_selection
+    )
+    manifest = _schema11_binary64_lock_manifest(plan, checkpoint, source)
+    lock = validate_binary64_layer_lock(
+        load_binary64_layer_lock(_resolve_recovery_path(binary64_lock_path)),
+        checkpoint,
+        selection=recovery_selection,
+        leaf_mechanism_ids=leaf_mechanism_ids,
+        auxiliary_evidence_manifest=manifest,
+    )
+    output = _resolve_recovery_path(output_path)
+    receipt = _resolve_recovery_path(receipt_path)
+    solved_leaf_store = (
+        SolvedLeafStore.default().root
+        if solved_leaf_store_path is None
+        else _resolve_recovery_path(solved_leaf_store_path)
+    )
+    migration = migrate_endpoint_recovery_checkpoint_file(
+        source,
+        output_path=output,
+        receipt_path=receipt,
+        binary64_lock_receipt_sha256=str(lock["receipt_sha256"]),
+        solved_leaf_store=solved_leaf_store,
+        replace_source=replace_source,
+        checkpoint_finalizer=lambda candidate, path: refresh_schema11_reports(
+            plan,
+            selection,
+            candidate,
+            path,
+            persist_checkpoint=False,
+        ),
+    )
+    output_checkpoint = validate_schema11_checkpoint(
+        _load_strict_json(output, "migrated schema-11 campaign checkpoint")
+    )
+    validate_binary64_layer_lock(
+        lock,
+        output_checkpoint,
+        selection=recovery_selection,
+        leaf_mechanism_ids=leaf_mechanism_ids,
+        auxiliary_evidence_manifest=manifest,
+    )
+    return 0, {
+        "command": "campaign-migrate-endpoint-recovery",
+        "checkpoint_path": str(output),
+        "receipt_path": str(receipt),
+        "solved_leaf_store": str(solved_leaf_store),
+        "affected_leaf_ids": migration["affected_leaf_ids"],
+        "affected_queue_ordinals": migration["affected_queue_ordinals"],
+        "reset_entry_count": migration["reset_entry_count"],
+        "binary64_processed_count": migration[
+            "preserved_binary64_processed_count"
+        ],
+        "retained_sample_count": migration["preserved_sample_count"],
+        "numerical_work": migration["numerical_work"],
     }
 
 
@@ -3015,6 +3120,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif arguments.command == "campaign-recovery-validate":
             status, output = _campaign_recovery_validate(
                 arguments.selection, arguments.checkpoint, arguments.receipt
+            )
+        elif arguments.command == "campaign-migrate-endpoint-recovery":
+            status, output = _campaign_migrate_endpoint_recovery(
+                arguments.selection,
+                arguments.checkpoint,
+                arguments.binary64_lock,
+                arguments.output,
+                arguments.receipt,
+                arguments.solved_leaf_store,
+                replace_source=arguments.replace_source,
             )
         elif arguments.command == "campaign-lock-binary64":
             status, output = _campaign_lock_binary64(

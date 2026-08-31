@@ -119,3 +119,80 @@ function deterministic_endpoint_receipts(
     )
     return Any[horizon_receipt, infinity_receipt]
 end
+
+function deterministic_order_geometry_endpoint_receipts(
+    ::Type{T}, request
+) where {T<:AbstractFloat}
+    receipts = deterministic_endpoint_receipts(
+        T, request, CF.ENDPOINT_ADEQUATE
+    )
+    policy = required(request, "fixed_root_endpoint_recovery_policy")
+    orders = required(policy, "endpoint_order_schedule")
+    geometries = required(policy, "infinity_geometry_schedule")
+    required_digits = required_reliable_digits(T, request)
+    series_digits = numeric_text(required_digits - one(T))
+    adequate_digits = numeric_text(required_digits + T(5))
+
+    attempts = Any[]
+    for order in orders
+        terminal_order = order == last(orders)
+        push!(attempts, Dict{String,Any}(
+            "endpoint_branch" => "infinity-outgoing",
+            "attempted_endpoint_order" => order,
+            "attempted_geometry" => first(geometries),
+            "maximum_last_term_ratio" => "0.1",
+            "maximum_truncation_digits_lost" => "2",
+            "maximum_recurrence_digits_lost" => "0.5",
+            "maximum_series_evaluation_digits_lost" => "0.5",
+            "predicted_reliable_digits" => series_digits,
+            "required_reliable_digits" => numeric_text(required_digits),
+            "candidate_limitation" => CF.ENDPOINT_SERIES_ORDER_LIMITED,
+            "selected_intervention" => terminal_order ?
+                "DEEPEN_ENDPOINT_GEOMETRY" : "INCREASE_ENDPOINT_ORDER",
+            "result" => "RETRY",
+            "terminal" => false,
+        ))
+    end
+    push!(attempts, Dict{String,Any}(
+        "endpoint_branch" => "infinity-outgoing",
+        "attempted_endpoint_order" => first(orders),
+        "attempted_geometry" => geometries[2],
+        "maximum_last_term_ratio" => "0.1",
+        "maximum_truncation_digits_lost" => "2",
+        "maximum_recurrence_digits_lost" => "0.5",
+        "maximum_series_evaluation_digits_lost" => "0.5",
+        "predicted_reliable_digits" => adequate_digits,
+        "required_reliable_digits" => numeric_text(required_digits),
+        "candidate_limitation" => CF.ENDPOINT_ADEQUATE,
+        "selected_intervention" => "ENTER_HOMOGENEOUS_ODE",
+        "result" => "ADEQUATE",
+        "terminal" => true,
+    ))
+
+    receipts[2] = Dict{String,Any}(
+        "schema" => "windows-solver.exterior-endpoint-recovery-receipt/3",
+        "endpoint_branch" => "infinity-outgoing",
+        "recovery_policy_identity" => required(policy, "identity"),
+        "recovery_policy_sha256" => required(policy, "policy_sha256"),
+        "base_endpoint_order" => required(policy, "base_endpoint_order"),
+        "generated_maximum_order" =>
+            required(policy, "generated_maximum_order"),
+        "attempted_endpoint_orders" => [
+            attempt["attempted_endpoint_order"] for attempt in attempts
+        ],
+        "terminal_endpoint_order" => first(orders),
+        "candidate_geometry_schedule" => geometries,
+        "terminal_geometry" => geometries[2],
+        "maximum_last_term_ratio" => "0.1",
+        "maximum_truncation_digits_lost" => "2",
+        "maximum_recurrence_digits_lost" => "0.5",
+        "maximum_series_evaluation_digits_lost" => "0.5",
+        "predicted_reliable_digits" => adequate_digits,
+        "required_reliable_digits" => numeric_text(required_digits),
+        "candidate_limitation" => CF.ENDPOINT_ADEQUATE,
+        "aggregate_limitation" => CF.ENDPOINT_ADEQUATE,
+        "factored_homogeneous_rhs_evaluations" => 0,
+        "attempts" => attempts,
+    )
+    return receipts
+end
