@@ -131,7 +131,7 @@ def migrate_fixed_root_endpoint_policy_checkpoint(
 ) -> dict[str, object]:
     """Validate schema 11 and optionally apply the explicit endpoint migration.
 
-    Ordinary recovery callers retain current v2 evidence.  The explicit
+    Ordinary recovery callers retain current predecessor evidence. The explicit
     migration path preserves the authenticated defective stage as
     ``FORENSIC_ONLY`` and returns the pending queue state without invoking
     roots, determinants, ODEs, or samples.
@@ -231,7 +231,7 @@ def migrate_endpoint_recovery_checkpoint_file(
     replace_source: bool = False,
     checkpoint_finalizer: CheckpointFinalizer | None = None,
 ) -> dict[str, object]:
-    """Migrate only defective v2 endpoint evidence, with zero numerics."""
+    """Migrate only defective pre-grid endpoint evidence, with zero numerics."""
 
     source_path = Path(source_checkpoint_path)
     output = Path(output_path)

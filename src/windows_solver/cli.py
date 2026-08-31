@@ -350,7 +350,7 @@ def build_parser() -> argparse.ArgumentParser:
     campaign_recovery_validate.add_argument("--receipt", type=Path)
     campaign_endpoint_migrate = commands.add_parser(
         "campaign-migrate-endpoint-recovery",
-        help="supersede defective v2 endpoint evidence without numerical work",
+        help="supersede defective pre-grid endpoint evidence without numerical work",
     )
     campaign_endpoint_migrate.add_argument("selection", type=Path)
     campaign_endpoint_migrate.add_argument(

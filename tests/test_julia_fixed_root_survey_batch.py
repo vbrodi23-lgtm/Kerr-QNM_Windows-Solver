@@ -616,9 +616,11 @@ class JuliaFixedRootSurveyBatchTests(unittest.TestCase):
             receipt["attempts"].append(deeper)
             receipt["selected_rho"] = "-25"
 
+        forged_evidence = deepcopy(evidence)
+        inspect_beyond_first_adequate(forged_evidence[0])
         with self.assertRaisesRegex(ValueError, "first adequacy"):
             _validated_exterior_endpoint_recovery_evidence(
-                forged(inspect_beyond_first_adequate),
+                forged_evidence,
                 policy,
                 expected_aggregate="adequate/v1",
                 spin=request["spin"],

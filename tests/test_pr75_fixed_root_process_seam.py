@@ -146,7 +146,7 @@ class PR75FixedRootProcessSeamTests(unittest.TestCase):
                 plan=FixedRootSurveyPlan.MECHANISM_COMPONENT_FOUR,
             )
 
-        receipt = batch.samples[0].numerical_conditioning[
+        receipt = batch.samples[0].numerical_conditioning.mapping[
             "endpoint_receipts"
         ][1]
         trajectory = [

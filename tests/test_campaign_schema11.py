@@ -565,7 +565,11 @@ class Schema11CheckpointTests(unittest.TestCase):
         self.assertEqual("FORENSIC_ONLY", history["authority"])
         self.assertEqual(stage, history["source_stage"])
         self.assertEqual(
-            "cause-aware-real-inner-order-geometry-fixed-root-exterior-endpoint-recovery/v3",
+            "cause-aware-fixed-root-exterior-endpoint-recovery/v1",
+            history["source_recovery_policy_identity"],
+        )
+        self.assertEqual(
+            "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2",
             history["replacement_recovery_policy_identity"],
         )
         replacement = history["replacement_recovery_policy"]

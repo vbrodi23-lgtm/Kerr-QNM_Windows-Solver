@@ -1857,6 +1857,50 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             "windows-solver.m02-endpoint-recovery-migration/1",
             "windows-solver.m02-endpoint-recovery-migration-entry/1",
             "authenticated-v2-to-v3-order-geometry-endpoint-recovery/v1",
+            # PR77 public M03 policy, representation, convention, and
+            # scheduling identities. Registration makes these names part of
+            # the inspectable contract; it does not claim that blocked
+            # mathematical decisions or produced science have been admitted.
+            "julia-m03-persistent-spectral-state-engine-v1",
+            "spin-weighted-spheroidal-spectral-coefficients-v1",
+            "regularised-gsn-spectral-segments-v1",
+            "teukolsky-s-minus-2-radial-v1",
+            "authenticated-gsn-to-teukolsky-map-v1",
+            "unit-outgoing-teukolsky-amplitude-at-scri-v1",
+            "bilinear-transpose-pencil-pairing-v1",
+            "m03-regularised-gsn-multidomain-v1",
+            "ingoing-teukolsky-carrier-v1",
+            "outgoing-teukolsky-carrier-v1",
+            "m03-spin-weighted-spheroidal-galerkin-v1",
+            (
+                "freeze-right-co-mode-pairing-residue-and-branch-"
+                "validation-thresholds-v1"
+            ),
+            "m03-bilinear-normalized-field-overlap-v1",
+            "m03-content-addressed-atomic-artifacts-v1",
+            "m03-kerr-spectral-state-conventions-v1",
+            "separated-s-minus-2-teukolsky-at-frozen-omega-A-v1",
+            "spin-weighted-spheroidal-angular-equation-v1",
+            "teukolsky-radial-equation-v1",
+            "qnm-ingoing-horizon-outgoing-infinity-v1",
+            (
+                "freeze-separated-equations-carriers-endpoints-physical-"
+                "representation-and-normalization-v1"
+            ),
+            (
+                "freeze-continuous-dual-equation-space-boundaries-pairing-"
+                "phase-v1"
+            ),
+            (
+                "freeze-pencil-derivative-green-numerator-sign-and-m02-"
+                "Domega-relation-v1"
+            ),
+            (
+                "freeze-observables-invariants-near-extremal-coordinate-"
+                "and-ambiguity-policy-v1"
+            ),
+            "one-worker-one-active-node-branch-contiguous-v1",
+            "kerr-prograde-spin-from-M-kappa-v1",
             "windows-solver.root-readout-recovery-index/v2",
             "windows-solver.promoted-cache-supersession/v1",
             "promoted-policy-preflight/v1",

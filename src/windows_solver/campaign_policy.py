@@ -2316,26 +2316,26 @@ def _fixed_root_legacy_endpoint_policy(
     return None
 
 
-def _fixed_root_real_inner_v2_endpoint_policy(
+def _fixed_root_real_inner_pre_grid_endpoint_policy(
     value: object,
 ) -> Mapping[str, object] | None:
     if isinstance(value, Mapping):
         if value.get("identity") == _FIXED_ROOT_ENDPOINT_RECOVERY_REAL_INNER_IDENTITY:
             return value
         for item in value.values():
-            found = _fixed_root_real_inner_v2_endpoint_policy(item)
+            found = _fixed_root_real_inner_pre_grid_endpoint_policy(item)
             if found is not None:
                 return found
     elif isinstance(value, list):
         for item in value:
-            found = _fixed_root_real_inner_v2_endpoint_policy(item)
+            found = _fixed_root_real_inner_pre_grid_endpoint_policy(item)
             if found is not None:
                 return found
     return None
 
 
 def _contains_premature_endpoint_order_exhaustion(value: object) -> bool:
-    """Identify v2 evidence that terminalised before unused geometry."""
+    """Identify predecessor evidence terminalised before unused geometry."""
 
     if isinstance(value, Mapping):
         if value.get("failure_code") == "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE":
@@ -2459,11 +2459,11 @@ def _replacement_fixed_root_endpoint_policy(
 def _replacement_two_dimensional_endpoint_policy(
     source: Mapping[str, object],
 ) -> dict[str, object]:
-    """Return the v3 order × geometry policy for authenticated v1/v2 input."""
+    """Return the order × geometry policy for authenticated predecessor input."""
 
     identity = source.get("identity")
     if identity == _FIXED_ROOT_ENDPOINT_RECOVERY_LEGACY_IDENTITY:
-        v2 = _replacement_fixed_root_endpoint_policy(source)
+        pre_grid = _replacement_fixed_root_endpoint_policy(source)
     elif identity == _FIXED_ROOT_ENDPOINT_RECOVERY_REAL_INNER_IDENTITY:
         binding = {
             name: item for name, item in source.items() if name != "policy_sha256"
@@ -2508,13 +2508,16 @@ def _replacement_two_dimensional_endpoint_policy(
             or digits not in (40, 80)
             or binding.get("semantic_precision_tier") != f"bigfloat-{digits}"
         ):
-            raise ValueError("fixed-root v2 endpoint policy semantics are invalid")
-        v2 = copy.deepcopy(dict(source))
+            raise ValueError(
+                "fixed-root pre-grid endpoint policy semantics are invalid"
+            )
+        pre_grid = copy.deepcopy(dict(source))
     else:
         raise ValueError("fixed-root endpoint migration source identity is invalid")
 
     replacement = {
-        name: item for name, item in v2.items() if name != "policy_sha256"
+        name: item for name, item in pre_grid.items()
+        if name != "policy_sha256"
     }
     replacement["schema"] = _FIXED_ROOT_ENDPOINT_RECOVERY_TWO_DIMENSIONAL_SCHEMA
     replacement["identity"] = _FIXED_ROOT_ENDPOINT_RECOVERY_TWO_DIMENSIONAL_IDENTITY
@@ -2562,15 +2565,17 @@ def _migrate_fixed_root_v2_forensic_history(
         for leaf_id in list(bucket):
             stage = bucket.get(leaf_id)
             legacy_endpoint_policy = _fixed_root_legacy_endpoint_policy(stage)
-            v2_endpoint_policy = _fixed_root_real_inner_v2_endpoint_policy(stage)
+            pre_grid_endpoint_policy = (
+                _fixed_root_real_inner_pre_grid_endpoint_policy(stage)
+            )
             source_endpoint_policy = legacy_endpoint_policy
             if (
                 endpoint_recovery_migration
                 and source_endpoint_policy is None
-                and v2_endpoint_policy is not None
+                and pre_grid_endpoint_policy is not None
                 and _contains_premature_endpoint_order_exhaustion(stage)
             ):
-                source_endpoint_policy = v2_endpoint_policy
+                source_endpoint_policy = pre_grid_endpoint_policy
             if (
                 not isinstance(stage, Mapping)
                 or (
@@ -3319,8 +3324,12 @@ def validate_schema11_checkpoint(
         source_endpoint_policy = _fixed_root_legacy_endpoint_policy(
             history.get("source_stage") if isinstance(history, Mapping) else None
         )
-        v2_source_endpoint_policy = _fixed_root_real_inner_v2_endpoint_policy(
-            history.get("source_stage") if isinstance(history, Mapping) else None
+        pre_grid_source_endpoint_policy = (
+            _fixed_root_real_inner_pre_grid_endpoint_policy(
+                history.get("source_stage")
+                if isinstance(history, Mapping)
+                else None
+            )
         )
         endpoint_valid = False
         if common_valid and source_endpoint_policy is not None:
@@ -3352,7 +3361,7 @@ def validate_schema11_checkpoint(
         current_source_endpoint_policy = (
             source_endpoint_policy
             if source_endpoint_policy is not None
-            else v2_source_endpoint_policy
+            else pre_grid_source_endpoint_policy
         )
         current_endpoint_valid = False
         if common_valid and current_source_endpoint_policy is not None:
