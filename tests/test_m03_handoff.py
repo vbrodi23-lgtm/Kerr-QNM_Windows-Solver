@@ -9,7 +9,11 @@ import unittest
 from windows_solver.campaign_policy import empty_schema11_checkpoint
 from windows_solver.cli import _campaign_plan_and_selection
 from windows_solver.contracts import canonical_json_bytes
-from windows_solver.m03_handoff import build_handoff, validate_handoff
+from windows_solver.m03_handoff import (
+    _m02_domega_bundle,
+    build_handoff,
+    validate_handoff,
+)
 
 
 SELECTION = Path(__file__).resolve().parents[1] / "examples" / "m02-campaign.json"
@@ -70,6 +74,113 @@ def _terminal_fixture():
 
 
 class M03HandoffTests(unittest.TestCase):
+    def test_complete_exterior_stencil_is_reduced_from_raw_receipts(self) -> None:
+        root_identity = "a" * 64
+        leaf_id = "leaf-with-exterior-stencil"
+        roles = (
+            ("frequency-real-plus-h", "10.2", "3"),
+            ("frequency-real-minus-h", "9.8", "-1"),
+            ("frequency-real-plus-h2", "10.1", "2"),
+            ("frequency-real-minus-h2", "9.9", "0"),
+        )
+        samples = []
+        for role, omega_real, determinant_real in roles:
+            response = {
+                "status": "ok",
+                "readout_role": role,
+                "omega_re": omega_real,
+                "omega_im": "-1",
+                "determinant_re": determinant_real,
+                "determinant_im": "0",
+            }
+            receipt = {
+                "response_binding": response,
+                "response_sha256": _sha(response),
+            }
+            samples.append(
+                {
+                    "readout_role": role,
+                    "precision_tier": "bigfloat-40",
+                    "working_precision_bits": 165,
+                    "determinant_family": "exterior-wronskian/v1",
+                    "determinant_normalisation": (
+                        "unit-asymptotic-branch-wronskian/v1"
+                    ),
+                    "worker_response_receipt": receipt,
+                    "worker_response_receipt_sha256": _sha(receipt),
+                }
+            )
+        stage = {
+            "stage_sha256": "b" * 64,
+            "component_result": {
+                "result": {
+                    "leaf_id": leaf_id,
+                    "baseline": {
+                        "numerical_conditioning": {
+                            "determinant_convention": (
+                                "wronskian-perturbed-Xin-with-Xup/v1"
+                            )
+                        },
+                        "primary_acceptance": {
+                            "determinant_re": "1",
+                            "determinant_im": "0",
+                        },
+                    },
+                    "derivative_evidence": {
+                        "fixed_root_samples": samples
+                    },
+                }
+            },
+        }
+        background = {
+            "reuse_key": {
+                "root_identity": root_identity,
+                "background_operation_identity": (
+                    "canonical-exterior-background-wronskian/v1"
+                ),
+            }
+        }
+        checkpoint = {
+            "promotion_queue": {
+                "entries": [
+                    {
+                        "leaf_id": leaf_id,
+                        "provisional_stage": {
+                            "canonical_background": background
+                        },
+                    }
+                ]
+            }
+        }
+
+        background_sha, evidence = _m02_domega_bundle(
+            checkpoint=checkpoint,
+            records=[{"leaf_id": leaf_id, "stages": [stage]}],
+            root_identity=root_identity,
+            frozen_omega={"real": "10", "imaginary": "-1"},
+        )
+
+        self.assertEqual(background_sha, _sha(background))
+        self.assertEqual(
+            evidence["coarse_derivative"],
+            {"real": "1E+1", "imaginary": "0E+1"},
+        )
+        self.assertEqual(
+            evidence["fine_derivative"],
+            {"real": "1E+1", "imaginary": "0E+1"},
+        )
+        self.assertEqual(evidence["disagreement_abs"], "0E+1")
+        self.assertEqual(
+            evidence["request_sha256"],
+            _sha(
+                {
+                    key: value
+                    for key, value in evidence.items()
+                    if key != "request_sha256"
+                }
+            ),
+        )
+
     def test_valid_handoff_collapses_212_leaves_to_48_roots(self) -> None:
         plan, selection, checkpoint = _terminal_fixture()
 

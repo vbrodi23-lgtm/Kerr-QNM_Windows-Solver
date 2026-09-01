@@ -209,6 +209,13 @@ jobs:
           PR75_REAL_WORKER_PROCESS=1 \
           PYTHONPATH=src python -m unittest \
             tests.test_pr75_fixed_root_process_seam -v
+      - name: Load the M03 core through its persistent RPC worker
+        shell: bash
+        run: |
+          M03_REAL_WORKER_PROCESS=1 \
+          M03_JULIA_PROJECT="$M02_PROJECT" \
+          PYTHONPATH=src python -m unittest \
+            tests.test_m03_worker_protocol.M03RealWorkerLoadTests -v
 
   test:
     needs: real-inner-fixed-root-seam
@@ -244,12 +251,16 @@ jobs:
           with zipfile.ZipFile(wheels[0]) as wheel:
               names = set(wheel.namelist())
               packaged_worker = wheel.read("windows_solver/data/julia/m02_worker.jl")
+              packaged_m03_core = wheel.read("windows_solver/data/julia/m03_core.jl")
+              packaged_m03_worker = wheel.read("windows_solver/data/julia/m03_worker.jl")
           required = {
               "windows_solver/linear_response_admission.py",
               "windows_solver/data/kerr_qnm_roots_2736.csv",
               "windows_solver/data/kerr_qnm_lattice_receipt.json",
               "windows_solver/data/fixed_root_reliability_projection_authority_v1.json",
               "windows_solver/data/julia/m02_worker.jl",
+              "windows_solver/data/julia/m03_core.jl",
+              "windows_solver/data/julia/m03_worker.jl",
               "windows_solver/data/LICENSE-CANONICAL-BACKEND-MIT.txt",
               "windows_solver/data/LICENSE-CC-BY-4.0.txt",
               "windows_solver/data/LICENSE-QNM-MIT.txt",
@@ -267,6 +278,12 @@ jobs:
           source_worker = Path("src/windows_solver/data/julia/m02_worker.jl").read_bytes()
           if packaged_worker != source_worker:
               raise AssertionError("packaged m02_worker.jl differs from canonical source")
+          source_m03_core = Path("src/windows_solver/data/julia/m03_core.jl").read_bytes()
+          source_m03_worker = Path("src/windows_solver/data/julia/m03_worker.jl").read_bytes()
+          if packaged_m03_core != source_m03_core:
+              raise AssertionError("packaged m03_core.jl differs from canonical source")
+          if packaged_m03_worker != source_m03_worker:
+              raise AssertionError("packaged m03_worker.jl differs from canonical source")
       - name: Compile Python
         run: python -m compileall -q src tests tools
       - name: Verify critical production capability wiring

@@ -1862,6 +1862,8 @@ $candidate | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:M02_TEST_J
             # the inspectable contract; it does not claim that blocked
             # mathematical decisions or produced science have been admitted.
             "julia-m03-persistent-spectral-state-engine-v1",
+            "m03-worker-v2",
+            "m03-core-v1",
             "spin-weighted-spheroidal-spectral-coefficients-v1",
             "regularised-gsn-spectral-segments-v1",
             "teukolsky-s-minus-2-radial-v1",

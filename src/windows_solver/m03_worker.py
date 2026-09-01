@@ -13,7 +13,7 @@ from typing import IO, Mapping, Sequence
 from .contracts import canonical_json_bytes
 
 
-RPC_SCHEMA = "windows-solver.m03-json-rpc/1"
+RPC_SCHEMA = "windows-solver.m03-json-rpc/2"
 
 
 class M03WorkerError(RuntimeError):
@@ -24,8 +24,28 @@ class M03IdentityRejection(M03WorkerError):
     """Fail-closed request or response identity mismatch."""
 
 
+class M03PolicyRejection(M03WorkerError):
+    """The request contradicts the frozen M03 numerical policy."""
+
+
+class M03SystemFailure(M03WorkerError):
+    """The Julia process or its protocol boundary failed operationally."""
+
+
 def request_identity(value: Mapping[str, object]) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _powershell_object_identity(value: Mapping[str, object]) -> str:
+    """Match bootstrap's ordered ``ConvertTo-Json -Compress`` identity."""
+
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def worker_from_runtime_receipt(
@@ -46,28 +66,75 @@ def worker_from_runtime_receipt(
         raise M03WorkerError(
             "M03 Julia runtime is not staged; run .\\runtime\\bootstrap.ps1 -WithM03"
         )
+    if m03.get("schema") != "windows-solver.m03-runtime-receipt/2":
+        raise M03IdentityRejection("installed M03 runtime receipt schema is stale")
+    expected_m03_fields = {
+        "schema",
+        "contract",
+        "contract_sha256",
+        "worker",
+        "worker_sha256",
+        "core",
+        "core_sha256",
+        "project",
+        "project_sha256",
+        "manifest_sha256",
+        "depot",
+        "source_root",
+    }
+    if set(m03) != expected_m03_fields:
+        raise M03IdentityRejection("installed M03 runtime receipt fields changed")
+    contract = m03.get("contract")
+    expected_contract_fields = {
+        "schema",
+        "worker_sha256",
+        "core_sha256",
+        "project_sha256",
+        "manifest_seed_sha256",
+        "julia_version",
+        "m02_dependency_contract_sha256",
+    }
+    if (
+        not isinstance(contract, Mapping)
+        or set(contract) != expected_contract_fields
+        or contract.get("schema") != "windows-solver.m03-runtime-contract/2"
+        or contract.get("worker_sha256") != m03.get("worker_sha256")
+        or contract.get("core_sha256") != m03.get("core_sha256")
+        or contract.get("project_sha256") != m03.get("project_sha256")
+        or _powershell_object_identity(contract) != m03.get("contract_sha256")
+        or contract.get("julia_version") != julia.get("version")
+        or contract.get("m02_dependency_contract_sha256")
+        != julia.get("dependency_contract_sha256")
+    ):
+        raise M03IdentityRejection("installed M03 runtime contract is stale")
     executable = Path(str(julia.get("executable", "")))
     project = Path(str(m03.get("project", "")))
     worker = Path(str(m03.get("worker", "")))
+    core = Path(str(m03.get("core", "")))
     depot = Path(str(m03.get("depot", "")))
     manifest = project / "Manifest.toml"
     project_file = project / "Project.toml"
     for path, label in (
         (executable, "Julia executable"),
         (worker, "M03 worker"),
+        (core, "M03 core"),
         (manifest, "M03 Manifest"),
         (project_file, "M03 Project"),
     ):
         if not path.is_file() or path.is_symlink():
             raise M03WorkerError(f"installed {label} is invalid: {path}")
+    if core.parent != worker.parent:
+        raise M03IdentityRejection("installed M03 core is not adjacent to its worker")
     if not depot.is_dir() or depot.is_symlink():
         raise M03WorkerError(f"installed M03 Julia depot is invalid: {depot}")
     for key, path in (
+        ("executable_sha256", executable),
         ("worker_sha256", worker),
+        ("core_sha256", core),
         ("manifest_sha256", manifest),
         ("project_sha256", project_file),
     ):
-        declared = m03.get(key)
+        declared = julia.get(key) if key == "executable_sha256" else m03.get(key)
         observed = hashlib.sha256(path.read_bytes()).hexdigest()
         if declared != observed:
             raise M03IdentityRejection(f"installed M03 {key} digest is stale")
@@ -142,10 +209,18 @@ class PersistentM03Worker:
             daemon=True,
         )
         self._stderr_thread.start()
-        hello = self.call("hello", {"protocol_schema": RPC_SCHEMA})
-        if hello.get("worker_kind") != "m03-julia-scientific-engine":
+        hello = self.call("hello", {})
+        if (
+            hello.get("worker_kind") != "m03-julia-protocol-worker"
+            or hello.get("worker_version") != "m03-worker-v2"
+            or hello.get("core_schema") != "windows-solver.m03-core/1"
+            or hello.get("core_version") != "m03-core-v1"
+            or hello.get("rpc_schema") != RPC_SCHEMA
+        ):
             self.close(force=True)
-            raise M03IdentityRejection("Julia process is not the M03 worker")
+            raise M03IdentityRejection(
+                "Julia process does not expose the authenticated M03 worker/core pair"
+            )
 
     def _drain_stderr(self, stream: IO[str]) -> None:
         for line in stream:
@@ -206,15 +281,37 @@ class PersistentM03Worker:
             raise M03IdentityRejection("M03 Julia response does not echo the request identity")
         if response["ok"] is not True:
             error = response["error"]
-            if isinstance(error, Mapping) and error.get("class") == "IDENTITY_REJECTION":
-                raise M03IdentityRejection(str(error.get("message")))
-            raise M03WorkerError(
-                str(error.get("message")) if isinstance(error, Mapping) else "M03 Julia request failed"
+            error_class = error.get("class") if isinstance(error, Mapping) else None
+            message = (
+                str(error.get("message"))
+                if isinstance(error, Mapping)
+                else "M03 Julia request failed"
             )
+            if error_class == "IDENTITY_REJECTION":
+                raise M03IdentityRejection(message)
+            if error_class == "POLICY_REJECTION":
+                raise M03PolicyRejection(message)
+            raise M03SystemFailure(message)
         result = response["result"]
         if not isinstance(result, dict) or response["error"] is not None:
             raise M03WorkerError("M03 Julia successful response payload is invalid")
-        return result
+        metadata_fields = {
+            "rpc_request_identity_sha256",
+            "rpc_response_identity_sha256",
+        }
+        if metadata_fields.intersection(result):
+            raise M03IdentityRejection(
+                "M03 Julia result attempted to shadow RPC identity metadata"
+            )
+        return {
+            **result,
+            "rpc_request_identity_sha256": response[
+                "request_identity_sha256"
+            ],
+            "rpc_response_identity_sha256": response[
+                "response_identity_sha256"
+            ],
+        }
 
     def close(self, *, force: bool = False) -> None:
         process = self._process
@@ -251,6 +348,8 @@ class PersistentM03Worker:
 
 __all__ = [
     "M03IdentityRejection",
+    "M03PolicyRejection",
+    "M03SystemFailure",
     "M03WorkerError",
     "PersistentM03Worker",
     "RPC_SCHEMA",

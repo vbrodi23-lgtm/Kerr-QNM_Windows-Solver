@@ -541,7 +541,10 @@ def build_parser() -> argparse.ArgumentParser:
     m03_handoff_validate.add_argument("handoff", type=Path)
     m03_transition = commands.add_parser(
         "m03-transition",
-        help="emit M03_READY only for a terminal M02 checkpoint",
+        help=(
+            "emit M03_READY only for a terminal M02 checkpoint with complete "
+            "M03 derivative evidence"
+        ),
     )
     m03_transition.add_argument("m02_selection", type=Path)
     m03_transition.add_argument("--checkpoint", type=Path, required=True)
@@ -814,14 +817,25 @@ def _m03_handoff_build(
         checkpoint_path=str(checkpoint_path.resolve()),
     )
     write_handoff(output_path, handoff)
+    ready = (
+        handoff["inventory"]["authenticated_domega_count"] == 48
+        and handoff["inventory"]["authenticated_background_count"] == 48
+    )
     return 0, {
         "command": "m03-handoff-build",
-        "state": "M03_READY",
+        "state": "M03_READY" if ready else "M03_HANDOFF_INCOMPLETE",
+        "m03_ready": ready,
         "handoff_path": str(output_path.resolve()),
         "handoff_sha256": handoff["handoff_sha256"],
         "source_leaf_count": handoff["inventory"]["source_leaf_count"],
         "node_count": handoff["inventory"]["node_count"],
         "branch_count": handoff["inventory"]["branch_count"],
+        "authenticated_domega_count": handoff["inventory"][
+            "authenticated_domega_count"
+        ],
+        "authenticated_background_count": handoff["inventory"][
+            "authenticated_background_count"
+        ],
         "root_solves": 0,
         "response_solves": 0,
         "julia_launches": 0,
@@ -855,14 +869,24 @@ def _m03_transition(
             checkpoint_path=str(checkpoint_path.resolve()),
         )
         write_handoff(handoff_path, handoff)
+    ready = (
+        handoff["inventory"]["authenticated_domega_count"] == 48
+        and handoff["inventory"]["authenticated_background_count"] == 48
+    )
     return 0, {
         "command": "m03-transition",
-        "state": "M03_READY",
-        "m03_ready": True,
+        "state": "M03_READY" if ready else "M03_HANDOFF_INCOMPLETE",
+        "m03_ready": ready,
         "handoff_path": str(handoff_path.resolve()),
         "handoff_sha256": handoff["handoff_sha256"],
         "node_count": 48,
         "branch_count": 11,
+        "authenticated_domega_count": handoff["inventory"][
+            "authenticated_domega_count"
+        ],
+        "authenticated_background_count": handoff["inventory"][
+            "authenticated_background_count"
+        ],
         "julia_launches": 0,
         "numerical_work": 0,
     }
@@ -2967,13 +2991,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif arguments.command == "m03-handoff-validate":
             handoff = load_handoff(arguments.handoff)
+            ready = (
+                handoff["inventory"]["authenticated_domega_count"] == 48
+                and handoff["inventory"]["authenticated_background_count"]
+                == 48
+            )
             status, output = 0, {
                 "command": arguments.command,
-                "state": "M03_READY",
+                "state": (
+                    "M03_READY" if ready else "M03_HANDOFF_INCOMPLETE"
+                ),
+                "m03_ready": ready,
                 "handoff_path": str(arguments.handoff.resolve()),
                 "handoff_sha256": handoff["handoff_sha256"],
                 "node_count": handoff["inventory"]["node_count"],
                 "branch_count": handoff["inventory"]["branch_count"],
+                "authenticated_domega_count": handoff["inventory"][
+                    "authenticated_domega_count"
+                ],
+                "authenticated_background_count": handoff["inventory"][
+                    "authenticated_background_count"
+                ],
                 "julia_launches": 0,
                 "numerical_work": 0,
             }
