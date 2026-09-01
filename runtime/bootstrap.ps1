@@ -1578,16 +1578,18 @@ Pkg.precompile()
         # package sources and depot; it does not establish another runtime
         # authority.
         $M03WorkerSource = Join-Path $JuliaDataRoot "m03_worker.jl"
+        $M03CoreSource = Join-Path $JuliaDataRoot "m03_core.jl"
         $M03ProjectSource = Join-Path $JuliaDataRoot "m03_project\Project.toml"
         $M03ManifestSeedSource = Join-Path $JuliaDataRoot "m03_project\Manifest.seed.toml"
-        foreach ($RequiredM03Source in @($M03WorkerSource, $M03ProjectSource, $M03ManifestSeedSource)) {
+        foreach ($RequiredM03Source in @($M03WorkerSource, $M03CoreSource, $M03ProjectSource, $M03ManifestSeedSource)) {
             if (-not (Test-Path -LiteralPath $RequiredM03Source -PathType Leaf)) {
                 throw "M03 runtime source is absent: $RequiredM03Source"
             }
         }
         $M03Contract = [ordered]@{
-            schema = "windows-solver.m03-runtime-contract/1"
+            schema = "windows-solver.m03-runtime-contract/2"
             worker_sha256 = Get-Sha256 $M03WorkerSource
+            core_sha256 = Get-Sha256 $M03CoreSource
             project_sha256 = Get-Sha256 $M03ProjectSource
             manifest_seed_sha256 = Get-Sha256 $M03ManifestSeedSource
             julia_version = $JuliaVersion
@@ -1597,12 +1599,14 @@ Pkg.precompile()
         $M03Root = Join-Path $RuntimeRoot "m03-environments\$M03ContractSha256"
         $M03Project = Join-Path $M03Root "project"
         $M03Worker = Join-Path $M03Root "m03_worker.jl"
+        $M03Core = Join-Path $M03Root "m03_core.jl"
         if (-not (Test-Path -LiteralPath $M03Project -PathType Container)) {
             New-Item -ItemType Directory -Force -Path $M03Project | Out-Null
         }
         foreach ($M03Copy in @(
             @($M03ProjectSource, (Join-Path $M03Project "Project.toml")),
             @((Join-Path $JuliaProject "Manifest.toml"), (Join-Path $M03Project "Manifest.toml")),
+            @($M03CoreSource, $M03Core),
             @($M03WorkerSource, $M03Worker)
         )) {
             $M03Source = [string]$M03Copy[0]
@@ -1625,11 +1629,13 @@ Pkg.precompile()
             "--probe"
         )
         $JuliaReceipt["m03"] = [ordered]@{
-            schema = "windows-solver.m03-runtime-receipt/1"
+            schema = "windows-solver.m03-runtime-receipt/2"
             contract = $M03Contract
             contract_sha256 = $M03ContractSha256
             worker = [IO.Path]::GetFullPath($M03Worker)
             worker_sha256 = Get-Sha256 $M03Worker
+            core = [IO.Path]::GetFullPath($M03Core)
+            core_sha256 = Get-Sha256 $M03Core
             project = [IO.Path]::GetFullPath($M03Project)
             project_sha256 = Get-Sha256 (Join-Path $M03Project "Project.toml")
             manifest_sha256 = Get-Sha256 (Join-Path $M03Project "Manifest.toml")

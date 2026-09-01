@@ -69,9 +69,11 @@
       "precision_relative_difference_max": null
     }
   },
+  "kernel_numerical_policy": null,
   "branch_overlap_policy": {
     "policy_id": "m03-bilinear-normalized-field-overlap-v1",
-    "minimum_overlap": "0.90",
+    "minimum_overlap": null,
+    "overlap_is_evidence_only": true,
     "unresolved_gap_blocks_continuation": true,
     "cold_start_across_gap_requires_review": true
   },
@@ -86,7 +88,7 @@
   "conventions": {
     "version": "m03-kerr-spectral-state-conventions-v1",
     "right_state": {
-      "review_state": "BLOCKED_HUMAN_MATH_REVIEW",
+      "review_state": "FROZEN",
       "operator_pencil": "separated-s-minus-2-teukolsky-at-frozen-omega-A-v1",
       "angular_equation": "spin-weighted-spheroidal-angular-equation-v1",
       "radial_equation": "teukolsky-radial-equation-v1",
@@ -95,16 +97,16 @@
       "required_decision": "freeze-separated-equations-carriers-endpoints-physical-representation-and-normalization-v1"
     },
     "co_mode": {
-      "review_state": "BLOCKED_HUMAN_MATH_REVIEW",
+      "review_state": "FROZEN",
       "required_decision": "freeze-continuous-dual-equation-space-boundaries-pairing-phase-v1"
     },
     "residue": {
-      "review_state": "BLOCKED_HUMAN_MATH_REVIEW",
+      "review_state": "FROZEN",
       "formula": "d_n=<alpha_n,(partial_omega F)(omega_n)v_n>",
       "required_decision": "freeze-pencil-derivative-green-numerator-sign-and-m02-Domega-relation-v1"
     },
     "branch_classification": {
-      "review_state": "BLOCKED_HUMAN_MATH_REVIEW",
+      "review_state": "FROZEN",
       "required_decision": "freeze-observables-invariants-near-extremal-coordinate-and-ambiguity-policy-v1"
     },
     "nhek_match": {

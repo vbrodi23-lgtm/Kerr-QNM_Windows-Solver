@@ -125,12 +125,12 @@ if ($Profile -eq "run") {
     }
     $RuntimeReceipt = Get-Content -LiteralPath $RuntimeReceiptPath -Raw | ConvertFrom-Json
     $M03Runtime = $RuntimeReceipt.julia_runtime.m03
-    if ($null -eq $M03Runtime -or [string]::IsNullOrWhiteSpace([string]$M03Runtime.worker_sha256)) {
+    if ($null -eq $M03Runtime -or [string]::IsNullOrWhiteSpace([string]$M03Runtime.contract_sha256)) {
         throw "M03 runtime is not staged; run .\runtime\bootstrap.ps1 -WithM03"
     }
     $Arguments += @(
         "--runtime-receipt", $RuntimeReceiptPath,
-        "--source-revision", ([string]$M03Runtime.worker_sha256).ToLowerInvariant()
+        "--source-revision", ([string]$M03Runtime.contract_sha256).ToLowerInvariant()
     )
     if ($NewCampaign) {
         $Arguments += "--new-campaign"
