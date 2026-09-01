@@ -48,7 +48,7 @@ class ProgressBusTests(unittest.TestCase):
             ],
         }
         infinity = {
-            "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
+            "schema": "windows-solver.exterior-endpoint-recovery-receipt/3",
             "attempted_endpoint_orders": [28],
             "attempts": [{
                 "attempted_endpoint_order": 28,

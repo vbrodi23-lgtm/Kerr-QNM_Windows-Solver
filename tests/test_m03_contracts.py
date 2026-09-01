@@ -19,7 +19,9 @@ from windows_solver.m03_contracts import (
 )
 from windows_solver.precision_tiers import (
     PrecisionTierPresentation,
+    SemanticPrecisionPresentation,
     precision_tier_presentation,
+    semantic_precision_presentation,
 )
 
 
@@ -420,17 +422,17 @@ class M03LineageAndCacheTests(unittest.TestCase):
                 normalization_id="unit-outgoing-scri-amplitude-v1",
                 pairing_id="not-applicable",
                 backend_revisions={"gsn": "pinned-commit"},
-                precision_tier=precision_tier_presentation(64),
+                precision_tier=semantic_precision_presentation("bigfloat-40"),
                 validation_policy={"field-equation-residual-max": 1.0e-10},
                 m02_lineage=anchor,
             )
 
     def test_cache_rejects_forged_precision_presentation(self) -> None:
         seed = adapt_spectral_payload(_spectral_payload())[0]
-        forged = PrecisionTierPresentation(
+        forged = SemanticPrecisionPresentation(
             precision_tier="decimal-64",
             arithmetic="fabricated decimal arithmetic",
-            legacy_tier_value=64,
+            working_precision_bits=213,
             nominal_decimal_digits=64,
             presentation_label="64 decimal digits",
         )
@@ -505,7 +507,7 @@ def _cache(
     *,
     pairing_id: str,
     artifact_kind: M03ArtifactKind = M03ArtifactKind.RADIAL_ANGULAR_FIELD,
-    precision_tier: PrecisionTierPresentation | None = None,
+    precision_tier: SemanticPrecisionPresentation | None = None,
     radial_grid: object | None = None,
 ) -> M03CacheIdentity:
     validation_policy = (
@@ -538,7 +540,7 @@ def _cache(
         pairing_id=pairing_id,
         backend_revisions={"gsn": "pinned-commit"},
         precision_tier=(
-            precision_tier_presentation(64)
+            semantic_precision_presentation("bigfloat-40")
             if precision_tier is None
             else precision_tier
         ),
@@ -695,7 +697,7 @@ class M03ArtifactContractTests(unittest.TestCase):
             normalization_id="root-frequency-only",
             pairing_id="not-applicable",
             backend_revisions={"spectral-catalog": "admitted"},
-            precision_tier=precision_tier_presentation(64),
+            precision_tier=semantic_precision_presentation("bigfloat-40"),
             validation_policy={
                 "minimum_overlap": 0.99,
                 "maximum_exact_node_residual_abs": 1.0e-8,
@@ -714,7 +716,10 @@ class M03ArtifactContractTests(unittest.TestCase):
                     "edge_count": 4,
                     "overlap_guards": {"minimum": 0.999},
                     "continuation_invariants": {"branch_resolved": True},
-                    "exact_node_polish": {"maximum_residual_abs": 1.0e-11},
+                    "fixed_root_validation": {
+                        "maximum_residual_abs": 1.0e-11,
+                        "maximum_root_movement_abs": 0.0,
+                    },
                 }
             },
         )
@@ -734,7 +739,7 @@ class M03ArtifactContractTests(unittest.TestCase):
             normalization_id="root-frequency-only",
             pairing_id="not-applicable",
             backend_revisions={"spectral-catalog": "admitted"},
-            precision_tier=precision_tier_presentation(64),
+            precision_tier=semantic_precision_presentation("bigfloat-40"),
             validation_policy={
                 "minimum_overlap": 0.99,
                 "maximum_exact_node_residual_abs": 1.0e-8,
@@ -745,7 +750,10 @@ class M03ArtifactContractTests(unittest.TestCase):
         for field, replacement in (
             ("overlap_guards", {"minimum": 0.5}),
             ("continuation_invariants", {"branch_resolved": False}),
-            ("exact_node_polish", {"maximum_residual_abs": 1.0}),
+            (
+                "fixed_root_validation",
+                {"maximum_residual_abs": 1.0, "maximum_root_movement_abs": 0.0},
+            ),
         ):
             with self.subTest(field=field):
                 validation = {
@@ -753,8 +761,9 @@ class M03ArtifactContractTests(unittest.TestCase):
                     "edge_count": 4,
                     "overlap_guards": {"minimum": 0.999},
                     "continuation_invariants": {"branch_resolved": True},
-                    "exact_node_polish": {
-                        "maximum_residual_abs": 1.0e-11
+                    "fixed_root_validation": {
+                        "maximum_residual_abs": 1.0e-11,
+                        "maximum_root_movement_abs": 0.0,
                     },
                 }
                 validation[field] = replacement
@@ -788,15 +797,16 @@ class M03ArtifactContractTests(unittest.TestCase):
                         "edge_count": 0,
                         "overlap_guards": {"minimum": 1.0},
                         "continuation_invariants": {"branch_resolved": True},
-                        "exact_node_polish": {
-                            "maximum_residual_abs": 1.0e-11
+                        "fixed_root_validation": {
+                            "maximum_residual_abs": 1.0e-11,
+                            "maximum_root_movement_abs": 0.0,
                         },
                     }
                 },
             )
 
-    def test_task_012_layer_cannot_admit_any_artifact(self) -> None:
-        with self.assertRaisesRegex(ValueError, "TASK-012 cannot admit"):
+    def test_artifact_production_cannot_admit_any_artifact(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cannot perform M03 admission"):
             build_m03_envelope(
                 kind=M03ArtifactKind.RADIAL_ANGULAR_FIELD,
                 seed=self.seed,

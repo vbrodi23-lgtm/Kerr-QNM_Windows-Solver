@@ -20,6 +20,7 @@ from .contracts import canonical_json_bytes, load_study
 from .campaign_recovery import (
     RecoverySelection,
     checkpoint_bound_promoted_recovery_selection,
+    migrate_endpoint_recovery_checkpoint_file,
     recover_campaign,
     validate_recovery_checkpoint,
     validate_recovery_receipt,
@@ -109,6 +110,22 @@ from .response_batches import (
     worker_failure_payload,
 )
 from .solved_leaf_cache import SolvedLeafStore
+from .m03_handoff import (
+    build_handoff as build_m02_m03_handoff,
+    load_handoff,
+    validate_handoff,
+    write_handoff,
+)
+from .m03_policy import load_m03_selection, production_blockers
+from .m03_campaign import (
+    admit_checkpoint as admit_m03_checkpoint,
+    build_campaign_plan as build_m03_campaign_plan,
+    load_or_create_checkpoint as load_or_create_m03_checkpoint,
+    run_campaign as run_m03_campaign,
+    terminal_reduce as reduce_m03_terminal,
+    validate_checkpoint as validate_m03_checkpoint,
+)
+from .m03_worker import worker_from_runtime_receipt
 from .structural_diagnostics import StructuralDiagnosticSession
 from .response_engine import VettedNativeDeterminantKernel, NativeResourceUnavailableError
 from .response_reduction import (
@@ -331,6 +348,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkpoint", type=Path, required=True
     )
     campaign_recovery_validate.add_argument("--receipt", type=Path)
+    campaign_endpoint_migrate = commands.add_parser(
+        "campaign-migrate-endpoint-recovery",
+        help="supersede defective pre-grid endpoint evidence without numerical work",
+    )
+    campaign_endpoint_migrate.add_argument("selection", type=Path)
+    campaign_endpoint_migrate.add_argument(
+        "--checkpoint", type=Path, required=True
+    )
+    campaign_endpoint_migrate.add_argument(
+        "--binary64-lock", type=Path, required=True
+    )
+    campaign_endpoint_migrate.add_argument("--output", type=Path, required=True)
+    campaign_endpoint_migrate.add_argument("--receipt", type=Path, required=True)
+    campaign_endpoint_migrate.add_argument("--solved-leaf-store", type=Path)
+    campaign_endpoint_migrate.add_argument(
+        "--replace-source", action="store_true"
+    )
     campaign_lock_binary64 = commands.add_parser(
         "campaign-lock-binary64",
         help="create the deterministic schema-11 binary64 Layer-1 lock",
@@ -493,6 +527,43 @@ def build_parser() -> argparse.ArgumentParser:
     m02_export.add_argument("admission", type=Path)
     m02_export.add_argument("--admission-id", required=True)
     m02_export.add_argument("--output", type=Path, required=True)
+
+    m03_handoff_build = commands.add_parser(
+        "m03-handoff-build",
+        help="build the zero-work M02 to M03 spectral handoff",
+    )
+    m03_handoff_build.add_argument("m02_selection", type=Path)
+    m03_handoff_build.add_argument("--checkpoint", type=Path, required=True)
+    m03_handoff_build.add_argument("--output", type=Path, required=True)
+    m03_handoff_validate = commands.add_parser(
+        "m03-handoff-validate", help="authenticate an existing M02 to M03 handoff"
+    )
+    m03_handoff_validate.add_argument("handoff", type=Path)
+    m03_transition = commands.add_parser(
+        "m03-transition",
+        help="emit M03_READY only for a terminal M02 checkpoint",
+    )
+    m03_transition.add_argument("m02_selection", type=Path)
+    m03_transition.add_argument("--checkpoint", type=Path, required=True)
+    m03_transition.add_argument("--handoff", type=Path, required=True)
+    m03_plan = commands.add_parser(
+        "m03-plan", help="build the exact 48-node M03 campaign plan"
+    )
+    m03_plan.add_argument("selection", type=Path)
+    m03_plan.add_argument("--handoff", type=Path, required=True)
+    for name, help_text in (
+        ("m03-run", "start or resume the persistent Julia M03 campaign"),
+        ("m03-validate", "validate the M03 checkpoint and retained artifacts"),
+        ("m03-admit", "perform zero-work M03 reduction and provider admission"),
+    ):
+        m03 = commands.add_parser(name, help=help_text)
+        m03.add_argument("selection", type=Path)
+        m03.add_argument("--handoff", type=Path, required=True)
+        m03.add_argument("--checkpoint", type=Path, required=True)
+        if name == "m03-run":
+            m03.add_argument("--runtime-receipt", type=Path, required=True)
+            m03.add_argument("--source-revision", required=True)
+            m03.add_argument("--new-campaign", action="store_true")
     return parser
 
 
@@ -727,6 +798,149 @@ def _selected_response(
     else:
         raise ValueError(f"unknown selected response command: {command}")
     return 0, {"command": command, **summary.to_mapping()}
+
+
+def _m03_handoff_build(
+    selection_path: Path,
+    checkpoint_path: Path,
+    output_path: Path,
+) -> tuple[int, object]:
+    plan, selection, _ = _campaign_plan_and_selection(selection_path)
+    checkpoint = _load_strict_json(checkpoint_path, "M02 terminal checkpoint")
+    handoff = build_m02_m03_handoff(
+        plan=plan,
+        selection=selection,
+        checkpoint=checkpoint,
+        checkpoint_path=str(checkpoint_path.resolve()),
+    )
+    write_handoff(output_path, handoff)
+    return 0, {
+        "command": "m03-handoff-build",
+        "state": "M03_READY",
+        "handoff_path": str(output_path.resolve()),
+        "handoff_sha256": handoff["handoff_sha256"],
+        "source_leaf_count": handoff["inventory"]["source_leaf_count"],
+        "node_count": handoff["inventory"]["node_count"],
+        "branch_count": handoff["inventory"]["branch_count"],
+        "root_solves": 0,
+        "response_solves": 0,
+        "julia_launches": 0,
+        "numerical_work": 0,
+    }
+
+
+def _m03_transition(
+    selection_path: Path,
+    checkpoint_path: Path,
+    handoff_path: Path,
+) -> tuple[int, object]:
+    checkpoint = _load_strict_json(checkpoint_path, "M02 checkpoint")
+    validated = validate_schema11_checkpoint(checkpoint)
+    if validated["state"] != "COMPLETE":
+        return 0, {
+            "command": "m03-transition",
+            "state": "M02_NOT_TERMINAL",
+            "m03_ready": False,
+            "julia_launches": 0,
+            "numerical_work": 0,
+        }
+    if handoff_path.exists():
+        handoff = load_handoff(handoff_path)
+    else:
+        plan, selection, _ = _campaign_plan_and_selection(selection_path)
+        handoff = build_m02_m03_handoff(
+            plan=plan,
+            selection=selection,
+            checkpoint=validated,
+            checkpoint_path=str(checkpoint_path.resolve()),
+        )
+        write_handoff(handoff_path, handoff)
+    return 0, {
+        "command": "m03-transition",
+        "state": "M03_READY",
+        "m03_ready": True,
+        "handoff_path": str(handoff_path.resolve()),
+        "handoff_sha256": handoff["handoff_sha256"],
+        "node_count": 48,
+        "branch_count": 11,
+        "julia_launches": 0,
+        "numerical_work": 0,
+    }
+
+
+def _m03_selected(
+    command: str,
+    selection_path: Path,
+    handoff_path: Path,
+    checkpoint_path: Path | None = None,
+    *,
+    runtime_receipt: Path | None = None,
+    source_revision: str | None = None,
+    new_campaign: bool = False,
+) -> tuple[int, object]:
+    selection = load_m03_selection(selection_path)
+    handoff = load_handoff(handoff_path)
+    plan = build_m03_campaign_plan(handoff, selection)
+    blockers = production_blockers(selection)
+    if command == "m03-plan":
+        return 0, {
+            "command": command,
+            **plan,
+            "production_blockers": list(blockers),
+        }
+    if checkpoint_path is None:
+        raise ValueError("M03 checkpoint path is required")
+    if command == "m03-run":
+        if runtime_receipt is None or source_revision is None:
+            raise ValueError("M03 runtime receipt and source revision are required")
+        checkpoint = run_m03_campaign(
+            handoff=handoff,
+            selection=selection,
+            checkpoint_path=checkpoint_path,
+            worker_factory=lambda: worker_from_runtime_receipt(
+                runtime_receipt, stderr_sink=sys.stderr
+            ),
+            source_revision=source_revision,
+            new_campaign=new_campaign,
+        )
+        return 0, {
+            "command": command,
+            "state": checkpoint["state"],
+            "checkpoint_path": str(checkpoint_path.resolve()),
+            "checkpoint_sha256": checkpoint["checkpoint_sha256"],
+        }
+    checkpoint = _load_strict_json(checkpoint_path, "M03 checkpoint")
+    validated = validate_m03_checkpoint(checkpoint, plan=plan)
+    if command == "m03-validate":
+        reduction = None
+        if all(item["status"] in {"PRODUCED", "UNRESOLVED"} for item in validated["nodes"]) and all(
+            item["status"] in {"PRODUCED", "UNRESOLVED"} for item in validated["branches"]
+        ):
+            reduction = reduce_m03_terminal(checkpoint=validated, plan=plan)
+        return 0, {
+            "command": command,
+            "state": validated["state"],
+            "checkpoint_path": str(checkpoint_path.resolve()),
+            "checkpoint_sha256": validated["checkpoint_sha256"],
+            "terminal_reduction": reduction,
+            "julia_launches": 0,
+            "scientific_numerical_work": 0,
+        }
+    if command == "m03-admit":
+        admission = admit_m03_checkpoint(
+            checkpoint=validated,
+            plan=plan,
+            checkpoint_path=checkpoint_path,
+        )
+        return 0, {
+            "command": command,
+            "state": "ADMITTED",
+            "checkpoint_path": str(checkpoint_path.resolve()),
+            "admission": admission,
+            "julia_launches": 0,
+            "scientific_numerical_work": 0,
+        }
+    raise ValueError(f"unknown M03 command: {command}")
 
 
 def _load_strict_json(path: Path, subject: str) -> dict[str, object]:
@@ -1201,6 +1415,93 @@ def _campaign_recovery_validate(
         "result_count": len(checkpoint["records"]),
         "checkpoint_path": str(_resolve_recovery_path(checkpoint_path)),
         "release_admissible": False,
+    }
+
+
+def _campaign_migrate_endpoint_recovery(
+    selection_path: Path,
+    checkpoint_path: Path,
+    binary64_lock_path: Path,
+    output_path: Path,
+    receipt_path: Path,
+    solved_leaf_store_path: Path | None,
+    *,
+    replace_source: bool,
+) -> tuple[int, object]:
+    from .binary64_layer_lock import (
+        load_binary64_layer_lock,
+        validate_binary64_layer_lock,
+    )
+
+    plan, selection, _descriptor = _campaign_plan_and_selection(selection_path)
+    source = _resolve_recovery_path(checkpoint_path)
+    raw_checkpoint = _load_strict_json(source, "schema-11 campaign checkpoint")
+    checkpoint = validate_schema11_checkpoint(raw_checkpoint)
+    recovery_selection = _campaign_recovery_selection(plan, selection)
+    if (
+        checkpoint["campaign_id"] != recovery_selection.campaign_id
+        or checkpoint["selection_id"] != recovery_selection.selection_id
+    ):
+        recovery_selection = checkpoint_bound_promoted_recovery_selection(
+            plan, selection, checkpoint
+        )
+    preflight_campaign_supports(plan, recovery_selection.ordered_leaf_ids)
+    leaf_mechanism_ids = _schema11_leaf_mechanism_ids(
+        plan, recovery_selection
+    )
+    manifest = _schema11_binary64_lock_manifest(plan, checkpoint, source)
+    lock = validate_binary64_layer_lock(
+        load_binary64_layer_lock(_resolve_recovery_path(binary64_lock_path)),
+        checkpoint,
+        selection=recovery_selection,
+        leaf_mechanism_ids=leaf_mechanism_ids,
+        auxiliary_evidence_manifest=manifest,
+    )
+    output = _resolve_recovery_path(output_path)
+    receipt = _resolve_recovery_path(receipt_path)
+    solved_leaf_store = (
+        SolvedLeafStore.default().root
+        if solved_leaf_store_path is None
+        else _resolve_recovery_path(solved_leaf_store_path)
+    )
+    migration = migrate_endpoint_recovery_checkpoint_file(
+        source,
+        output_path=output,
+        receipt_path=receipt,
+        binary64_lock_receipt_sha256=str(lock["receipt_sha256"]),
+        solved_leaf_store=solved_leaf_store,
+        replace_source=replace_source,
+        checkpoint_finalizer=lambda candidate, path: refresh_schema11_reports(
+            plan,
+            selection,
+            candidate,
+            path,
+            persist_checkpoint=False,
+        ),
+    )
+    output_checkpoint = validate_schema11_checkpoint(
+        _load_strict_json(output, "migrated schema-11 campaign checkpoint")
+    )
+    validate_binary64_layer_lock(
+        lock,
+        output_checkpoint,
+        selection=recovery_selection,
+        leaf_mechanism_ids=leaf_mechanism_ids,
+        auxiliary_evidence_manifest=manifest,
+    )
+    return 0, {
+        "command": "campaign-migrate-endpoint-recovery",
+        "checkpoint_path": str(output),
+        "receipt_path": str(receipt),
+        "solved_leaf_store": str(solved_leaf_store),
+        "affected_leaf_ids": migration["affected_leaf_ids"],
+        "affected_queue_ordinals": migration["affected_queue_ordinals"],
+        "reset_entry_count": migration["reset_entry_count"],
+        "binary64_processed_count": migration[
+            "preserved_binary64_processed_count"
+        ],
+        "retained_sample_count": migration["preserved_sample_count"],
+        "numerical_work": migration["numerical_work"],
     }
 
 
@@ -2658,6 +2959,46 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif arguments.command == "validate-evidence":
             status, output = _validate_evidence(arguments.bundle)
+        elif arguments.command == "m03-handoff-build":
+            status, output = _m03_handoff_build(
+                arguments.m02_selection,
+                arguments.checkpoint,
+                arguments.output,
+            )
+        elif arguments.command == "m03-handoff-validate":
+            handoff = load_handoff(arguments.handoff)
+            status, output = 0, {
+                "command": arguments.command,
+                "state": "M03_READY",
+                "handoff_path": str(arguments.handoff.resolve()),
+                "handoff_sha256": handoff["handoff_sha256"],
+                "node_count": handoff["inventory"]["node_count"],
+                "branch_count": handoff["inventory"]["branch_count"],
+                "julia_launches": 0,
+                "numerical_work": 0,
+            }
+        elif arguments.command == "m03-transition":
+            status, output = _m03_transition(
+                arguments.m02_selection,
+                arguments.checkpoint,
+                arguments.handoff,
+            )
+        elif arguments.command == "m03-plan":
+            status, output = _m03_selected(
+                arguments.command,
+                arguments.selection,
+                arguments.handoff,
+            )
+        elif arguments.command in {"m03-run", "m03-validate", "m03-admit"}:
+            status, output = _m03_selected(
+                arguments.command,
+                arguments.selection,
+                arguments.handoff,
+                arguments.checkpoint,
+                runtime_receipt=getattr(arguments, "runtime_receipt", None),
+                source_revision=getattr(arguments, "source_revision", None),
+                new_campaign=getattr(arguments, "new_campaign", False),
+            )
         elif arguments.command.startswith("response-"):
             status, output = _selected_response(
                 arguments.command, arguments.selection, arguments.checkpoint
@@ -2779,6 +3120,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif arguments.command == "campaign-recovery-validate":
             status, output = _campaign_recovery_validate(
                 arguments.selection, arguments.checkpoint, arguments.receipt
+            )
+        elif arguments.command == "campaign-migrate-endpoint-recovery":
+            status, output = _campaign_migrate_endpoint_recovery(
+                arguments.selection,
+                arguments.checkpoint,
+                arguments.binary64_lock,
+                arguments.output,
+                arguments.receipt,
+                arguments.solved_leaf_store,
+                replace_source=arguments.replace_source,
             )
         elif arguments.command == "campaign-lock-binary64":
             status, output = _campaign_lock_binary64(

@@ -570,3 +570,7 @@ finally {
 
 Write-Host "M02 requested pass finished; checkpoint is structurally valid:" -ForegroundColor Green
 Write-Host "    $CheckpointPath"
+
+# The milestone transition is explicit. Invoke m03.ps1 after M02 completion;
+# that public entry point validates or builds the immutable handoff and then
+# starts or resumes M03. Diagnostic and partial M02 runs never advance M03.

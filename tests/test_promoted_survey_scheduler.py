@@ -127,11 +127,12 @@ def _requested_contract(kwargs):
 def _fixture_fixed_root_request(job, digits: int, kwargs):
     contract = _requested_contract(kwargs)
     recovery_binding = {
-        "schema": "windows-solver.fixed-root-endpoint-recovery-policy/1",
+        "schema": "windows-solver.fixed-root-endpoint-recovery-policy/2",
         "identity": (
-            "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2"
+            "cause-aware-real-inner-order-geometry-fixed-root-exterior-endpoint-recovery/v3"
         ),
         "endpoint_order_rule": "bounded-doubling-prefix/v1",
+        "endpoint_transition_rule": "bounded-order-then-geometry-grid/v1",
         "base_endpoint_order": 28,
         "generated_maximum_order": 112,
         "endpoint_order_schedule": [28, 56, 112],
@@ -195,9 +196,9 @@ def _fixture_fixed_root_request(job, digits: int, kwargs):
 def _endpoint_control_diagnostics(request, failure_code: str):
     policy = request["fixed_root_endpoint_recovery_policy"]
     limitation, intervention, outcome = {
-        "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE": (
+        "EXTERIOR_ENDPOINT_RECOVERY_EXHAUSTED": (
             "insufficient-series-order/v1",
-            "ENDPOINT_ORDER_RECOVERY_EXHAUSTED",
+            "ENDPOINT_ORDER_GEOMETRY_RECOVERY_EXHAUSTED",
             "UNRESOLVED",
         ),
         "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED": (
@@ -289,7 +290,7 @@ def _endpoint_control_diagnostics(request, failure_code: str):
 
     geometries = policy["infinity_geometry_schedule"]
     coordinates = (
-        [(order, geometries[0]) for order in orders]
+        [(order, geometry) for geometry in geometries for order in orders]
         if limitation == "insufficient-series-order/v1"
         else [(orders[0], geometry) for geometry in geometries]
         if limitation == "insufficient-geometric-depth/v1"
@@ -298,18 +299,22 @@ def _endpoint_control_diagnostics(request, failure_code: str):
     infinity_attempts = []
     for index, (order, geometry) in enumerate(coordinates):
         terminal = index == len(coordinates) - 1
-        selected = (
-            "PROMOTE_ARITHMETIC_TIER_IF_AGGREGATE_ALLOWS"
-            if limitation == "insufficient-arithmetic-precision/v1"
-            else "NONE" if terminal
-            else "INCREASE_ENDPOINT_ORDER"
-            if limitation == "insufficient-series-order/v1"
-            else "DEEPEN_ENDPOINT_GEOMETRY"
-        )
+        if limitation == "insufficient-arithmetic-precision/v1":
+            selected = "PROMOTE_ARITHMETIC_TIER_IF_AGGREGATE_ALLOWS"
+        elif terminal:
+            selected = "NONE"
+        elif limitation == "insufficient-series-order/v1":
+            selected = (
+                "INCREASE_ENDPOINT_ORDER"
+                if order != orders[-1]
+                else "DEEPEN_ENDPOINT_GEOMETRY"
+            )
+        else:
+            selected = "DEEPEN_ENDPOINT_GEOMETRY"
         result = (
             "ARITHMETIC_INADEQUATE"
             if limitation == "insufficient-arithmetic-precision/v1"
-            else "ORDER_EXHAUSTED"
+            else "RECOVERY_EXHAUSTED"
             if terminal and limitation == "insufficient-series-order/v1"
             else "GEOMETRY_EXHAUSTED"
             if terminal else "RETRY"
@@ -327,10 +332,11 @@ def _endpoint_control_diagnostics(request, failure_code: str):
             "candidate_limitation": limitation,
             "selected_intervention": selected,
             "result": result,
+            "terminal": terminal,
         })
     terminal_attempt = infinity_attempts[-1]
     receipts.append({
-        "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
+        "schema": "windows-solver.exterior-endpoint-recovery-receipt/3",
         "endpoint_branch": "infinity-outgoing",
         "recovery_policy_identity": policy["identity"],
         "recovery_policy_sha256": policy["policy_sha256"],
@@ -446,7 +452,7 @@ def _conditioning(
     del precision_limited
     required = "16.698970004336018804786261105275506973231810118538"
     policy_identity = (
-        "cause-aware-real-inner-fixed-root-exterior-endpoint-recovery/v2"
+        "cause-aware-real-inner-order-geometry-fixed-root-exterior-endpoint-recovery/v3"
     )
     policy_sha256 = "f" * 64
     horizon_schedule = [
@@ -518,9 +524,10 @@ def _conditioning(
             "candidate_limitation": "adequate/v1",
             "selected_intervention": "ENTER_HOMOGENEOUS_ODE",
             "result": "ADEQUATE",
+            "terminal": True,
         }
     receipts.append({
-            "schema": "windows-solver.exterior-endpoint-recovery-receipt/1",
+            "schema": "windows-solver.exterior-endpoint-recovery-receipt/3",
             "endpoint_branch": "infinity-outgoing",
             "recovery_policy_identity": policy_identity,
             "recovery_policy_sha256": policy_sha256,
@@ -1827,7 +1834,7 @@ class PromotedSurveySchedulerTests(unittest.TestCase):
 
     def test_order_and_geometry_exhaustion_remain_at_bf40(self):
         for failure_code in (
-            "EXTERIOR_ENDPOINT_MAXIMUM_ORDER_INADEQUATE",
+            "EXTERIOR_ENDPOINT_RECOVERY_EXHAUSTED",
             "EXTERIOR_ENDPOINT_GEOMETRY_EXHAUSTED",
         ):
             with self.subTest(failure_code=failure_code):

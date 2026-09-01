@@ -2,10 +2,21 @@ from __future__ import annotations
 
 import unittest
 
-from windows_solver.precision_tiers import precision_tier_presentation
+from windows_solver.precision_tiers import (
+    precision_tier_presentation,
+    semantic_precision_presentation,
+)
 
 
 class PrecisionTierPresentationTests(unittest.TestCase):
+    def test_m03_bigfloat_40_has_no_legacy_integer_boundary(self) -> None:
+        presentation = semantic_precision_presentation("bigfloat-40")
+
+        self.assertEqual(presentation.precision_tier, "bigfloat-40")
+        self.assertEqual(presentation.nominal_decimal_digits, 40)
+        self.assertGreaterEqual(presentation.working_precision_bits, 165)
+        self.assertNotIn("legacy_tier_value", presentation.to_mapping())
+
     def test_binary64_is_not_presented_as_64_decimal_digits(self) -> None:
         presentation = precision_tier_presentation(64)
 

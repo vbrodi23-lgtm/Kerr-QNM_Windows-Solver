@@ -34,6 +34,16 @@ from .root_readout_cache import (
 
 
 RECOVERY_RECEIPT_SCHEMA = "windows-solver.campaign-recovery/v1"
+ENDPOINT_RECOVERY_MIGRATION_SCHEMA = (
+    "windows-solver.m02-endpoint-recovery-migration/1"
+)
+ENDPOINT_RECOVERY_MIGRATION_IDENTITY = (
+    "authenticated-v2-to-v3-order-geometry-endpoint-recovery/v1"
+)
+M02_ENDPOINT_RECOVERY_KNOWN_AFFECTED_LEAF_ID = (
+    "b-prime-leaf-e6c649ba56795de2c7c4d992fc92652914622017bbd0a0443ab75de34057c1f0"
+)
+M02_ENDPOINT_RECOVERY_KNOWN_AFFECTED_QUEUE_ORDINAL = 146
 ROOT_READOUT_RECOVERY_INDEX_SCHEMA = "windows-solver.root-readout-recovery-index/v2"
 LEGACY_COMPATIBILITY_SCHEMA = "legacy-compatibility/v1"
 SCIENTIFIC_COMPATIBILITY_SCHEMA = "scientific-compatibility/v1"
@@ -116,16 +126,486 @@ def _is_sha256(value: object) -> bool:
 
 def migrate_fixed_root_endpoint_policy_checkpoint(
     checkpoint: Mapping[str, object],
+    *,
+    endpoint_recovery_migration: bool = False,
 ) -> dict[str, object]:
-    """Apply the schema-11 forensic endpoint migration with zero numerics.
+    """Validate schema 11 and optionally apply the explicit endpoint migration.
 
-    The existing schema validator owns the single migration implementation.
-    This recovery-facing adapter makes that boundary explicit: it preserves
-    the authenticated legacy stage as ``FORENSIC_ONLY`` and returns the pending
-    BF40 queue state without invoking roots, determinants, ODEs, or samples.
+    Ordinary recovery callers retain current predecessor evidence. The explicit
+    migration path preserves the authenticated defective stage as
+    ``FORENSIC_ONLY`` and returns the pending queue state without invoking
+    roots, determinants, ODEs, or samples.
     """
 
-    return validate_schema11_checkpoint(checkpoint)
+    return validate_schema11_checkpoint(
+        checkpoint,
+        endpoint_recovery_migration=endpoint_recovery_migration,
+    )
+
+
+def _endpoint_migration_histories(
+    checkpoint: Mapping[str, object],
+) -> list[Mapping[str, object]]:
+    histories = checkpoint.get("forensic_fixed_root_v2_history")
+    if not isinstance(histories, Mapping):
+        raise ValueError("endpoint migration forensic history is absent")
+    selected = [
+        value for value in histories.values()
+        if isinstance(value, Mapping)
+        and value.get("schema")
+        == "windows-solver.fixed-root-endpoint-forensic-history/3"
+        and value.get("migration_reason")
+        == "FIXED_ROOT_TWO_DIMENSIONAL_ENDPOINT_RECOVERY_REQUIRED"
+    ]
+    return sorted(
+        selected,
+        key=lambda item: (int(item["queue_ordinal"]), str(item["leaf_id"])),
+    )
+
+
+def _archive_endpoint_recovery_solved_leaf_receipts(
+    store_root: Path | None,
+    affected_leaf_ids: set[str],
+) -> list[dict[str, object]]:
+    if store_root is None or not store_root.exists():
+        return []
+    if not store_root.is_dir():
+        raise ValueError("solved-leaf store is not a directory")
+    from .solved_leaf_cache import SolvedLeafStore
+
+    actions: list[tuple[Path, Path, Mapping[str, object], str]] = []
+    archive_root = store_root / "forensic-endpoint-recovery-v3"
+    for source in sorted(store_root.glob("*.json"), key=lambda item: item.name):
+        if source.is_symlink():
+            raise ValueError("solved-leaf migration refuses a symlink")
+        value = _read_json(source)
+        receipt = SolvedLeafStore._validate_receipt(value)
+        leaf_id = str(receipt["leaf_id"])
+        if leaf_id not in affected_leaf_ids:
+            continue
+        source_sha256 = _file_sha256(source)
+        destination = archive_root / (
+            f"{source.stem}.{receipt['receipt_sha256']}.json"
+        )
+        if destination.exists():
+            if _file_sha256(destination) != source_sha256:
+                raise ValueError("solved-leaf forensic archive conflicts")
+            os.replace(source, destination)
+        else:
+            actions.append((source, destination, receipt, source_sha256))
+
+    for source, destination, _receipt, _source_sha256 in actions:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source, destination)
+
+    archived: list[dict[str, object]] = []
+    if not archive_root.exists():
+        return archived
+    for destination in sorted(
+        archive_root.glob("*.json"), key=lambda item: item.name
+    ):
+        if destination.is_symlink():
+            raise ValueError("solved-leaf forensic archive refuses a symlink")
+        receipt = SolvedLeafStore._validate_receipt(_read_json(destination))
+        if str(receipt["leaf_id"]) not in affected_leaf_ids:
+            continue
+        archived.append({
+            "leaf_id": receipt["leaf_id"],
+            "scientific_computation_identity_sha256": receipt[
+                "scientific_computation_identity_sha256"
+            ],
+            "receipt_sha256": receipt["receipt_sha256"],
+            "artifact_sha256": _file_sha256(destination),
+            "forensic_path": str(destination),
+        })
+    return archived
+
+
+def migrate_endpoint_recovery_checkpoint_file(
+    source_checkpoint_path: str | os.PathLike[str] | Path,
+    *,
+    output_path: str | os.PathLike[str] | Path,
+    receipt_path: str | os.PathLike[str] | Path,
+    binary64_lock_receipt_sha256: str,
+    solved_leaf_store: str | os.PathLike[str] | Path | None = None,
+    replace_source: bool = False,
+    checkpoint_finalizer: CheckpointFinalizer | None = None,
+) -> dict[str, object]:
+    """Migrate only defective pre-grid endpoint evidence, with zero numerics."""
+
+    source_path = Path(source_checkpoint_path)
+    output = Path(output_path)
+    receipt = Path(receipt_path)
+    if output == receipt or source_path == receipt:
+        raise ValueError("endpoint migration paths must be distinct")
+    if output == source_path and not replace_source:
+        raise ValueError("in-place endpoint migration requires explicit authority")
+    if not _is_sha256(binary64_lock_receipt_sha256):
+        raise ValueError("binary64 lock receipt SHA-256 is invalid")
+    if output.exists() and receipt.exists():
+        return validate_endpoint_recovery_migration_receipt(
+            output,
+            receipt,
+            binary64_lock_receipt_sha256=binary64_lock_receipt_sha256,
+        )
+    if receipt.exists():
+        raise ValueError("endpoint migration receipt exists without its output")
+    try:
+        source_value = _read_json(source_path)
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            f"endpoint migration source checkpoint is corrupt: {source_path}: {error}"
+        ) from error
+    if not isinstance(source_value, Mapping):
+        raise ValueError("endpoint migration source checkpoint must be an object")
+    source_bytes = source_path.read_bytes()
+    if source_bytes != canonical_json_bytes(source_value):
+        raise ValueError("endpoint migration source checkpoint is not canonical")
+    source_checkpoint_sha256 = hashlib.sha256(source_bytes).hexdigest()
+    authenticated_source = validate_schema11_checkpoint(source_value)
+    source_histories = {
+        str(item.get("history_sha256"))
+        for item in _endpoint_migration_histories(authenticated_source)
+    }
+    migrated = migrate_fixed_root_endpoint_policy_checkpoint(
+        authenticated_source,
+        endpoint_recovery_migration=True,
+    )
+    histories = [
+        item for item in _endpoint_migration_histories(migrated)
+        if str(item.get("history_sha256")) not in source_histories
+    ]
+    if not histories:
+        histories = _endpoint_migration_histories(migrated)
+    affected_leaf_ids = {str(item["leaf_id"]) for item in histories}
+    affected_ordinals = [int(item["queue_ordinal"]) for item in histories]
+    if not affected_leaf_ids:
+        raise ValueError("no defective endpoint-policy evidence was discovered")
+    known_entries = [
+        entry for entry in migrated["promotion_queue"]["entries"]
+        if isinstance(entry, Mapping)
+        and entry.get("leaf_id") == M02_ENDPOINT_RECOVERY_KNOWN_AFFECTED_LEAF_ID
+    ]
+    if known_entries and (
+        len(known_entries) != 1
+        or known_entries[0].get("queue_ordinal")
+        != M02_ENDPOINT_RECOVERY_KNOWN_AFFECTED_QUEUE_ORDINAL
+        or M02_ENDPOINT_RECOVERY_KNOWN_AFFECTED_LEAF_ID
+        not in affected_leaf_ids
+    ):
+        raise ValueError("known endpoint-recovery boundary was not migrated")
+    checkpoint_entry_content = {
+        "schema": "windows-solver.m02-endpoint-recovery-migration-entry/1",
+        "migration_identity": ENDPOINT_RECOVERY_MIGRATION_IDENTITY,
+        "source_checkpoint_sha256": source_checkpoint_sha256,
+        "affected_leaf_ids": sorted(affected_leaf_ids),
+        "affected_queue_ordinals": sorted(affected_ordinals),
+        "archived_stage_sha256s": sorted(
+            str(item["source_stage_sha256"]) for item in histories
+        ),
+        "numerical_work": {
+            "backend_constructions": 0,
+            "julia_launches": 0,
+            "determinant_evaluations": 0,
+            "root_solves": 0,
+        },
+    }
+    checkpoint_entry = {
+        **checkpoint_entry_content,
+        "receipt_sha256": _sha256(checkpoint_entry_content),
+    }
+    existing_entries = [
+        item for item in migrated["recovery_receipts"]
+        if isinstance(item, Mapping)
+        and item.get("schema")
+        == "windows-solver.m02-endpoint-recovery-migration-entry/1"
+        and item.get("migration_identity")
+        == ENDPOINT_RECOVERY_MIGRATION_IDENTITY
+    ]
+    if existing_entries:
+        if len(existing_entries) != 1:
+            raise ValueError("endpoint migration checkpoint entry is ambiguous")
+        checkpoint_entry = copy.deepcopy(dict(existing_entries[0]))
+    else:
+        migrated["recovery_receipts"].append(checkpoint_entry)
+    if checkpoint_finalizer is not None:
+        scientific_sha256 = _checkpoint_scientific_sha256(migrated)
+        migrated = migrate_fixed_root_endpoint_policy_checkpoint(
+            checkpoint_finalizer(migrated, output),
+            endpoint_recovery_migration=True,
+        )
+        if _checkpoint_scientific_sha256(migrated) != scientific_sha256:
+            raise ValueError(
+                "endpoint migration report finalizer changed scientific state"
+            )
+
+    source_entries = authenticated_source.get(
+        "promotion_queue", {}
+    ).get("entries", [])
+    output_entries = migrated.get("promotion_queue", {}).get("entries", [])
+    if not isinstance(source_entries, list) or not isinstance(output_entries, list):
+        raise ValueError("endpoint migration queue is invalid")
+    preserved_fields = {
+        "queue_ordinal", "leaf_id", "queue_kind", "source_pass", "route",
+        "minimum_requested_tier", "source_record_sha256",
+        "source_stage_sha256", "source_root_seal_sha256",
+        "source_fingerprint_sha256", "scientific_computation_identity",
+    }
+    if len(source_entries) != len(output_entries) or any(
+        {
+            name: source_entry.get(name) for name in preserved_fields
+        } != {
+            name: output_entry.get(name) for name in preserved_fields
+        }
+        for source_entry, output_entry in zip(source_entries, output_entries)
+        if isinstance(source_entry, Mapping) and isinstance(output_entry, Mapping)
+    ):
+        raise ValueError("endpoint migration changed a frozen queue binding")
+    if (
+        authenticated_source.get("survey_pass_ledger", {}).get("binary64")
+        != migrated.get("survey_pass_ledger", {}).get("binary64")
+        or authenticated_source.get("promoted_root_ledger")
+        != migrated.get("promoted_root_ledger")
+    ):
+        raise ValueError("endpoint migration changed frozen Layer-1/root evidence")
+
+    archived_cache = _archive_endpoint_recovery_solved_leaf_receipts(
+        None if solved_leaf_store is None else Path(solved_leaf_store),
+        affected_leaf_ids,
+    )
+    output_checkpoint_sha256 = _sha256(migrated)
+    receipt_content = {
+        "schema": ENDPOINT_RECOVERY_MIGRATION_SCHEMA,
+        "migration_identity": ENDPOINT_RECOVERY_MIGRATION_IDENTITY,
+        "source_checkpoint_sha256": source_checkpoint_sha256,
+        "output_checkpoint_sha256": output_checkpoint_sha256,
+        "source_binary64_lock_receipt_sha256": binary64_lock_receipt_sha256,
+        "output_binary64_lock_receipt_sha256": binary64_lock_receipt_sha256,
+        "affected_leaf_ids": sorted(affected_leaf_ids),
+        "affected_queue_ordinals": sorted(affected_ordinals),
+        "affected_entries": [
+            {
+                "leaf_id": str(item["leaf_id"]),
+                "queue_ordinal": int(item["queue_ordinal"]),
+                "source_stage_sha256": str(item["source_stage_sha256"]),
+            }
+            for item in sorted(
+                histories, key=lambda value: int(value["queue_ordinal"])
+            )
+        ],
+        "archived_stage_sha256s": sorted(
+            str(item["source_stage_sha256"]) for item in histories
+        ),
+        "archived_solved_leaf_receipts": archived_cache,
+        "preserved_binary64_processed_count": len(
+            migrated["survey_pass_ledger"]["binary64"]
+        ),
+        "preserved_sample_count": sum(
+            int(item.get("sample_count", 0))
+            for item in migrated["survey_pass_ledger"]["binary64"].values()
+            if isinstance(item, Mapping)
+        ),
+        "preserved_root_object_count": sum(
+            len(bucket) for bucket in migrated["promoted_root_ledger"].values()
+            if isinstance(bucket, Mapping)
+        ),
+        "preserved_queue_cardinality": len(output_entries),
+        "reset_entry_count": len(histories),
+        "numerical_work": {
+            "backend_constructions": 0,
+            "julia_launches": 0,
+            "determinant_evaluations": 0,
+            "root_solves": 0,
+        },
+    }
+    migration_receipt = {
+        **receipt_content,
+        "receipt_sha256": _sha256(receipt_content),
+    }
+    if receipt.exists():
+        existing = _read_json(receipt)
+        if existing != migration_receipt:
+            raise ValueError("endpoint migration receipt destination conflicts")
+    if output.exists() and output != source_path:
+        existing = _read_json(output)
+        if existing != migrated:
+            raise ValueError("endpoint migration output destination conflicts")
+    else:
+        _atomic_json(output, migrated)
+    if not receipt.exists():
+        _atomic_json(receipt, migration_receipt)
+    return migration_receipt
+
+
+def validate_endpoint_recovery_migration_receipt(
+    checkpoint_path: str | os.PathLike[str] | Path,
+    receipt_path: str | os.PathLike[str] | Path,
+    *,
+    binary64_lock_receipt_sha256: str,
+) -> dict[str, object]:
+    checkpoint = Path(checkpoint_path)
+    receipt = Path(receipt_path)
+    value = _read_json(receipt)
+    if not isinstance(value, Mapping):
+        raise ValueError("endpoint migration receipt must be an object")
+    fields = {
+        "schema", "migration_identity", "source_checkpoint_sha256",
+        "output_checkpoint_sha256", "source_binary64_lock_receipt_sha256",
+        "output_binary64_lock_receipt_sha256", "affected_leaf_ids",
+        "affected_queue_ordinals", "affected_entries",
+        "archived_stage_sha256s",
+        "archived_solved_leaf_receipts", "preserved_binary64_processed_count",
+        "preserved_sample_count", "preserved_root_object_count",
+        "preserved_queue_cardinality", "reset_entry_count", "numerical_work",
+        "receipt_sha256",
+    }
+    content = {
+        name: item for name, item in value.items() if name != "receipt_sha256"
+    }
+    if (
+        set(value) != fields
+        or value.get("schema") != ENDPOINT_RECOVERY_MIGRATION_SCHEMA
+        or value.get("migration_identity")
+        != ENDPOINT_RECOVERY_MIGRATION_IDENTITY
+        or value.get("receipt_sha256") != _sha256(content)
+        or value.get("source_binary64_lock_receipt_sha256")
+        != binary64_lock_receipt_sha256
+        or value.get("output_binary64_lock_receipt_sha256")
+        != binary64_lock_receipt_sha256
+        or value.get("numerical_work") != {
+            "backend_constructions": 0,
+            "julia_launches": 0,
+            "determinant_evaluations": 0,
+            "root_solves": 0,
+        }
+        or value.get("output_checkpoint_sha256") != _file_sha256(checkpoint)
+    ):
+        raise ValueError("endpoint migration receipt authentication failed")
+    affected_leaf_ids = value.get("affected_leaf_ids")
+    affected_ordinals = value.get("affected_queue_ordinals")
+    affected_entries = value.get("affected_entries")
+    archived_stage_sha256s = value.get("archived_stage_sha256s")
+    archived_cache = value.get("archived_solved_leaf_receipts")
+    if (
+        not isinstance(affected_leaf_ids, list)
+        or not affected_leaf_ids
+        or affected_leaf_ids != sorted(set(affected_leaf_ids))
+        or not all(isinstance(item, str) and item for item in affected_leaf_ids)
+        or not isinstance(affected_ordinals, list)
+        or affected_ordinals != sorted(set(affected_ordinals))
+        or not all(type(item) is int and item >= 0 for item in affected_ordinals)
+        or len(affected_leaf_ids) != len(affected_ordinals)
+        or not isinstance(affected_entries, list)
+        or len(affected_entries) != len(affected_leaf_ids)
+        or not isinstance(archived_stage_sha256s, list)
+        or archived_stage_sha256s != sorted(set(archived_stage_sha256s))
+        or len(archived_stage_sha256s) != len(affected_leaf_ids)
+        or not all(_is_sha256(item) for item in archived_stage_sha256s)
+        or value.get("reset_entry_count") != len(affected_leaf_ids)
+        or not isinstance(archived_cache, list)
+    ):
+        raise ValueError("endpoint migration receipt inventory is invalid")
+    affected_entry_fields = {
+        "leaf_id", "queue_ordinal", "source_stage_sha256",
+    }
+    if (
+        any(
+            not isinstance(item, Mapping)
+            or set(item) != affected_entry_fields
+            or not isinstance(item.get("leaf_id"), str)
+            or type(item.get("queue_ordinal")) is not int
+            or not _is_sha256(item.get("source_stage_sha256"))
+            for item in affected_entries
+        )
+        or affected_entries != sorted(
+            affected_entries, key=lambda item: int(item["queue_ordinal"])
+        )
+        or sorted(item["leaf_id"] for item in affected_entries)
+        != affected_leaf_ids
+        or [item["queue_ordinal"] for item in affected_entries]
+        != affected_ordinals
+        or sorted(item["source_stage_sha256"] for item in affected_entries)
+        != archived_stage_sha256s
+    ):
+        raise ValueError("endpoint migration affected-entry binding is invalid")
+    from .solved_leaf_cache import SolvedLeafStore
+
+    cache_fields = {
+        "leaf_id", "scientific_computation_identity_sha256",
+        "receipt_sha256", "artifact_sha256", "forensic_path",
+    }
+    for item in archived_cache:
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != cache_fields
+            or item.get("leaf_id") not in affected_leaf_ids
+            or not _is_sha256(item.get("scientific_computation_identity_sha256"))
+            or not _is_sha256(item.get("receipt_sha256"))
+            or not _is_sha256(item.get("artifact_sha256"))
+            or not isinstance(item.get("forensic_path"), str)
+        ):
+            raise ValueError("endpoint migration cache archive is invalid")
+        forensic_path = Path(item["forensic_path"])
+        if (
+            forensic_path.is_symlink()
+            or not forensic_path.is_file()
+            or _file_sha256(forensic_path) != item["artifact_sha256"]
+        ):
+            raise ValueError("endpoint migration cache artifact is invalid")
+        cached_receipt = SolvedLeafStore._validate_receipt(
+            _read_json(forensic_path)
+        )
+        if (
+            cached_receipt["leaf_id"] != item["leaf_id"]
+            or cached_receipt["receipt_sha256"] != item["receipt_sha256"]
+            or cached_receipt["scientific_computation_identity_sha256"]
+            != item["scientific_computation_identity_sha256"]
+        ):
+            raise ValueError("endpoint migration cache binding is invalid")
+
+    migrated = validate_schema11_checkpoint(_read_json(checkpoint))
+    histories = [
+        item for item in _endpoint_migration_histories(migrated)
+        if item.get("source_stage_sha256") in archived_stage_sha256s
+    ]
+    history_by_leaf = {str(item["leaf_id"]): item for item in histories}
+    if (
+        set(history_by_leaf) != set(affected_leaf_ids)
+        or sorted(int(item["queue_ordinal"]) for item in histories)
+        != affected_ordinals
+        or sorted(str(item["source_stage_sha256"]) for item in histories)
+        != archived_stage_sha256s
+    ):
+        raise ValueError("endpoint migration forensic binding is invalid")
+    entries = migrated["promotion_queue"]["entries"]
+    for affected in affected_entries:
+        leaf_id = str(affected["leaf_id"])
+        ordinal = int(affected["queue_ordinal"])
+        entry = entries[ordinal]
+        if (
+            entry.get("leaf_id") != leaf_id
+            or entry.get("disposition") != "PENDING"
+            or entry.get("retained_promoted_stage_sha256") is not None
+        ):
+            raise ValueError("endpoint migration queue reset is invalid")
+    if (
+        value.get("preserved_binary64_processed_count")
+        != len(migrated["survey_pass_ledger"]["binary64"])
+        or value.get("preserved_sample_count")
+        != sum(
+            int(item.get("sample_count", 0))
+            for item in migrated["survey_pass_ledger"]["binary64"].values()
+            if isinstance(item, Mapping)
+        )
+        or value.get("preserved_root_object_count")
+        != sum(
+            len(bucket) for bucket in migrated["promoted_root_ledger"].values()
+            if isinstance(bucket, Mapping)
+        )
+        or value.get("preserved_queue_cardinality") != len(entries)
+    ):
+        raise ValueError("endpoint migration preservation counts are invalid")
+    return copy.deepcopy(dict(value))
 
 
 def _checkpoint_scientific_sha256(checkpoint: Mapping[str, object]) -> str:
@@ -1508,13 +1988,19 @@ def validate_recovery_receipt(
 
 
 __all__ = [
+    "ENDPOINT_RECOVERY_MIGRATION_IDENTITY",
+    "ENDPOINT_RECOVERY_MIGRATION_SCHEMA",
+    "M02_ENDPOINT_RECOVERY_KNOWN_AFFECTED_LEAF_ID",
+    "M02_ENDPOINT_RECOVERY_KNOWN_AFFECTED_QUEUE_ORDINAL",
     "RECOVERY_RECEIPT_SCHEMA",
     "RecoverySelection",
     "RecoverySummary",
     "checkpoint_bound_promoted_recovery_selection",
     "migrate_fixed_root_endpoint_policy_checkpoint",
+    "migrate_endpoint_recovery_checkpoint_file",
     "recover_campaign",
     "validate_checkpoint_bound_promoted_recovery_selection",
     "validate_recovery_checkpoint",
     "validate_recovery_receipt",
+    "validate_endpoint_recovery_migration_receipt",
 ]

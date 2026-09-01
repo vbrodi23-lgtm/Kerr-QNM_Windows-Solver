@@ -1,0 +1,122 @@
+{
+  "schema": "windows-solver.m03-selection/1",
+  "schema_version": 1,
+  "expected_handoff_schema": "windows-solver.m02-m03-handoff/1",
+  "expected_node_count": 48,
+  "expected_branch_count": 11,
+  "numerical_backend_id": "julia-m03-persistent-spectral-state-engine-v1",
+  "field_representations": {
+    "angular": "spin-weighted-spheroidal-spectral-coefficients-v1",
+    "radial_numerical_carrier": "regularised-gsn-spectral-segments-v1",
+    "radial_physical": "teukolsky-s-minus-2-radial-v1",
+    "gsn_teukolsky_binding": "authenticated-gsn-to-teukolsky-map-v1"
+  },
+  "right_state_normalization_id": "unit-outgoing-teukolsky-amplitude-at-scri-v1",
+  "co_mode_pairing_id": "bilinear-transpose-pencil-pairing-v1",
+  "precision": {
+    "direct_node": "bigfloat-40",
+    "deep_node": "bigfloat-80",
+    "promotion": {
+      "from": "bigfloat-40",
+      "to": "bigfloat-80",
+      "on_any_required_gate_failure": true
+    },
+    "production_ceiling": "bigfloat-80",
+    "binary64_field_admissible": false,
+    "automatic_bf120": false
+  },
+  "radial_discretization": {
+    "policy_id": "m03-regularised-gsn-multidomain-v1",
+    "base_order": 192,
+    "comparison_order": 256,
+    "adaptive_segments_max": 24,
+    "horizon_carrier": "ingoing-teukolsky-carrier-v1",
+    "infinity_carrier": "outgoing-teukolsky-carrier-v1"
+  },
+  "angular_discretization": {
+    "policy_id": "m03-spin-weighted-spheroidal-galerkin-v1",
+    "base_bandwidth": 48,
+    "comparison_bandwidth": 64,
+    "regularity_basis": "spin-weighted-spherical-harmonics"
+  },
+  "validation_thresholds": {
+    "review_state": "BLOCKED_HUMAN_NUMERICAL_REVIEW",
+    "required_decision": "freeze-right-co-mode-pairing-residue-and-branch-validation-thresholds-v1",
+    "right_state": {
+      "field_equation_residual_abs_max": null,
+      "horizon_boundary_residual_abs_max": null,
+      "infinity_boundary_residual_abs_max": null,
+      "wronskian_relative_drift_max": null,
+      "resolution_relative_field_difference_max": null,
+      "representation_relative_difference_max": null
+    },
+    "co_mode": {
+      "dual_equation_residual_abs_max": null,
+      "boundary_residual_abs_max": null,
+      "resolution_relative_difference_max": null,
+      "normalization_relative_error_max": null
+    },
+    "pairing": {
+      "magnitude_min": null,
+      "precision_relative_difference_max": null,
+      "resolution_relative_difference_max": null
+    },
+    "residue_projector": {
+      "right_rescaling_relative_error_max": null,
+      "co_mode_rescaling_relative_error_max": null,
+      "representation_relative_difference_max": null,
+      "local_reconstruction_relative_error_max": null,
+      "precision_relative_difference_max": null
+    }
+  },
+  "branch_overlap_policy": {
+    "policy_id": "m03-bilinear-normalized-field-overlap-v1",
+    "minimum_overlap": "0.90",
+    "unresolved_gap_blocks_continuation": true,
+    "cold_start_across_gap_requires_review": true
+  },
+  "storage_policy": {
+    "policy_id": "m03-content-addressed-atomic-artifacts-v1",
+    "node_directory": "nodes",
+    "branch_directory": "branches",
+    "reports_suffix": ".reports",
+    "payload_hash": "sha256",
+    "atomic_publication": true
+  },
+  "conventions": {
+    "version": "m03-kerr-spectral-state-conventions-v1",
+    "right_state": {
+      "review_state": "BLOCKED_HUMAN_MATH_REVIEW",
+      "operator_pencil": "separated-s-minus-2-teukolsky-at-frozen-omega-A-v1",
+      "angular_equation": "spin-weighted-spheroidal-angular-equation-v1",
+      "radial_equation": "teukolsky-radial-equation-v1",
+      "endpoint_conditions": "qnm-ingoing-horizon-outgoing-infinity-v1",
+      "normalization": "unit-outgoing-teukolsky-amplitude-at-scri-v1",
+      "required_decision": "freeze-separated-equations-carriers-endpoints-physical-representation-and-normalization-v1"
+    },
+    "co_mode": {
+      "review_state": "BLOCKED_HUMAN_MATH_REVIEW",
+      "required_decision": "freeze-continuous-dual-equation-space-boundaries-pairing-phase-v1"
+    },
+    "residue": {
+      "review_state": "BLOCKED_HUMAN_MATH_REVIEW",
+      "formula": "d_n=<alpha_n,(partial_omega F)(omega_n)v_n>",
+      "required_decision": "freeze-pencil-derivative-green-numerator-sign-and-m02-Domega-relation-v1"
+    },
+    "branch_classification": {
+      "review_state": "BLOCKED_HUMAN_MATH_REVIEW",
+      "required_decision": "freeze-observables-invariants-near-extremal-coordinate-and-ambiguity-policy-v1"
+    },
+    "nhek_match": {
+      "review_state": "FUTURE_BLOCKED",
+      "required_for_node_production": false
+    }
+  },
+  "process_policy": {
+    "worker_count": 1,
+    "active_node_count": 1,
+    "branch_contiguous": true,
+    "restart_limit_per_node": 2,
+    "stdout_protocol_only": true
+  }
+}

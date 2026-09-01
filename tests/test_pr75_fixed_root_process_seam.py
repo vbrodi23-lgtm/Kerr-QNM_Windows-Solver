@@ -129,6 +129,46 @@ class PR75FixedRootProcessSeamTests(unittest.TestCase):
             event_kinds.index(ProgressEventKind.REQUEST_COMPLETED),
         )
 
+    def test_julia_mixed_order_geometry_fixture_is_accepted_by_python(self):
+        adapter = self._real_adapter()
+        job = _job()
+        backend = _backend(adapter, 40)
+
+        with patch.dict(
+            os.environ,
+            {"PR75_PROCESS_FIXTURE_OUTCOME": "recovery-grid"},
+        ):
+            batch = backend.fixed_root_survey_batch(
+                job,
+                fixed_root=job.root.omega,
+                root_seal_sha256=ROOT_SEAL_SHA256,
+                branch_identity=job.root.branch_id,
+                plan=FixedRootSurveyPlan.MECHANISM_COMPONENT_FOUR,
+            )
+
+        receipt = batch.samples[0].numerical_conditioning.mapping[
+            "endpoint_receipts"
+        ][1]
+        trajectory = [
+            (
+                attempt["attempted_endpoint_order"],
+                attempt["attempted_geometry"],
+                attempt["selected_intervention"],
+            )
+            for attempt in receipt["attempts"]
+        ]
+        self.assertEqual(
+            [
+                (28, "100", "INCREASE_ENDPOINT_ORDER"),
+                (56, "100", "INCREASE_ENDPOINT_ORDER"),
+                (112, "100", "DEEPEN_ENDPOINT_GEOMETRY"),
+                (28, "250", "ENTER_HOMOGENEOUS_ODE"),
+            ],
+            trajectory,
+        )
+        self.assertEqual("250", receipt["terminal_geometry"])
+        self.assertEqual(0, receipt["factored_homogeneous_rhs_evaluations"])
+
     def test_real_worker_main_exit_21_is_bound_by_production_adapter(self):
         adapter = self._real_adapter()
         job = _job()
